@@ -195,7 +195,8 @@ const SocialEngine = {
 };
 
 // ╔══════════════════════════════════════════════════════════════╗
-// MACRO ENGINE — S&P 500, DXY, Gold via free APIs
+// MACRO ENGINE — S&P 500, DXY, Gold via 5-SOURCE FALLBACK
+// Sources: Yahoo, GoldPrice.org, Metals.live, ExchangeRate API, TwelveData
 // ╚══════════════════════════════════════════════════════════════╝
 const MacroEngine = {
   _cache: null,
@@ -203,7 +204,29 @@ const MacroEngine = {
   _tdRateLimited: false,
   _tdCooldownUntil: 0,
   _lastWorkingProxy: "",
-  _lastWorkingSource: "yahoo", // yahoo was working, start with it
+  _lastWorkingSource: "",
+
+  // Helper: direct fetch (no proxy needed) with timeout
+  async _directFetch(url, timeout = 8000) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(timeout) });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  },
+
+  // Helper: fetch via CORS proxy chain
+  async _proxyFetch(targetUrl, proxies, timeout = 8000) {
+    for (const proxy of proxies) {
+      try {
+        const res = await fetch(proxy + encodeURIComponent(targetUrl), { signal: AbortSignal.timeout(timeout) });
+        if (!res.ok) continue;
+        const data = await res.json();
+        if (data) { this._lastWorkingProxy = proxy; return data; }
+      } catch { continue; }
+    }
+    return null;
+  },
 
   async fetchMacroData() {
     try {
@@ -212,80 +235,111 @@ const MacroEngine = {
 
       const results = { sp500: null, dxy: null, gold: null, regime: "NEUTRAL", live: false, timestamp: Date.now(), source: "" };
       const proxies = CORS_PROXIES.filter(Boolean);
-
-      const symbols = [
-        { key: "sp500", td: "SPX", yf: "^GSPC", name: "S&P 500" },
-        { key: "dxy", td: "DXY", yf: "DX-Y.NYB", name: "DXY" },
-        { key: "gold", td: "XAU/USD", yf: "GC=F", name: "Gold" },
-      ];
-
-      // Try last working proxy first for speed
       const orderedProxies = this._lastWorkingProxy 
         ? [this._lastWorkingProxy, ...proxies.filter(p => p !== this._lastWorkingProxy)]
         : proxies;
 
-      // SOURCE 1: Yahoo Finance (most reliable from UAE)
-      let yahooWorked = false;
-      for (const sym of symbols) {
+      // ═══ SOURCE 1: Yahoo Finance via CORS proxy (S&P, DXY, Gold) ═══
+      const yfSymbols = [
+        { key: "sp500", yf: "^GSPC", name: "S&P 500" },
+        { key: "dxy", yf: "DX-Y.NYB", name: "DXY" },
+        { key: "gold", yf: "GC=F", name: "Gold" },
+      ];
+      for (const sym of yfSymbols) {
         if (results[sym.key]?.live) continue;
-        for (const proxy of orderedProxies) {
-          try {
-            const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym.yf}?range=2d&interval=1d`;
-            const res = await fetch(proxy + encodeURIComponent(url), { signal: AbortSignal.timeout(8000) });
-            if (!res.ok) continue;
-            const data = await res.json();
-            const closes = data?.chart?.result?.[0]?.indicators?.quote?.[0]?.close;
-            if (closes?.length >= 2) {
-              const today = closes[closes.length - 1];
-              const yesterday = closes[closes.length - 2];
-              if (today && yesterday) {
-                const change = ((today - yesterday) / yesterday) * 100;
-                results[sym.key] = { price: today, change, name: sym.name, live: true };
-                results.live = true;
-                results.source = "yahoo";
-                this._lastWorkingProxy = proxy;
-                yahooWorked = true;
-              }
-            }
-            break; // Don't try more proxies for this symbol if we got a response
-          } catch { continue; }
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym.yf}?range=2d&interval=1d`;
+        const data = await this._proxyFetch(url, orderedProxies);
+        const closes = data?.chart?.result?.[0]?.indicators?.quote?.[0]?.close;
+        if (closes?.length >= 2) {
+          const today = closes[closes.length - 1];
+          const yesterday = closes[closes.length - 2];
+          if (today && yesterday) {
+            results[sym.key] = { price: today, change: ((today - yesterday) / yesterday) * 100, name: sym.name, live: true };
+            results.live = true;
+            results.source = "yahoo";
+          }
         }
       }
 
-      // SOURCE 2: TwelveData fallback (only if Yahoo missed some symbols AND not rate-limited)
-      const tdOk = !this._tdRateLimited || Date.now() > this._tdCooldownUntil;
-      if (tdOk && (!results.sp500 || !results.dxy || !results.gold)) {
-        for (const sym of symbols) {
-          if (results[sym.key]?.live) continue;
-          for (const proxy of orderedProxies) {
-            try {
-              const url = `https://api.twelvedata.com/time_series?symbol=${sym.td}&interval=1day&outputsize=2&format=JSON`;
-              const res = await fetch(proxy + encodeURIComponent(url), { signal: AbortSignal.timeout(8000) });
-              if (res.status === 429) { 
-                this._tdRateLimited = true; 
-                this._tdCooldownUntil = Date.now() + 3600000; // 1hr cooldown
-                break; 
-              }
-              if (!res.ok) continue;
-              const data = await res.json();
-              if (data?.code === 429 || data?.status === "error") {
-                this._tdRateLimited = true;
-                this._tdCooldownUntil = Date.now() + 3600000;
-                break;
-              }
-              if (data?.values?.length >= 2) {
-                const today = parseFloat(data.values[0].close);
-                const yesterday = parseFloat(data.values[1].close);
-                const change = ((today - yesterday) / yesterday) * 100;
-                results[sym.key] = { price: today, change, name: sym.name, live: true };
-                results.live = true;
-                results.source = results.source || "twelvedata";
-                this._lastWorkingProxy = proxy;
-                break;
-              }
-            } catch { continue; }
+      // ═══ SOURCE 2: Gold from goldprice.org (FREE, CORS-enabled, NO proxy) ═══
+      if (!results.gold?.live) {
+        try {
+          const data = await this._directFetch("https://data-asg.goldprice.org/dbXRates/USD", 6000);
+          if (data?.items?.[0]) {
+            const item = data.items[0];
+            const goldPrice = item.xauPrice;
+            const goldPrev = item.xauClose || goldPrice;
+            if (goldPrice && goldPrev) {
+              results.gold = { price: goldPrice, change: ((goldPrice - goldPrev) / goldPrev) * 100, name: "Gold", live: true };
+              results.live = true;
+              if (!results.source) results.source = "goldprice.org";
+            }
           }
-          if (this._tdRateLimited) break; // Stop trying TwelveData for other symbols
+        } catch { /* silent */ }
+      }
+
+      // ═══ SOURCE 3: Gold from metals.live (FREE, no key, direct) ═══
+      if (!results.gold?.live) {
+        try {
+          const gData = await this._directFetch("https://api.metals.live/v1/spot/gold", 6000);
+          if (Array.isArray(gData) && gData.length > 0 && gData[0]?.price) {
+            results.gold = { price: gData[0].price, change: 0, name: "Gold", live: true };
+            results.live = true;
+            if (!results.source) results.source = "metals.live";
+          }
+        } catch { /* silent */ }
+      }
+
+      // ═══ SOURCE 4: Synthetic DXY from exchange rates (FREE, CORS-enabled, NO proxy) ═══
+      if (!results.dxy?.live) {
+        try {
+          const fxData = await this._directFetch("https://open.er-api.com/v6/latest/USD", 8000);
+          if (fxData?.result === "success" && fxData?.rates) {
+            const r = fxData.rates;
+            // Official DXY basket weights: EUR 57.6%, JPY 13.6%, GBP 11.9%, CAD 9.1%, SEK 4.2%, CHF 3.6%
+            if (r.EUR && r.JPY && r.GBP && r.CAD && r.SEK && r.CHF) {
+              const syntheticDXY = 50.14348 
+                * Math.pow(1 / r.EUR, 0.576) 
+                * Math.pow(r.JPY, 0.136) 
+                * Math.pow(1 / r.GBP, 0.119) 
+                * Math.pow(r.CAD, 0.091) 
+                * Math.pow(r.SEK, 0.042) 
+                * Math.pow(r.CHF, 0.036);
+              // % change vs previous cached value (first fetch = 0%)
+              const prevDXY = this._cache?.dxy?.price || syntheticDXY;
+              const dxyChange = prevDXY !== syntheticDXY ? ((syntheticDXY - prevDXY) / prevDXY) * 100 : 0;
+              results.dxy = { price: Math.round(syntheticDXY * 100) / 100, change: dxyChange, name: "DXY", live: true, synthetic: true };
+              results.live = true;
+              if (!results.source) results.source = "exchange-rates";
+            }
+          }
+        } catch { /* silent */ }
+      }
+
+      // ═══ SOURCE 5: TwelveData fallback (rate-limit aware, via proxy) ═══
+      const tdOk = !this._tdRateLimited || Date.now() > this._tdCooldownUntil;
+      if (tdOk && (!results.sp500?.live || !results.dxy?.live || !results.gold?.live)) {
+        const tdSymbols = [
+          { key: "sp500", td: "SPX", name: "S&P 500" },
+          { key: "dxy", td: "DXY", name: "DXY" },
+          { key: "gold", td: "XAU/USD", name: "Gold" },
+        ];
+        for (const sym of tdSymbols) {
+          if (results[sym.key]?.live) continue;
+          const url = `https://api.twelvedata.com/time_series?symbol=${sym.td}&interval=1day&outputsize=2&format=JSON`;
+          const data = await this._proxyFetch(url, orderedProxies, 8000);
+          if (data?.code === 429 || data?.status === "error") {
+            this._tdRateLimited = true;
+            this._tdCooldownUntil = Date.now() + 3600000;
+            break;
+          }
+          if (data?.values?.length >= 2) {
+            const today = parseFloat(data.values[0].close);
+            const yesterday = parseFloat(data.values[1].close);
+            results[sym.key] = { price: today, change: ((today - yesterday) / yesterday) * 100, name: sym.name, live: true };
+            results.live = true;
+            if (!results.source) results.source = "twelvedata";
+          }
         }
       }
 
@@ -300,10 +354,20 @@ const MacroEngine = {
       else if (sp > 1 && dx < -0.5) results.regime = "BULLISH";
       else results.regime = "NEUTRAL";
 
+      // Debug log what worked
+      console.log("[NEXUS] Macro fetch:", 
+        "SP500=" + (results.sp500?.live ? "LIVE" : "FAIL"), 
+        "DXY=" + (results.dxy?.live ? "LIVE" : "FAIL"), 
+        "Gold=" + (results.gold?.live ? "LIVE" : "FAIL"), 
+        "via " + (results.source || "none"));
+
       // Cache successful results
       if (results.live) { this._cache = results; this._cacheTime = Date.now(); }
       return results;
-    } catch { return { sp500: null, dxy: null, gold: null, regime: "NEUTRAL", live: false, timestamp: Date.now(), source: "" }; }
+    } catch(e) { 
+      console.warn("[NEXUS] MacroEngine error:", e?.message);
+      return { sp500: null, dxy: null, gold: null, regime: "NEUTRAL", live: false, timestamp: Date.now(), source: "" }; 
+    }
   },
 
   // Score for AI decision engine: -20 to +20
