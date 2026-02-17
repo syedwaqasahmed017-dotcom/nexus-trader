@@ -2585,21 +2585,43 @@ export default function NexusV7() {
       MLEngine.init();
       setMlStats(MLEngine.getStats());
 
-      // Load API settings
+      // Load API settings (with hardcoded defaults for cross-device access)
+      const DEFAULT_KEYS = {
+        groqKey: "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",
+        geminiKey: "",
+      };
+      const DEFAULT_CLOUD = {
+        url: "https://weoveyphvuokmtlxwbgr.supabase.co",
+        key: "sb_publishable_ISM6jc6EqMjTxZ4HwoNooQ_MuctWqkh",
+        userId: "nexus1",
+      };
       const apiSettings = DB.get("api_settings", {});
+      const gk = apiSettings.groqKey || DEFAULT_KEYS.groqKey;
+      const gmk = apiSettings.geminiKey || DEFAULT_KEYS.geminiKey;
+      if (gk) { setGroqKey(gk.trim()); }
+      if (gmk) { setGeminiKey(gmk.trim()); }
       if (apiSettings.apiKey) setApiKey(apiSettings.apiKey);
       if (apiSettings.tradingMode) setTradingMode(apiSettings.tradingMode);
-      if (apiSettings.geminiKey) setGeminiKey(apiSettings.geminiKey.trim());
-      if (apiSettings.groqKey) setGroqKey(apiSettings.groqKey.trim());
+      // Auto-save defaults if not already saved
+      if (!apiSettings.groqKey && gk) {
+        DB.set("api_settings", { ...apiSettings, groqKey: gk, geminiKey: gmk });
+      }
 
-      // Load Cloud Sync settings
+      // Load Cloud Sync settings (with hardcoded defaults)
       const cloudSettings = DB.get("cloud_settings", {});
-      if (cloudSettings.url && cloudSettings.key && cloudSettings.userId) {
-        setCloudUrl(cloudSettings.url);
-        setCloudKey(cloudSettings.key);
-        setCloudUserId(cloudSettings.userId);
-        CloudSync.init(cloudSettings.url, cloudSettings.key, cloudSettings.userId);
+      const cUrl = cloudSettings.url || DEFAULT_CLOUD.url;
+      const cKey = cloudSettings.key || DEFAULT_CLOUD.key;
+      const cId = cloudSettings.userId || DEFAULT_CLOUD.userId;
+      if (cUrl && cKey && cId) {
+        setCloudUrl(cUrl);
+        setCloudKey(cKey);
+        setCloudUserId(cId);
+        CloudSync.init(cUrl, cKey, cId);
         setCloudStatus("idle");
+        // Auto-save defaults if not already saved
+        if (!cloudSettings.url) {
+          DB.set("cloud_settings", { url: cUrl, key: cKey, userId: cId });
+        }
       }
 
       const sess = Sessions.getCurrent();
