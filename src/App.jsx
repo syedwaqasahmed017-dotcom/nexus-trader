@@ -61,11 +61,14 @@ const ENDPOINTS = [
   "https://api4.binance.com",
 ];
 
+// ═══ YOUR PROXY (deployed on Render — never blocked) ═══
+const MY_PROXY = "https://nexus-proxy.onrender.com/proxy?url=";
+
 const CORS_PROXIES = [
+  MY_PROXY,
   "https://api.codetabs.com/v1/proxy?quest=",
   "https://api.allorigins.win/raw?url=",
   "https://corsproxy.io/?url=",
-  "https://thingproxy.freeboard.io/fetch/",
 ];
 
 // ╔══════════════════════════════════════════════════════════════╗
