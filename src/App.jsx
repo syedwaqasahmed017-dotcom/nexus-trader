@@ -62,7 +62,7 @@ const ENDPOINTS = [
 ];
 
 // ═══ YOUR PROXY (deployed on Render — never blocked) ═══
-const MY_PROXY = "https://nexus-proxy.onrender.com/proxy?url=";
+const MY_PROXY = "https://nexus-proxy-fd7v.onrender.com/proxy?url=";
 
 const CORS_PROXIES = [
   MY_PROXY,
