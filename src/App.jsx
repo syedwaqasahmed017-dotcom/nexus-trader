@@ -3544,8 +3544,11 @@ export default function NexusV7() {
             <div style={S.metric}><div style={{ fontSize: 8, color: K.dn }}>STOP LOSS</div><div style={{ fontSize: 13, fontWeight: 700, color: K.dn }}>${fx(aiResult.sl, pair.dp)}</div></div>
             <div style={S.metric}><div style={{ fontSize: 8, color: K.up }}>TAKE PROFIT</div><div style={{ fontSize: 13, fontWeight: 700, color: K.up }}>${fx(aiResult.tp, pair.dp)}</div></div>
             <div style={S.metric}><div style={{ fontSize: 8, color: K.txM }}>REGIME</div><div style={{ fontSize: 11, fontWeight: 700, color: K.gold }}>{aiResult.analysis?.regime || "-"}</div></div>
-            <div style={{ ...S.metric, border: aiResult.analysis?.marketBias === "bear" ? `1px solid ${K.dn}` : aiResult.analysis?.marketBias === "bull" ? `1px solid ${K.up}` : `1px solid ${K.txD}` }}><div style={{ fontSize: 8, color: K.txM }}>MKT BIAS</div><div style={{ fontSize: 13, fontWeight: 900, color: aiResult.analysis?.marketBias === "bear" ? K.dn : aiResult.analysis?.marketBias === "bull" ? K.up : K.warn }}>{(aiResult.analysis?.marketBias || "neutral").toUpperCase()} {aiResult.analysis?.marketBiasStrength > 0 ? `${aiResult.analysis.marketBiasStrength}%` : ""}</div></div>
           </div>}
+          <div style={{ display: "flex", gap: 12, marginTop: 8, flexWrap: "wrap" }}>
+            <div style={{ ...S.metric, border: aiResult.analysis?.marketBias === "bear" ? `1px solid ${K.dn}` : aiResult.analysis?.marketBias === "bull" ? `1px solid ${K.up}` : `1px solid ${K.txD}` }}><div style={{ fontSize: 8, color: K.txM }}>MKT BIAS</div><div style={{ fontSize: 13, fontWeight: 900, color: aiResult.analysis?.marketBias === "bear" ? K.dn : aiResult.analysis?.marketBias === "bull" ? K.up : K.warn }}>{(aiResult.analysis?.marketBias || "neutral").toUpperCase()} {aiResult.analysis?.marketBiasStrength > 0 ? `${aiResult.analysis.marketBiasStrength}%` : ""}</div></div>
+            <div style={S.metric}><div style={{ fontSize: 8, color: K.txM }}>REGIME</div><div style={{ fontSize: 11, fontWeight: 700, color: K.gold }}>{aiResult.analysis?.regime || "-"}</div></div>
+          </div>
 
           {/* ═══ SOCIAL DATA: F&G + Reddit + Macro ═══ */}
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 14 }}>
