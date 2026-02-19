@@ -121,55 +121,115 @@ const SocialEngine = {
     return { value: 50, label: "Neutral", trend: "stable", weekChange: 0, prevValue: 50, isExtremeFear: false, isExtremeGreed: false, isFear: false, isGreed: false, signal: 0, live: false, timestamp: Date.now() };
   },
 
-  // Fetch Reddit r/Bitcoin sentiment via JSON API
+  // Fetch Reddit r/Bitcoin sentiment — with backoff, caching, RSS fallback
+  _redditBackoff: 0,
+  _redditCache: null,
+  _redditConsecutiveFails: 0,
+
   async fetchRedditSentiment() {
     try {
-      const urls = [
-        "https://www.reddit.com/r/Bitcoin/hot.json?limit=25",
-        "https://old.reddit.com/r/Bitcoin/hot.json?limit=25",
-      ];
-      for (const baseUrl of urls) {
-        for (const proxy of CORS_PROXIES.filter(Boolean)) {
-          try {
-            const res = await fetch(proxy + encodeURIComponent(baseUrl), {
-              signal: AbortSignal.timeout(8000),
-            });
-            if (!res.ok) continue;
-            const data = await res.json();
-            if (!data?.data?.children?.length) continue;
-            const posts = data.data.children.map(p => p.data).filter(p => p && p.title);
-            let totalScore = 0;
-            let bullCount = 0, bearCount = 0, totalPosts = 0;
-            const bullWords = ["bull","moon","pump","ath","buy","long","breakout","rally","surge","adoption","institutional","etf approved","bullish","higher","recover","bounce","support held","accumulate","halving"];
-            const bearWords = ["bear","crash","dump","sell","short","plunge","fear","collapse","scam","ban","regulation","bubble","ponzi","correction","lower","resistance","breakdown","capitulation","bearish"];
+      // Return cache if backoff active
+      if (Date.now() < this._redditBackoff && this._redditCache) return this._redditCache;
 
-            for (const post of posts.slice(0, 25)) {
-              const text = (post.title + " " + (post.selftext || "")).toLowerCase();
-              let postScore = 0;
-              const upvoteWeight = Math.min(Math.log10(Math.max(post.ups || 1, 1)) / 3, 1.5);
-              bullWords.forEach(w => { if (text.includes(w)) postScore += 4 * upvoteWeight; });
-              bearWords.forEach(w => { if (text.includes(w)) postScore -= 4 * upvoteWeight; });
-              const ratio = post.upvote_ratio || 0.5;
-              postScore *= (0.5 + ratio);
-              totalScore += postScore;
-              if (postScore > 2) bullCount++;
-              else if (postScore < -2) bearCount++;
-              totalPosts++;
-            }
+      // Try JSON first, then RSS fallback
+      const result = await this._tryRedditJSON() || await this._tryRedditRSS();
 
-            const normalized = clamp(Math.round(totalScore / Math.max(totalPosts, 1) * 5), -100, 100);
-            const label = normalized > 25 ? "Bullish" : normalized > 8 ? "Slightly Bullish" : normalized < -25 ? "Bearish" : normalized < -8 ? "Slightly Bearish" : "Neutral";
-
-            return {
-              score: normalized, label, bullCount, bearCount, totalPosts,
-              signal: normalized > 30 ? 0.6 : normalized > 15 ? 0.3 : normalized < -30 ? -0.6 : normalized < -15 ? -0.3 : 0,
-              live: true, timestamp: Date.now(),
-            };
-          } catch { continue; }
-        }
+      if (result) {
+        this._redditCache = result;
+        this._redditConsecutiveFails = 0;
+        this._redditBackoff = 0;
+        return result;
       }
-      return this._fallbackReddit();
-    } catch { return this._fallbackReddit(); }
+
+      // All failed — exponential backoff (max 30min)
+      this._redditConsecutiveFails++;
+      const backoffMs = Math.min(1800000, 60000 * Math.pow(2, this._redditConsecutiveFails));
+      this._redditBackoff = Date.now() + backoffMs;
+      console.warn(`[NEXUS] Reddit: ${this._redditConsecutiveFails} fails, backoff ${Math.round(backoffMs/1000)}s`);
+      return this._redditCache || this._fallbackReddit();
+    } catch { return this._redditCache || this._fallbackReddit(); }
+  },
+
+  async _tryRedditJSON() {
+    const urls = [
+      "https://www.reddit.com/r/Bitcoin/hot.json?limit=25",
+      "https://www.reddit.com/r/cryptocurrency/hot.json?limit=25",
+    ];
+    const proxyList = CORS_PROXIES.filter(Boolean);
+    for (const baseUrl of urls) {
+      for (const proxy of proxyList) {
+        try {
+          const res = await fetch(proxy + encodeURIComponent(baseUrl), {
+            signal: AbortSignal.timeout(10000),
+            headers: { "Accept": "application/json" },
+          });
+          if (res.status === 429 || res.status === 403) continue;
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (!data?.data?.children?.length) continue;
+          return this._parseRedditPosts(data.data.children.map(p => p.data).filter(p => p && p.title));
+        } catch { continue; }
+      }
+    }
+    return null;
+  },
+
+  async _tryRedditRSS() {
+    // RSS feeds are less rate-limited than JSON API
+    const urls = [
+      "https://www.reddit.com/r/Bitcoin/hot.rss?limit=20",
+      "https://www.reddit.com/r/cryptocurrency/hot.rss?limit=20",
+    ];
+    const proxyList = CORS_PROXIES.filter(Boolean);
+    for (const baseUrl of urls) {
+      for (const proxy of proxyList) {
+        try {
+          const res = await fetch(proxy + encodeURIComponent(baseUrl), {
+            signal: AbortSignal.timeout(10000),
+          });
+          if (res.status === 429 || res.status === 403) continue;
+          if (!res.ok) continue;
+          const text = await res.text();
+          const titleMatches = [...text.matchAll(/<title[^>]*>([\s\S]*?)<\/title>/gi)];
+          if (titleMatches.length < 3) continue;
+          const posts = titleMatches.slice(1).map(m => ({
+            title: m[1].replace(/<!\[CDATA\[|\]\]>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").trim(),
+            ups: 10, upvote_ratio: 0.7, selftext: "",
+          }));
+          if (posts.length > 0) return this._parseRedditPosts(posts);
+        } catch { continue; }
+      }
+    }
+    return null;
+  },
+
+  _parseRedditPosts(posts) {
+    try {
+      let totalScore = 0;
+      let bullCount = 0, bearCount = 0, totalPosts = 0;
+      const bullWords = ["bull","moon","pump","ath","buy","long","breakout","rally","surge","adoption","institutional","etf approved","bullish","higher","recover","bounce","support held","accumulate","halving"];
+      const bearWords = ["bear","crash","dump","sell","short","plunge","fear","collapse","scam","ban","regulation","bubble","ponzi","correction","lower","resistance","breakdown","capitulation","bearish"];
+      for (const post of posts.slice(0, 25)) {
+        const text = (post.title + " " + (post.selftext || "")).toLowerCase();
+        let postScore = 0;
+        const upvoteWeight = Math.min(Math.log10(Math.max(post.ups || 1, 1)) / 3, 1.5);
+        bullWords.forEach(w => { if (text.includes(w)) postScore += 4 * upvoteWeight; });
+        bearWords.forEach(w => { if (text.includes(w)) postScore -= 4 * upvoteWeight; });
+        const ratio = post.upvote_ratio || 0.5;
+        postScore *= (0.5 + ratio);
+        totalScore += postScore;
+        if (postScore > 2) bullCount++;
+        else if (postScore < -2) bearCount++;
+        totalPosts++;
+      }
+      const normalized = clamp(Math.round(totalScore / Math.max(totalPosts, 1) * 5), -100, 100);
+      const label = normalized > 25 ? "Bullish" : normalized > 8 ? "Slightly Bullish" : normalized < -25 ? "Bearish" : normalized < -8 ? "Slightly Bearish" : "Neutral";
+      return {
+        score: normalized, label, bullCount, bearCount, totalPosts,
+        signal: normalized > 30 ? 0.6 : normalized > 15 ? 0.3 : normalized < -30 ? -0.6 : normalized < -15 ? -0.3 : 0,
+        live: true, timestamp: Date.now(),
+      };
+    } catch { return null; }
   },
 
   _fallbackReddit() {
@@ -675,9 +735,9 @@ const LLMEngine = {
       return `BTC trading analyst. JSON only.
 
 ${symbol} $${currentPrice.toFixed(0)} RSI:${ind.rsi?.toFixed(0)||"?"} MACD:${ind.macd?.toFixed(1)||"?"} EMA9v21:${currentPrice>(ind.ema9||0)?"above":"below"} BB:${ind.bbPos?.toFixed(1)||"?"} Vol:${ind.volRatio?.toFixed(1)||"?"}x ${aiResult?.analysis?.regime||"?"}
-Signal:${aiResult?.action||"WAIT"} ${aiResult?.confidence?.toFixed(0)||0}% | F&G:${fg.value||"?"} ${fg.label||""} | Macro:${macro.regime||"?"} | Bal:$${balance?.toFixed(0)||100} ${recentWins}W/${recentLosses}L
+Signal:${aiResult?.action||"WAIT"} ${aiResult?.confidence?.toFixed(0)||0}% | F&G:${fg.value||"?"} ${fg.label||""} | Macro:${macro.regime||"?"} | Bias:${ind.marketBias||"neutral"} | Bal:$${balance?.toFixed(0)||100} ${recentWins}W/${recentLosses}L
 ${brainStats?.brainSize > 0 ? `Brain:${brainStats.brainSize} WR:${brainStats.totalWins+brainStats.totalLosses>0?((brainStats.totalWins/(brainStats.totalWins+brainStats.totalLosses))*100).toFixed(0):"0"}%` : ""}
-Fee:0.4% RT. Trade ONLY if move>0.6%.
+Fee:0.4% RT. Trade ONLY if move>0.6%. In bear markets, prefer shorts over contrarian longs.
 
 {"action":"LONG|SHORT|WAIT","confidence":0-100,"reasoning":"1 sentence","risks":"brief","conviction":"HIGH|MEDIUM|LOW","override":false,"adjustConfidence":0}`;
     } catch { return null; }
@@ -1978,6 +2038,7 @@ const Brain = {
       this.wins = DB.get("brain_wins", []);
       this.coolUntil = DB.get("brain_cool", 0);
       this.sessionTrades = DB.get("brain_sessions", {});
+      this._pruneOldSessions();
     } catch { this.losses = []; this.wins = []; this.coolUntil = 0; this.sessionTrades = {}; }
   },
   save() {
@@ -1985,7 +2046,21 @@ const Brain = {
       DB.set("brain_losses", this.losses.slice(-2000));
       DB.set("brain_wins", this.wins.slice(-2000));
       DB.set("brain_cool", this.coolUntil);
+      this._pruneOldSessions();
       DB.set("brain_sessions", this.sessionTrades);
+    } catch {}
+  },
+  _pruneOldSessions() {
+    try {
+      const MAX_AGE = 30 * 24 * 3600000; // 30 days
+      const now = Date.now();
+      const keys = Object.keys(this.sessionTrades);
+      if (keys.length <= 720) return; // ~30 days of hourly keys, no need to prune yet
+      for (const key of keys) {
+        const dateStr = key.split("_").slice(1).join("_");
+        const ts = new Date(dateStr + ":00:00Z").getTime();
+        if (!isNaN(ts) && now - ts > MAX_AGE) delete this.sessionTrades[key];
+      }
     } catch {}
   },
   fingerprint(indicators, action, symbol) {
@@ -2004,6 +2079,7 @@ const Brain = {
         "srsi" + (Math.round((i.stochRSI || 50) / 10) * 10),
         "sess" + session,
         "news" + (i.newsScore > 20 ? "B" : i.newsScore < -20 ? "R" : "N"),
+        "bias" + (i.marketBias || "n"),
       ].join("|");
     } catch { return "unknown"; }
   },
@@ -2147,6 +2223,63 @@ function detectRegime(candles, atr, bbWidth) {
   } catch { return "unknown"; }
 }
 
+// ═══ MARKET BIAS DETECTION — Adapts strategy to bull/bear/neutral ═══
+// Looks at MA alignment + trend + momentum to determine market direction
+// Prevents contrarian F&G from fighting a clear trend
+function detectMarketBias(closes, price, ema9, ema21, ema50, mom5, mom20, trendStr) {
+  try {
+    let bearSignals = 0, bullSignals = 0;
+    // MA alignment (short-term)
+    if (price < ema9 && price < ema21) bearSignals += 2;
+    else if (price > ema9 && price > ema21) bullSignals += 2;
+    if (ema50 !== null) {
+      if (price < ema50 && ema9 < ema50) bearSignals += 2;
+      else if (price > ema50 && ema9 > ema50) bullSignals += 2;
+    }
+    if (ema9 < ema21) bearSignals += 1; else bullSignals += 1;
+    // Momentum
+    if (mom5 < -0.5 && mom20 < -1) bearSignals += 2;
+    else if (mom5 > 0.5 && mom20 > 1) bullSignals += 2;
+    // Trend strength
+    if (trendStr < -2) bearSignals += 1;
+    else if (trendStr > 2) bullSignals += 1;
+    // 20-period trend: how many of last 20 closes were declining
+    const recent20 = closes.slice(-20);
+    if (recent20.length >= 20) {
+      const declining = recent20.filter((c, i) => i > 0 && c < recent20[i - 1]).length;
+      if (declining >= 13) bearSignals += 2;
+      else if (declining <= 7) bullSignals += 2;
+    }
+    // ═══ LONGER LOOKBACK: Use full candle history for macro trend ═══
+    // 100-candle trend (covers ~1.7 hours of 1-min data)
+    if (closes.length >= 100) {
+      const avg100 = closes.slice(-100).reduce((a, b) => a + b, 0) / 100;
+      const pctFrom100 = (price - avg100) / avg100 * 100;
+      if (pctFrom100 < -0.5) bearSignals += 2;
+      else if (pctFrom100 > 0.5) bullSignals += 2;
+    }
+    // 300-candle trend (covers ~5 hours — strong directional signal)
+    if (closes.length >= 300) {
+      const avg300 = closes.slice(-300).reduce((a, b) => a + b, 0) / 300;
+      const pctFrom300 = (price - avg300) / avg300 * 100;
+      if (pctFrom300 < -0.8) bearSignals += 3; // heavy weight — this is a macro signal
+      else if (pctFrom300 > 0.8) bullSignals += 3;
+      // Also check slope: is avg300 itself declining over time?
+      const earlyAvg = closes.slice(-300, -200).reduce((a, b) => a + b, 0) / 100;
+      const lateAvg = closes.slice(-100).reduce((a, b) => a + b, 0) / 100;
+      const slope = (lateAvg - earlyAvg) / earlyAvg * 100;
+      if (slope < -0.3) bearSignals += 2;
+      else if (slope > 0.3) bullSignals += 2;
+    }
+    const total = bearSignals + bullSignals;
+    if (total === 0) return { bias: "neutral", strength: 0, bearSignals, bullSignals };
+    // Lower threshold: 1.5x instead of 2x — easier to detect directional markets
+    if (bearSignals >= bullSignals * 1.5) return { bias: "bear", strength: Math.min(100, bearSignals * 8), bearSignals, bullSignals };
+    if (bullSignals >= bearSignals * 1.5) return { bias: "bull", strength: Math.min(100, bullSignals * 8), bearSignals, bullSignals };
+    return { bias: "neutral", strength: Math.abs(bearSignals - bullSignals) * 8, bearSignals, bullSignals };
+  } catch { return { bias: "neutral", strength: 0, bearSignals: 0, bullSignals: 0 }; }
+}
+
 function analyzeSentiment(candles, volume, rsi, atrPct) {
   try {
     if (candles.length < 40) return { score: 50, label: "Neutral", signal: 0 };
@@ -2252,6 +2385,8 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     const nearSupport = priceInRange < 0.15;
     const nearResistance = priceInRange > 0.85;
     const regime = detectRegime(candles, atrVal, bbWidth);
+    const marketBias = detectMarketBias(closes, price, curEma9, curEma21, curEma50, mom5, mom20, trendStr);
+    console.log(`[NEXUS] MarketBias: ${marketBias.bias} ${marketBias.strength}% (bear=${marketBias.bearSignals} bull=${marketBias.bullSignals}) closes=${closes.length}`);
     const sentiment = analyzeSentiment(candles, volumes, curRSI, atrPct);
     const candlePatterns = detectCandlePatterns(candles);
     const newsImpact = NewsEngine.getNewsSentiment(news || [], symbol);
@@ -2267,6 +2402,7 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       ema9: curEma9, ema21: curEma21, ema50: curEma50, stochRSI: curSRSI, vwap: curVWAP, obvTrend,
       volRatio, trendStr, mom5, mom20, regime, sentiment: sentiment.score, greenStreak, redStreak,
       support: recentLow, resistance: recentHigh, newsScore: newsImpact.score, sessionName: sessionInfo.primary.name,
+      marketBias: marketBias.bias, marketBiasStrength: marketBias.strength,
     };
 
     const sessionBal = sessionStart || INITIAL_BALANCE;
@@ -2328,22 +2464,53 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     if (regime === "squeeze") reasons.push("Squeeze - big move coming");
     if (regime === "volatile") reasons.push("High volatility - caution");
 
-    if (sentiment.signal > 0.5) { bull += 10; reasons.push(`Extreme Fear (${sentiment.score}) - contrarian buy`); }
-    else if (sentiment.signal < -0.5) { bear += 10; reasons.push(`Extreme Greed (${sentiment.score}) - contrarian sell`); }
-    else if (sentiment.signal > 0) { bull += 4; } else if (sentiment.signal < 0) { bear += 4; }
+    // Local sentiment — context-aware: fear in bear market confirms trend
+    if (marketBias.bias === "bear" && marketBias.strength > 30) {
+      // In bear market, fear = confirmation, greed = contrarian sell
+      if (sentiment.signal > 0.5) { /* extreme fear in bear = neutral, don't add bull */ reasons.push(`Fear (${sentiment.score}) in bear trend - confirmation`); }
+      else if (sentiment.signal < -0.5) { bear += 10; reasons.push(`Greed (${sentiment.score}) in bear trend - sell`); }
+      else if (sentiment.signal < 0) { bear += 4; }
+    } else {
+      // Normal/bull: traditional contrarian
+      if (sentiment.signal > 0.5) { bull += 10; reasons.push(`Extreme Fear (${sentiment.score}) - contrarian buy`); }
+      else if (sentiment.signal < -0.5) { bear += 10; reasons.push(`Extreme Greed (${sentiment.score}) - contrarian sell`); }
+      else if (sentiment.signal > 0) { bull += 4; } else if (sentiment.signal < 0) { bear += 4; }
+    }
 
-    // ═══ REAL FEAR & GREED INDEX (Alternative.me API) ═══
+    // ═══ REAL FEAR & GREED INDEX — CONTEXT-AWARE (v7.1) ═══
+    // In bull/neutral markets: contrarian (buy fear, sell greed)
+    // In bear markets: fear CONFIRMS trend, only contrarian on reversal signals
     const fg = socialFG || SocialEngine._fallbackFG();
     if (fg.live) {
-      if (fg.value <= 10) { bull += 18; reasons.push(`F&G EXTREME FEAR (${fg.value}) - strong contrarian buy`); }
-      else if (fg.value <= 20) { bull += 14; reasons.push(`F&G Extreme Fear (${fg.value}) - contrarian buy`); }
-      else if (fg.value <= 30) { bull += 8; reasons.push(`F&G Fear (${fg.value}) - accumulation zone`); }
-      else if (fg.value >= 90) { bear += 18; reasons.push(`F&G EXTREME GREED (${fg.value}) - strong contrarian sell`); }
-      else if (fg.value >= 80) { bear += 14; reasons.push(`F&G Extreme Greed (${fg.value}) - contrarian sell`); }
-      else if (fg.value >= 70) { bear += 8; reasons.push(`F&G Greed (${fg.value}) - caution zone`); }
-      // F&G trend amplifier
-      if (fg.trend === "falling" && fg.value < 35) { bull += 4; reasons.push("F&G falling → deeper fear"); }
-      if (fg.trend === "rising" && fg.value > 65) { bear += 4; reasons.push("F&G rising → more greed"); }
+      const isBearMarket = marketBias.bias === "bear" && marketBias.strength > 30;
+      const isBullMarket = marketBias.bias === "bull" && marketBias.strength > 30;
+      const hasReversalSignals = (curRSI < 25 && curRSI > prevRSI) || macdCross === "bullCross" || (nearSupport && candlePatterns.some(p => p.signal > 0));
+
+      if (isBearMarket) {
+        // ═══ BEAR MARKET: Fear confirms trend, don't fight it ═══
+        if (fg.value <= 10) {
+          if (hasReversalSignals) { bull += 8; reasons.push(`F&G Extreme Fear (${fg.value}) + reversal signals - cautious buy`); }
+          else { bear += 6; reasons.push(`F&G Extreme Fear (${fg.value}) confirms bear trend`); }
+        } else if (fg.value <= 20) {
+          if (hasReversalSignals) { bull += 5; reasons.push(`F&G Fear (${fg.value}) + reversal signals`); }
+          else { bear += 4; reasons.push(`F&G Fear (${fg.value}) confirms downtrend`); }
+        } else if (fg.value <= 30) {
+          // mild fear in bear market — neutral, slight bear confirmation
+          bear += 2;
+        } else if (fg.value >= 80) { bear += 18; reasons.push(`F&G Extreme Greed (${fg.value}) in bear market - strong sell`); }
+        else if (fg.value >= 70) { bear += 12; reasons.push(`F&G Greed (${fg.value}) in bear market - sell`); }
+      } else {
+        // ═══ BULL/NEUTRAL MARKET: Traditional contrarian works ═══
+        if (fg.value <= 10) { bull += 18; reasons.push(`F&G EXTREME FEAR (${fg.value}) - strong contrarian buy`); }
+        else if (fg.value <= 20) { bull += 14; reasons.push(`F&G Extreme Fear (${fg.value}) - contrarian buy`); }
+        else if (fg.value <= 30) { bull += 8; reasons.push(`F&G Fear (${fg.value}) - accumulation zone`); }
+        else if (fg.value >= 90) { bear += 18; reasons.push(`F&G EXTREME GREED (${fg.value}) - strong contrarian sell`); }
+        else if (fg.value >= 80) { bear += 14; reasons.push(`F&G Extreme Greed (${fg.value}) - contrarian sell`); }
+        else if (fg.value >= 70) { bear += 8; reasons.push(`F&G Greed (${fg.value}) - caution zone`); }
+      }
+      // F&G trend amplifier — only in matching market direction
+      if (fg.trend === "falling" && fg.value < 35 && !isBearMarket) { bull += 4; reasons.push("F&G falling \u2192 deeper fear (contrarian)"); }
+      if (fg.trend === "rising" && fg.value > 65) { bear += 4; reasons.push("F&G rising \u2192 more greed"); }
     }
 
     // ═══ REDDIT SENTIMENT (r/Bitcoin) ═══
@@ -2446,7 +2613,7 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
 
     return {
       action, confidence: finalConf, sl, tp, reasons: reasons.slice(0, 18), indicators, bullScore: fx(bullPct, 1), bearScore: fx(bearPct, 1), riskLevel,
-      analysis: { phase, regime, candlePattern: candlePatterns.length > 0 ? candlePatterns[0].name : "None", totalFactors: 26, brainPatterns: Brain.losses.length + Brain.wins.length, mlTrained: MLEngine._trained },
+      analysis: { phase, regime, marketBias: marketBias.bias, marketBiasStrength: marketBias.strength, candlePattern: candlePatterns.length > 0 ? candlePatterns[0].name : "None", totalFactors: 26, brainPatterns: Brain.losses.length + Brain.wins.length, mlTrained: MLEngine._trained },
       sentiment, patterns: candlePatterns, newsImpact, fakeAlert, session: sessionInfo,
       socialFG: fg, socialReddit: rd, macroSignal, macroData: macro, onChainSignal, onChainData: onChain, mlPrediction,
     };
@@ -2774,8 +2941,8 @@ export default function NexusV7() {
       try {
         const fg = await SocialEngine.fetchFearGreed();
         setFgData(fg);
-        if (fg.live && fg.isExtremeFear) addLog("SOCIAL", `F&G EXTREME FEAR: ${fg.value} — strong contrarian buy signal`);
-        if (fg.live && fg.isExtremeGreed) addLog("SOCIAL", `F&G EXTREME GREED: ${fg.value} — contrarian sell warning`);
+        if (fg.live && fg.isExtremeFear) addLog("SOCIAL", `F&G EXTREME FEAR: ${fg.value} — monitoring for signals`);
+        if (fg.live && fg.isExtremeGreed) addLog("SOCIAL", `F&G EXTREME GREED: ${fg.value} — monitoring for signals`);
       } catch {}
     };
     fn(); const i = setInterval(fn, 300000); return () => clearInterval(i);
@@ -2789,7 +2956,7 @@ export default function NexusV7() {
         setRedditData(rd);
       } catch {}
     };
-    fn(); const i = setInterval(fn, 180000); return () => clearInterval(i);
+    fn(); const i = setInterval(fn, 600000); return () => clearInterval(i); // 10min — Reddit rate-limits aggressively
   }, []);
 
   // ═══ FETCH MACRO DATA — S&P, DXY, Gold (every 10 min) ═══
@@ -3009,10 +3176,22 @@ export default function NexusV7() {
         tradeConf = Math.max(0, Math.min(95, tradeConf + llmResult.adjustConfidence));
       }
 
-      // ═══ SHORT SIGNAL HARDENING ═══
-      // Crypto has upward bias — require 8% extra confidence for shorts
+      // ═══ DYNAMIC SHORT CONFIDENCE — adapts to market bias (v7.1) ═══
+      // Bull market: shorts need extra confidence (crypto upward bias)
+      // Bear market: shorts get a BONUS (trend-aligned)
+      // Neutral: small penalty
       if (aiResult.action === "SHORT") {
-        tradeConf -= 8;
+        const bias = aiResult?.indicators?.marketBias || "neutral";
+        const biasStr = aiResult?.indicators?.marketBiasStrength || 0;
+        if (bias === "bear" && biasStr > 40) {
+          tradeConf += 4; // Bear market: shorts are trend-aligned, small boost
+        } else if (bias === "bear") {
+          // mild bear: no penalty, no bonus
+        } else if (bias === "bull" && biasStr > 40) {
+          tradeConf -= 12; // Strong bull: shorts heavily penalized
+        } else {
+          tradeConf -= 5; // Neutral: small penalty (was -8)
+        }
         if (tradeConf < MIN_CONF_TO_TRADE) return;
       }
 
@@ -3361,10 +3540,11 @@ export default function NexusV7() {
             <input type="range" min="0.5" max="5" step="0.5" value={riskPct} onChange={e => setRiskPct(+e.target.value)}/>
             <span style={{ fontSize: 10, color: K.gold, fontWeight: 700 }}>{riskPct}%</span>
           </div>
-          {aiResult.sl > 0 && <div style={{ display: "flex", gap: 12, marginTop: 12 }}>
+          {aiResult.sl > 0 && <div style={{ display: "flex", gap: 12, marginTop: 12, flexWrap: "wrap" }}>
             <div style={S.metric}><div style={{ fontSize: 8, color: K.dn }}>STOP LOSS</div><div style={{ fontSize: 13, fontWeight: 700, color: K.dn }}>${fx(aiResult.sl, pair.dp)}</div></div>
             <div style={S.metric}><div style={{ fontSize: 8, color: K.up }}>TAKE PROFIT</div><div style={{ fontSize: 13, fontWeight: 700, color: K.up }}>${fx(aiResult.tp, pair.dp)}</div></div>
             <div style={S.metric}><div style={{ fontSize: 8, color: K.txM }}>REGIME</div><div style={{ fontSize: 11, fontWeight: 700, color: K.gold }}>{aiResult.analysis?.regime || "-"}</div></div>
+            <div style={{ ...S.metric, border: aiResult.analysis?.marketBias === "bear" ? `1px solid ${K.dn}` : aiResult.analysis?.marketBias === "bull" ? `1px solid ${K.up}` : `1px solid ${K.txD}` }}><div style={{ fontSize: 8, color: K.txM }}>MKT BIAS</div><div style={{ fontSize: 13, fontWeight: 900, color: aiResult.analysis?.marketBias === "bear" ? K.dn : aiResult.analysis?.marketBias === "bull" ? K.up : K.warn }}>{(aiResult.analysis?.marketBias || "neutral").toUpperCase()} {aiResult.analysis?.marketBiasStrength > 0 ? `${aiResult.analysis.marketBiasStrength}%` : ""}</div></div>
           </div>}
 
           {/* ═══ SOCIAL DATA: F&G + Reddit + Macro ═══ */}
