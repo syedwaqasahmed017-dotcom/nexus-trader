@@ -3525,30 +3525,97 @@ export default function NexusV7() {
     } catch {}
   }, [aiResult, aiActive, llmResult, drawdownState, cooldownUntil, lastDataUpdate, candles, isLive, mtfData]);
 
-  // ═══ SL/TP MONITOR ═══
+  // ═══ SL/TP MONITOR + MTF-AWARE SMART EXITS (v7.2) ═══
   useEffect(() => {
     try {
       if (!price || positions.length === 0) return;
       // ═══ DATA INTEGRITY: Don't trigger SL/TP on stale prices ═══
       const dataAge = Date.now() - lastDataUpdate;
       if (dataAge > STALE_SL_BLOCK) return; // stale price could trigger wrong exits
+      const mtfCombined = mtfData?.combined;
       setPositions(prev => {
         let changed = false;
         const updated = prev.filter(p => {
           if (p.pair !== pair.sym) return true;
           const pnl = p.side === "LONG" ? (price - p.entry) * p.qty : (p.entry - price) * p.qty;
           const pnlPct = (pnl / p.cost) * 100;
-          // Trailing stops — wider thresholds to reduce premature exits
-          if (pnlPct > 2 && p.sl) {
+          const holdMins = (Date.now() - new Date(p.entryTime).getTime()) / 60000;
+
+          // ═══ MTF-AWARE TRAILING STOPS ═══
+          const mtfConfirms = mtfCombined?.valid && (
+            (p.side === "LONG" && mtfCombined.trend === "bullish") ||
+            (p.side === "SHORT" && mtfCombined.trend === "bearish")
+          );
+          const mtfAgainst = mtfCombined?.valid && (
+            (p.side === "LONG" && mtfCombined.trend === "bearish") ||
+            (p.side === "SHORT" && mtfCombined.trend === "bullish")
+          );
+          const mtfAlignedAgainst = mtfAgainst && mtfCombined.aligned;
+
+          // === TRAIL TO BREAKEVEN ===
+          // Normal: at 2% profit. MTF against: at 1.2% (faster protection)
+          const beThreshold = mtfAgainst ? 1.2 : 2;
+          if (pnlPct > beThreshold && p.sl) {
             const be = p.entry + (p.side === "LONG" ? 1 : -1) * (p.cost * FEE_RATE * 2 / p.qty);
-            if (p.side === "LONG" && p.sl < be) { p.sl = be; addLog("AI", `Trail SL to breakeven ${p.pairName}`); }
-            if (p.side === "SHORT" && p.sl > be) { p.sl = be; addLog("AI", `Trail SL to breakeven ${p.pairName}`); }
+            if (p.side === "LONG" && p.sl < be) { p.sl = be; addLog("AI", `Trail SL to breakeven ${p.pairName}${mtfAgainst ? " (MTF opposing)" : ""}`); }
+            if (p.side === "SHORT" && p.sl > be) { p.sl = be; addLog("AI", `Trail SL to breakeven ${p.pairName}${mtfAgainst ? " (MTF opposing)" : ""}`); }
           }
-          if (pnlPct > 3.5 && p.sl) {
-            const trail = p.side === "LONG" ? price - (price - p.entry) * 0.4 : price + (p.entry - price) * 0.4;
-            if (p.side === "LONG" && trail > p.sl) p.sl = trail;
-            if (p.side === "SHORT" && trail < p.sl) p.sl = trail;
+
+          // === PROFIT TRAILING ===
+          // MTF confirms: keep 30% of profit (wider trail, let winners run)
+          // MTF neutral: keep 40% of profit (standard)
+          // MTF against: keep 55% of profit (tight trail, protect gains)
+          const trailThreshold = mtfConfirms ? 4.5 : mtfAgainst ? 2.5 : 3.5;
+          const trailKeep = mtfConfirms ? 0.3 : mtfAgainst ? 0.55 : 0.4;
+          if (pnlPct > trailThreshold && p.sl) {
+            const trail = p.side === "LONG" ? price - (price - p.entry) * trailKeep : price + (p.entry - price) * trailKeep;
+            if (p.side === "LONG" && trail > p.sl) { p.sl = trail; }
+            if (p.side === "SHORT" && trail < p.sl) { p.sl = trail; }
           }
+
+          // === MTF EARLY EXIT: Take profit when MTF turns against profitable position ===
+          // If profitable >1.5% and MTF is ALIGNED against you, take the money and run
+          if (pnlPct > 1.5 && mtfAlignedAgainst) {
+            addLog("MTF", `SMART EXIT: ${p.side} ${p.pairName} +${pnlPct.toFixed(1)}% \u2014 MTF aligned against, locking profit`);
+            closeTrade(p, price, "MTF Smart Exit");
+            changed = true;
+            return false;
+          }
+
+          // === MTF FAST CUT: Cut losers faster when MTF confirms you're wrong ===
+          // If losing >0.8% and MTF is aligned against you and held >5 min, exit early
+          if (pnlPct < -0.8 && mtfAlignedAgainst && holdMins > 5) {
+            addLog("MTF", `FAST CUT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% \u2014 MTF aligned against, cutting loss early`);
+            closeTrade(p, price, "MTF Fast Cut");
+            changed = true;
+            return false;
+          }
+
+          // === TIME-BASED EXIT: Stale positions with no MTF support ===
+          // If held >120 min, in loss, and MTF is neutral or against — exit
+          if (holdMins > 120 && pnlPct < 0 && !mtfConfirms) {
+            addLog("AI", `TIME EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% after ${Math.round(holdMins)}min \u2014 no MTF support`);
+            closeTrade(p, price, "Time Exit (no MTF support)");
+            changed = true;
+            return false;
+          }
+
+          // === EXTENDED WINNER HOLD: Let winners ride when MTF confirms ===
+          // When MTF confirms and profit >3%, push TP target 30% further
+          if (pnlPct > 3 && mtfConfirms && mtfCombined.aligned && p.tp) {
+            const tpDist = Math.abs(p.tp - p.entry);
+            const extendedTp = p.side === "LONG" ? p.entry + tpDist * 1.3 : p.entry - tpDist * 1.3;
+            if (p.side === "LONG" && extendedTp > p.tp) {
+              addLog("MTF", `Extending TP: ${p.pairName} \u2192 $${extendedTp.toFixed(pair.dp)} (MTF aligned, letting winner run)`);
+              p.tp = extendedTp;
+            }
+            if (p.side === "SHORT" && extendedTp < p.tp) {
+              addLog("MTF", `Extending TP: ${p.pairName} \u2192 $${extendedTp.toFixed(pair.dp)} (MTF aligned, letting winner run)`);
+              p.tp = extendedTp;
+            }
+          }
+
+          // === STANDARD SL/TP HITS ===
           if (p.sl && ((p.side === "LONG" && price <= p.sl) || (p.side === "SHORT" && price >= p.sl))) { closeTrade(p, price, "Stop Loss"); changed = true; return false; }
           if (p.tp && ((p.side === "LONG" && price >= p.tp) || (p.side === "SHORT" && price <= p.tp))) { closeTrade(p, price, "Take Profit"); changed = true; return false; }
           return true;
@@ -3556,7 +3623,7 @@ export default function NexusV7() {
         return changed ? updated : prev;
       });
     } catch {}
-  }, [price, lastDataUpdate]);
+  }, [price, lastDataUpdate, mtfData]);
 
   // ═══ TRADE EXECUTION ═══
   function executeTrade(side, amount, sl, tp, isAI = false) {
