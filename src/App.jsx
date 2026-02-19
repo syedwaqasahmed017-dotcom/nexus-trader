@@ -3429,15 +3429,44 @@ export default function NexusV7() {
       // Drawdown escalation check
       if (drawdownState?.isPaused) { return; }
 
+      // ═══ MTF ALIGNMENT GATE (v7.2) — Don't trade against the big picture ═══
+      // Require multi-timeframe agreement before opening positions
+      const mtfCombined = mtfData?.combined;
+      if (mtfCombined && mtfCombined.valid) {
+        // HARD BLOCK: Never open a LONG when MTF is aligned bearish (or vice versa)
+        if (aiResult.action === "LONG" && mtfCombined.trend === "bearish" && mtfCombined.aligned) {
+          addLog("MTF", "BLOCKED LONG: 3+ timeframes aligned bearish — not fighting the trend");
+          return;
+        }
+        if (aiResult.action === "SHORT" && mtfCombined.trend === "bullish" && mtfCombined.aligned) {
+          addLog("MTF", "BLOCKED SHORT: 3+ timeframes aligned bullish — not fighting the trend");
+          return;
+        }
+        // SOFT GATE: When MTF is neutral or weak, require higher confidence
+        if (mtfCombined.trend === "neutral" || mtfCombined.strength < 20) {
+          // MTF unclear — raise the bar by 8 points
+          if (aiResult.confidence < MIN_CONF_TO_TRADE + 8) {
+            return; // silently skip — MTF not confirming, need extra confidence
+          }
+        }
+        // BONUS: When MTF confirms trade direction, boost confidence
+        if (aiResult.action === "LONG" && mtfCombined.trend === "bullish") {
+          // Trade is WITH the MTF trend — no extra gate needed
+        }
+        if (aiResult.action === "SHORT" && mtfCombined.trend === "bearish") {
+          // Trade is WITH the MTF trend — no extra gate needed
+        }
+      }
+
       let tradeConf = aiResult.confidence;
       if ((geminiKey || groqKey) && llmResult?.live && llmResult.adjustConfidence) {
         tradeConf = Math.max(0, Math.min(95, tradeConf + llmResult.adjustConfidence));
       }
 
-      // ═══ DYNAMIC SHORT CONFIDENCE — adapts to market bias (v7.1) ═══
+      // ═══ DYNAMIC SHORT CONFIDENCE — adapts to market bias + MTF (v7.2) ═══
       // Bull market: shorts need extra confidence (crypto upward bias)
       // Bear market: shorts get a BONUS (trend-aligned)
-      // Neutral: small penalty
+      // MTF aligned: additional boost/penalty
       if (aiResult.action === "SHORT") {
         const bias = aiResult?.indicators?.marketBias || "neutral";
         const biasStr = aiResult?.indicators?.marketBiasStrength || 0;
@@ -3450,7 +3479,18 @@ export default function NexusV7() {
         } else {
           tradeConf -= 5; // Neutral: small penalty (was -8)
         }
+        // MTF alignment bonus for shorts
+        if (mtfCombined?.valid && mtfCombined.trend === "bearish" && mtfCombined.aligned) {
+          tradeConf += 6; // All timeframes say down — high conviction short
+          addLog("MTF", `Short +6 conf: MTF aligned bearish ${mtfCombined.strength}%`);
+        }
         if (tradeConf < MIN_CONF_TO_TRADE) return;
+      }
+
+      // MTF alignment bonus for longs
+      if (aiResult.action === "LONG" && mtfCombined?.valid && mtfCombined.trend === "bullish" && mtfCombined.aligned) {
+        tradeConf += 6;
+        addLog("MTF", `Long +6 conf: MTF aligned bullish ${mtfCombined.strength}%`);
       }
 
       if (tradeConf < MIN_CONF_TO_TRADE) return;
@@ -3483,7 +3523,7 @@ export default function NexusV7() {
         executionLockRef.current = false;
       }
     } catch {}
-  }, [aiResult, aiActive, llmResult, drawdownState, cooldownUntil, lastDataUpdate, candles, isLive]);
+  }, [aiResult, aiActive, llmResult, drawdownState, cooldownUntil, lastDataUpdate, candles, isLive, mtfData]);
 
   // ═══ SL/TP MONITOR ═══
   useEffect(() => {
