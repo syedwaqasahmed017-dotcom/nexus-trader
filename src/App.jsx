@@ -2198,6 +2198,292 @@ const Brain = {
 };
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BACKTEST ENGINE — Pre-train Brain with historical BTC data
+// Fetches 5x1000 1-min candles from different time periods, simulates trades,
+// records win/loss patterns to Brain for smarter future decisions.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const BacktestEngine = {
+  _running: false, _results: null, _progress: "",
+
+  async run(symbol, onProgress) {
+    if (this._running) return null;
+    this._running = true;
+    this._progress = "Fetching historical data...";
+    if (onProgress) onProgress(this._progress);
+
+    try {
+      const batches = await this._fetchBatches(symbol, onProgress);
+      if (batches.length === 0) { this._running = false; return { error: "No historical data fetched" }; }
+
+      let wins = 0, losses = 0;
+      for (let b = 0; b < batches.length; b++) {
+        this._progress = `Simulating batch ${b + 1}/${batches.length}... (${batches[b].length} candles)`;
+        if (onProgress) onProgress(this._progress);
+        const results = this._simulate(batches[b], symbol);
+        for (const r of results) {
+          if (r.won) {
+            Brain.wins.push({ fp: r.fp, profit: r.profit, ts: r.ts, pair: symbol, action: r.action, session: r.session, liveVerified: true, source: "backtest" });
+            wins++;
+          } else {
+            Brain.losses.push({ fp: r.fp, loss: r.loss, ts: r.ts, pair: symbol, action: r.action, session: r.session, liveVerified: true, source: "backtest" });
+            losses++;
+          }
+        }
+      }
+
+      Brain.save();
+      const total = wins + losses;
+      this._results = { wins, losses, total, winRate: total > 0 ? (wins / total * 100) : 0, batches: batches.length };
+      this._progress = `Done: ${total} patterns (${wins}W/${losses}L = ${total > 0 ? (wins/total*100).toFixed(1) : 0}% WR)`;
+      if (onProgress) onProgress(this._progress);
+      this._running = false;
+      return this._results;
+    } catch (e) {
+      this._running = false;
+      this._progress = "Error: " + (e.message || "unknown");
+      if (onProgress) onProgress(this._progress);
+      return { error: e.message };
+    }
+  },
+
+  async _fetchBatches(symbol, onProgress) {
+    const now = Date.now();
+    // 5 batches from different time periods for diverse market conditions
+    const offsets = [
+      0,                  // now to 16h ago
+      60000 * 3000,       // ~2 days ago
+      60000 * 7000,       // ~5 days ago
+      60000 * 15000,      // ~10 days ago
+      60000 * 30000,      // ~21 days ago
+    ];
+    const batches = [];
+
+    for (let idx = 0; idx < offsets.length; idx++) {
+      const offset = offsets[idx];
+      const endTime = now - offset;
+      const startTime = endTime - 1000 * 60000;
+      this._progress = `Fetching batch ${idx + 1}/${offsets.length}...`;
+      if (onProgress) onProgress(this._progress);
+
+      try {
+        const baseUrl = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1m&startTime=${startTime}&endTime=${endTime}&limit=1000`;
+        let data = null;
+
+        // Try direct endpoints first
+        for (const ep of ENDPOINTS) {
+          try {
+            const url = `${ep}/api/v3/klines?symbol=${symbol}&interval=1m&startTime=${startTime}&endTime=${endTime}&limit=1000`;
+            const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+            const json = await resp.json();
+            if (Array.isArray(json) && json.length > 100) { data = json; break; }
+          } catch { continue; }
+        }
+
+        // Fallback to CORS proxies
+        if (!data) {
+          for (const proxy of CORS_PROXIES.filter(Boolean)) {
+            try {
+              const resp = await fetch(proxy + encodeURIComponent(baseUrl), { signal: AbortSignal.timeout(10000) });
+              const json = await resp.json();
+              if (Array.isArray(json) && json.length > 100) { data = json; break; }
+            } catch { continue; }
+          }
+        }
+
+        if (data && data.length > 300) {
+          batches.push(data.map(k => ({
+            t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5]
+          })));
+        }
+      } catch {}
+
+      // Polite delay between API requests
+      await new Promise(r => setTimeout(r, 300));
+    }
+
+    return batches;
+  },
+
+  _getSession(ts) {
+    const h = new Date(ts).getUTCHours();
+    if (h >= 13 && h < 22) return "New York";
+    if (h >= 7 && h < 16) return "London";
+    if (h >= 0 && h < 9) return "Tokyo";
+    return "Sydney";
+  },
+
+  _simulate(candles, symbol) {
+    const results = [];
+    if (candles.length < 350) return results;
+
+    const closes = candles.map(c => c.c);
+
+    // Pre-calculate indicator arrays across all candles
+    const rsiArr = calcRSI(closes);
+    const macd = calcMACD(closes);
+    const bb = calcBB(closes);
+    const srsiArr = calcStochRSI(closes);
+    const ema9 = calcEMA(closes, 9);
+    const ema21 = calcEMA(closes, 21);
+    const ema50 = calcEMA(closes, 50);
+
+    const WARMUP = 300;     // Indicator stabilization period
+    const STEP = 8;         // Check every 8th candle (diverse but not too many)
+    const LOOKAHEAD = 120;  // 2 hours max to hit SL/TP
+
+    for (let i = WARMUP; i < candles.length - LOOKAHEAD; i += STEP) {
+      const price = candles[i].c;
+      const atr = calcATR(candles.slice(Math.max(0, i - 30), i + 1));
+      if (atr === 0 || price === 0) continue;
+
+      const atrPct = (atr / price) * 100;
+      const rsi = rsiArr[i] || 50;
+      const prevRsi = rsiArr[i - 1] || 50;
+      const srsi = srsiArr[i] || 50;
+
+      // MACD (offset by 26 due to EMA26 warmup)
+      const mi = i - 26;
+      const macdHistVal = (mi >= 0 && mi < macd.hist.length) ? macd.hist[mi] : 0;
+      const prevMacdHist = (mi > 0 && mi - 1 < macd.hist.length) ? macd.hist[mi - 1] : 0;
+      const macdDir = macdHistVal > 0 ? "up" : macdHistVal < 0 ? "down" : "n";
+      const macdCross = (macdHistVal > 0 && prevMacdHist <= 0) ? "bullCross" : (macdHistVal < 0 && prevMacdHist >= 0) ? "bearCross" : "none";
+
+      // Bollinger Bands
+      const bbU = bb.upper[i], bbL = bb.lower[i], bbM = bb.middle[i];
+      const bbZone = (bbL && price <= bbL) ? "lower" : (bbU && price >= bbU) ? "upper" : "mid";
+      const bbWidth = (bbU && bbL && bbM) ? ((bbU - bbL) / bbM) * 100 : 2;
+
+      // Volume ratio
+      const vol20 = candles.slice(Math.max(0, i - 20), i).reduce((a, c) => a + c.v, 0) / 20;
+      const volRatio = vol20 > 0 ? candles[i].v / vol20 : 1;
+
+      // Trend strength
+      let trendStr = 0;
+      if (ema9[i] > ema21[i]) trendStr += 2; else trendStr -= 2;
+      if (ema50[i] && ema9[i] > ema50[i]) trendStr += 2; else if (ema50[i]) trendStr -= 2;
+
+      // Momentum
+      const mom5 = i >= 5 ? ((price - closes[i - 5]) / closes[i - 5]) * 100 : 0;
+
+      // Regime
+      const regime = atrPct > 2.5 ? "volatile" : atrPct < 0.5 ? "ranging" : "normal";
+
+      // ═══ SCORING (simplified version of aiDecision) ═══
+      let bull = 0, bear = 0;
+
+      if (rsi < 18) bull += 28;
+      else if (rsi < 28) bull += 20;
+      else if (rsi < 40 && rsi > prevRsi) bull += 8;
+      if (rsi > 82) bear += 28;
+      else if (rsi > 72) bear += 20;
+      else if (rsi > 60 && rsi < prevRsi) bear += 8;
+
+      if (macdCross === "bullCross") bull += 22;
+      else if (macdCross === "bearCross") bear += 22;
+      else if (macdHistVal > 0 && macdHistVal > prevMacdHist) bull += 8;
+      else if (macdHistVal < 0 && macdHistVal < prevMacdHist) bear += 8;
+
+      if (bbZone === "lower") bull += 18;
+      else if (bbZone === "upper") bear += 18;
+
+      if (ema9[i] > ema21[i]) bull += 10; else bear += 10;
+      if (ema50[i]) { if (price > ema50[i] && ema9[i] > ema50[i]) bull += 8; else if (price < ema50[i] && ema9[i] < ema50[i]) bear += 8; }
+
+      if (srsi < 8) bull += 12; else if (srsi < 18) bull += 6;
+      if (srsi > 92) bear += 12; else if (srsi > 82) bear += 6;
+
+      if (volRatio > 2) { if (bull > bear) bull += 8; else bear += 8; }
+      else if (volRatio > 1.3) { if (bull > bear) bull += 4; else bear += 4; }
+
+      if (mom5 > 0.3) bull += 6; else if (mom5 < -0.3) bear += 6;
+
+      // RSI divergence
+      if (rsi < 35 && rsi > prevRsi && closes[i] < closes[i - 1]) bull += 14;
+      if (rsi > 65 && rsi < prevRsi && closes[i] > closes[i - 1]) bear += 14;
+
+      const total = bull + bear;
+      if (total === 0) continue;
+      const bullPct = (bull / total) * 100;
+      const bearPct = (bear / total) * 100;
+
+      // Need clear signal (matching live thresholds)
+      let action = null;
+      if (bullPct > 63 && bull > 22) action = "LONG";
+      else if (bearPct > 63 && bear > 22) action = "SHORT";
+      if (!action) continue;
+
+      // ═══ SL/TP (matching tighter v7.2 levels) ═══
+      const slMult = regime === "volatile" ? 1.8 : 1.3;
+      const tpMult = regime === "volatile" ? 4.0 : 3.2;
+
+      let sl, tp;
+      if (action === "LONG") { sl = price - atr * slMult; tp = price + atr * tpMult; }
+      else { sl = price + atr * slMult; tp = price - atr * tpMult; }
+
+      // ═══ LOOK AHEAD: Does SL or TP hit first? ═══
+      let won = null;
+      let exitPrice = price;
+
+      for (let j = i + 1; j < Math.min(i + LOOKAHEAD, candles.length); j++) {
+        const c = candles[j];
+        if (action === "LONG") {
+          if (c.l <= sl) { won = false; exitPrice = sl; break; }
+          if (c.h >= tp) { won = true; exitPrice = tp; break; }
+        } else {
+          if (c.h >= sl) { won = false; exitPrice = sl; break; }
+          if (c.l <= tp) { won = true; exitPrice = tp; break; }
+        }
+      }
+
+      // Timeout: check P&L at end of lookahead window
+      if (won === null) {
+        const finalPrice = candles[Math.min(i + LOOKAHEAD, candles.length - 1)].c;
+        if (action === "LONG") won = finalPrice > price * 1.001; // Need >0.1% to count as win (fees)
+        else won = finalPrice < price * 0.999;
+        exitPrice = finalPrice;
+      }
+
+      // Build indicators for Brain fingerprint
+      const indicators = {
+        rsi, macdDir, volRatio, atrPct, bbZone, trendStr, regime,
+        stochRSI: srsi, newsScore: 0, marketBias: "neutral",
+      };
+
+      const fp = Brain.fingerprint(indicators, action, symbol);
+      const session = this._getSession(candles[i].t);
+      const pnl = action === "LONG" ? exitPrice - price : price - exitPrice;
+
+      results.push({
+        fp, action, won,
+        profit: won ? Math.abs(pnl) : 0,
+        loss: won ? 0 : Math.abs(pnl),
+        ts: candles[i].t,
+        session,
+      });
+    }
+
+    return results;
+  },
+
+  getStats() { return this._results || null; },
+  isRunning() { return this._running; },
+  getProgress() { return this._progress; },
+
+  // Remove all backtest patterns (keep live patterns)
+  purge() {
+    const before = Brain.wins.length + Brain.losses.length;
+    Brain.wins = Brain.wins.filter(w => w.source !== "backtest");
+    Brain.losses = Brain.losses.filter(l => l.source !== "backtest");
+    Brain.save();
+    return before - (Brain.wins.length + Brain.losses.length);
+  },
+
+  countBacktestPatterns() {
+    return Brain.wins.filter(w => w.source === "backtest").length + Brain.losses.filter(l => l.source === "backtest").length;
+  }
+};
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // TECHNICAL ANALYSIS LIBRARY
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 function calcEMA(data, period) { try { if (!data.length) return []; const k = 2 / (period + 1); let val = data[0]; const r = [val]; for (let i = 1; i < data.length; i++) { val = data[i] * k + val * (1 - k); r.push(val); } return r; } catch { return []; } }
@@ -2956,6 +3242,7 @@ export default function NexusV7() {
   const [mlTraining, setMlTraining] = useState(false);
   const [brainStats, setBrainStats] = useState({ totalLosses: 0, totalWins: 0, weekLosses: 0, totalLossPrevented: 0, totalWinValue: 0, topBlocked: [], brainSize: 0 });
   const [mtfData, setMtfData] = useState(null); // Multi-Timeframe analysis (5m, 15m, 1h, 4h)
+  const [backtestProgress, setBacktestProgress] = useState("");
 
   // ═══ STREAK & COOLDOWN TRACKING (PERSISTED — survives refresh) ═══
   const [consecutiveLosses, setConsecutiveLosses] = useState(() => DB.get("streak_losses", 0));
@@ -3780,7 +4067,7 @@ export default function NexusV7() {
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
             <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v7</div>
-            <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>24/7 AI | {Brain.losses.length + Brain.wins.length} PATTERNS | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | ☁ CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
+            <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>24/7 AI | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
         <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
@@ -4347,7 +4634,27 @@ export default function NexusV7() {
             <div>See ML tab for training controls and CSV export</div>
           </div>
           <button onClick={() => { Brain.reset(); setBrainStats(Brain.getStats()); addLog("AI", "Brain reset"); }} style={{ ...S.btn(false, K.dn), fontSize: 9 }}>Reset Brain</button>
-          <button onClick={() => { const purged = Brain.purgeDemo(); setBrainStats(Brain.getStats()); addLog("AI", purged > 0 ? `Purged ${purged} unverified demo entries from Brain` : "No demo entries found — Brain is clean"); }} style={{ ...S.btn(false, K.warn), fontSize: 9 }}>Purge Demo Data</button>
+          <button onClick={() => { const purged = Brain.purgeDemo(); setBrainStats(Brain.getStats()); addLog("AI", purged > 0 ? `Purged ${purged} unverified demo entries from Brain` : "No demo entries found \u2014 Brain is clean"); }} style={{ ...S.btn(false, K.warn), fontSize: 9 }}>Purge Demo Data</button>
+          <button disabled={BacktestEngine.isRunning()} onClick={async () => {
+            setBacktestProgress("Starting...");
+            addLog("AI", "Pre-training Brain with historical BTC data...");
+            const result = await BacktestEngine.run("BTCUSDT", (p) => setBacktestProgress(p));
+            setBrainStats(Brain.getStats());
+            if (result && !result.error) {
+              addLog("AI", `Pre-train complete: ${result.total} patterns (${result.wins}W/${result.losses}L = ${result.winRate.toFixed(1)}% WR) from ${result.batches} batches`);
+            } else {
+              addLog("ERR", "Pre-train failed: " + (result?.error || "unknown"));
+            }
+            setTimeout(() => setBacktestProgress(""), 10000);
+          }} style={{ ...S.btn(false, "#1565c0"), fontSize: 9, opacity: BacktestEngine.isRunning() ? 0.5 : 1 }}>
+            {BacktestEngine.isRunning() ? "\u23F3 Training..." : "\uD83E\uDDE0 Pre-Train Brain (Historical)"}
+          </button>
+          {BacktestEngine.countBacktestPatterns() > 0 && <button onClick={() => {
+            const purged = BacktestEngine.purge();
+            setBrainStats(Brain.getStats());
+            addLog("AI", `Purged ${purged} backtest patterns from Brain`);
+          }} style={{ ...S.btn(false, "#6a1b9a"), fontSize: 9 }}>Purge Backtest ({BacktestEngine.countBacktestPatterns()})</button>}
+          {backtestProgress && <div style={{ fontSize: 8, color: "#42a5f5", marginTop: 2 }}>{backtestProgress}</div>}
         </div>}
 
         {/* JOURNAL */}
