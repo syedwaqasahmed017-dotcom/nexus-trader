@@ -724,7 +724,7 @@ const LLMEngine = {
     this._lastSnapshot = { price, action: aiResult?.action, confidence: aiResult?.confidence || 0, regime: aiResult?.analysis?.regime, fg: fgData?.value || 0, macroRegime: macroData?.regime, rsi: aiResult?.indicators?.rsi || 50, time: Date.now() };
   },
 
-  buildPrompt(aiResult, candles, currentPrice, symbol, fgData, redditData, macroData, brainStats, balance, history) {
+  buildPrompt(aiResult, candles, currentPrice, symbol, fgData, redditData, macroData, brainStats, balance, history, mtfData) {
     try {
       const recent = (history || []).slice(0, 10);
       const recentWins = recent.filter(h => h.net > 0).length;
@@ -732,12 +732,14 @@ const LLMEngine = {
       const ind = aiResult?.indicators || {};
       const fg = fgData || {};
       const macro = macroData || {};
+      const mtf = mtfData && mtfData.combined && mtfData.combined.valid ? mtfData.combined : null;
+      const mtfStr = mtf ? `MTF:${mtf.trend} ${mtf.strength}% ${mtf.aligned?"ALIGNED":""} (${(mtfData.combined.details||[]).map(d=>`${d.tf}:${d.dir}`).join(" ")})` : "MTF:loading";
       return `BTC trading analyst. JSON only.
 
 ${symbol} $${currentPrice.toFixed(0)} RSI:${ind.rsi?.toFixed(0)||"?"} MACD:${ind.macd?.toFixed(1)||"?"} EMA9v21:${currentPrice>(ind.ema9||0)?"above":"below"} BB:${ind.bbPos?.toFixed(1)||"?"} Vol:${ind.volRatio?.toFixed(1)||"?"}x ${aiResult?.analysis?.regime||"?"}
-Signal:${aiResult?.action||"WAIT"} ${aiResult?.confidence?.toFixed(0)||0}% | F&G:${fg.value||"?"} ${fg.label||""} | Macro:${macro.regime||"?"} | Bias:${ind.marketBias||"neutral"} | Bal:$${balance?.toFixed(0)||100} ${recentWins}W/${recentLosses}L
+Signal:${aiResult?.action||"WAIT"} ${aiResult?.confidence?.toFixed(0)||0}% | F&G:${fg.value||"?"} ${fg.label||""} | Macro:${macro.regime||"?"} | Bias:${ind.marketBias||"neutral"} | ${mtfStr} | Bal:$${balance?.toFixed(0)||100} ${recentWins}W/${recentLosses}L
 ${brainStats?.brainSize > 0 ? `Brain:${brainStats.brainSize} WR:${brainStats.totalWins+brainStats.totalLosses>0?((brainStats.totalWins/(brainStats.totalWins+brainStats.totalLosses))*100).toFixed(0):"0"}%` : ""}
-Fee:0.4% RT. Trade ONLY if move>0.6%. In bear markets, prefer shorts over contrarian longs.
+Fee:0.4% RT. Trade ONLY if move>0.6%. In bear markets, prefer shorts over contrarian longs. When MTF is ALIGNED, trade WITH the higher timeframe trend.
 
 {"action":"LONG|SHORT|WAIT","confidence":0-100,"reasoning":"1 sentence","risks":"brief","conviction":"HIGH|MEDIUM|LOW","override":false,"adjustConfidence":0}`;
     } catch { return null; }
@@ -774,7 +776,7 @@ Fee:0.4% RT. Trade ONLY if move>0.6%. In bear markets, prefer shorts over contra
     return { text: data?.candidates?.[0]?.content?.parts?.[0]?.text || "", model, provider: "gemini" };
   },
 
-  async analyze(aiResult, candles, currentPrice, symbol, fgData, redditData, macroData, brainStats, balance, history, geminiKey, groqKey) {
+  async analyze(aiResult, candles, currentPrice, symbol, fgData, redditData, macroData, brainStats, balance, history, geminiKey, groqKey, mtfData) {
     try {
       const hasGroq = !!groqKey, hasGemini = !!geminiKey;
       if (!hasGroq && !hasGemini) return this.getFallback();
@@ -799,7 +801,7 @@ Fee:0.4% RT. Trade ONLY if move>0.6%. In bear markets, prefer shorts over contra
         this._consecutiveErrors = 0;
       }
 
-      const prompt = this.buildPrompt(aiResult, candles, currentPrice, symbol, fgData, redditData, macroData, brainStats, balance, history);
+      const prompt = this.buildPrompt(aiResult, candles, currentPrice, symbol, fgData, redditData, macroData, brainStats, balance, history, mtfData);
       if (!prompt) return this._cache || this.getFallback();
 
       this._lastCall = now;
@@ -2331,9 +2333,215 @@ function detectCandlePatterns(candles) {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// AI DECISION ENGINE v7 — 26 FACTORS + NEWS + SESSIONS + FAKE + BRAIN + SOCIAL + MACRO
+// MULTI-TIMEFRAME ANALYSIS ENGINE — See the big picture
+// Fetches 5m, 15m, 1h, 4h candles and calculates RSI, EMA, MACD, trend on each
+// Higher timeframes carry more weight: 4h(4x) > 1h(3x) > 15m(2x) > 5m(1x)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, socialFG, socialReddit, macroInfo, onChainInfo) {
+const MTFEngine = {
+  _cache: {},
+  _lastFetch: 0,
+  _fetchInterval: 60000, // fetch new MTF data every 60s max
+
+  // Analyze a single timeframe's candles
+  analyzeTimeframe(candles, label) {
+    try {
+      if (!candles || candles.length < 30) return { label, trend: "unknown", strength: 0, rsi: 50, emaSignal: "neutral", macdSignal: "neutral", valid: false };
+      const closes = candles.map(c => c.c);
+      const L = closes.length;
+      const price = closes[L - 1];
+
+      // RSI
+      const rsi14 = calcRSI(closes, 14);
+      const rsi = rsi14[L - 1] || 50;
+
+      // EMAs
+      const ema9 = calcEMA(closes, 9);
+      const ema21 = calcEMA(closes, 21);
+      const ema50 = calcEMA(closes, 50);
+      const e9 = ema9[L - 1] || price;
+      const e21 = ema21[L - 1] || price;
+      const e50 = L > 50 ? (ema50[L - 1] || price) : null;
+
+      // EMA signal
+      let emaSignal = "neutral";
+      if (price > e9 && e9 > e21) emaSignal = "bullish";
+      else if (price < e9 && e9 < e21) emaSignal = "bearish";
+      else if (price > e9) emaSignal = "mildBull";
+      else if (price < e9) emaSignal = "mildBear";
+
+      // MACD
+      const mc = calcMACD(closes);
+      const lastHist = mc.hist.length > 0 ? mc.hist[mc.hist.length - 1] : 0;
+      const prevHist = mc.hist.length > 1 ? mc.hist[mc.hist.length - 2] : 0;
+      let macdSignal = "neutral";
+      if (lastHist > 0 && lastHist > prevHist) macdSignal = "bullish";
+      else if (lastHist > 0) macdSignal = "mildBull";
+      else if (lastHist < 0 && lastHist < prevHist) macdSignal = "bearish";
+      else if (lastHist < 0) macdSignal = "mildBear";
+
+      // Trend: price vs EMA50 + slope
+      let trend = "neutral", strength = 0;
+      if (e50 !== null) {
+        const pctFromE50 = (price - e50) / e50 * 100;
+        if (pctFromE50 < -1.5) { trend = "bearish"; strength = Math.min(100, Math.abs(pctFromE50) * 15); }
+        else if (pctFromE50 > 1.5) { trend = "bullish"; strength = Math.min(100, pctFromE50 * 15); }
+        else { trend = "neutral"; strength = Math.abs(pctFromE50) * 10; }
+      } else {
+        // No EMA50, use EMA9 vs EMA21
+        const emaDiff = (e9 - e21) / e21 * 100;
+        if (emaDiff < -0.3) { trend = "bearish"; strength = Math.min(100, Math.abs(emaDiff) * 30); }
+        else if (emaDiff > 0.3) { trend = "bullish"; strength = Math.min(100, emaDiff * 30); }
+      }
+
+      // Recent momentum (last 5 candles)
+      const mom = closes.length >= 6 ? (closes[L - 1] - closes[L - 6]) / closes[L - 6] * 100 : 0;
+
+      return { label, trend, strength: Math.round(strength), rsi: Math.round(rsi), emaSignal, macdSignal, mom: +mom.toFixed(2), price, valid: true };
+    } catch { return { label, trend: "unknown", strength: 0, rsi: 50, emaSignal: "neutral", macdSignal: "neutral", valid: false }; }
+  },
+
+  // Combine all timeframe signals into one verdict
+  // Weights: 4h=4, 1h=3, 15m=2, 5m=1
+  combineSignals(tf5m, tf15m, tf1h, tf4h) {
+    try {
+      const timeframes = [
+        { data: tf5m, weight: 1 },
+        { data: tf15m, weight: 2 },
+        { data: tf1h, weight: 3 },
+        { data: tf4h, weight: 4 },
+      ].filter(t => t.data && t.data.valid);
+
+      if (timeframes.length === 0) return { trend: "neutral", strength: 0, confidence: 0, aligned: false, bullTFs: 0, bearTFs: 0, details: [], valid: false };
+
+      let bullScore = 0, bearScore = 0, totalWeight = 0;
+      const details = [];
+
+      for (const tf of timeframes) {
+        const d = tf.data;
+        const w = tf.weight;
+        totalWeight += w;
+
+        // Trend direction scoring
+        let tfBull = 0, tfBear = 0;
+        if (d.trend === "bullish") tfBull += 3 * w;
+        else if (d.trend === "bearish") tfBear += 3 * w;
+
+        // EMA alignment
+        if (d.emaSignal === "bullish") tfBull += 2 * w;
+        else if (d.emaSignal === "bearish") tfBear += 2 * w;
+        else if (d.emaSignal === "mildBull") tfBull += 1 * w;
+        else if (d.emaSignal === "mildBear") tfBear += 1 * w;
+
+        // MACD direction
+        if (d.macdSignal === "bullish") tfBull += 2 * w;
+        else if (d.macdSignal === "bearish") tfBear += 2 * w;
+        else if (d.macdSignal === "mildBull") tfBull += 1 * w;
+        else if (d.macdSignal === "mildBear") tfBear += 1 * w;
+
+        // RSI context
+        if (d.rsi > 70) tfBear += 1 * w; // overbought on this TF
+        else if (d.rsi < 30) tfBull += 1 * w; // oversold
+
+        bullScore += tfBull;
+        bearScore += tfBear;
+
+        const dir = tfBull > tfBear ? "BULL" : tfBear > tfBull ? "BEAR" : "NEUTRAL";
+        details.push({ tf: d.label, dir, rsi: d.rsi, ema: d.emaSignal, macd: d.macdSignal, trend: d.trend, str: d.strength });
+      }
+
+      const total = bullScore + bearScore;
+      const bullPct = total > 0 ? bullScore / total * 100 : 50;
+      const bearPct = total > 0 ? bearScore / total * 100 : 50;
+      const diff = Math.abs(bullScore - bearScore);
+      const maxPossible = totalWeight * 8; // max score per TF = 8
+      const strength = Math.min(100, Math.round(diff / Math.max(maxPossible, 1) * 100));
+
+      const bullTFs = details.filter(d => d.dir === "BULL").length;
+      const bearTFs = details.filter(d => d.dir === "BEAR").length;
+      const aligned = bullTFs >= 3 || bearTFs >= 3; // 3+ timeframes agree
+
+      let trend = "neutral";
+      if (bullScore > bearScore * 1.3) trend = "bullish";
+      else if (bearScore > bullScore * 1.3) trend = "bearish";
+
+      return {
+        trend, strength, confidence: Math.round(Math.max(bullPct, bearPct)),
+        aligned, bullTFs, bearTFs, totalTFs: timeframes.length,
+        bullScore: Math.round(bullScore), bearScore: Math.round(bearScore),
+        details, valid: true,
+      };
+    } catch { return { trend: "neutral", strength: 0, confidence: 50, aligned: false, bullTFs: 0, bearTFs: 0, details: [], valid: false }; }
+  },
+
+  // Fetch candles for a specific timeframe from Binance
+  async fetchTFCandles(symbol, interval, limit, endpoints, corsProxies) {
+    // Try direct endpoints first
+    for (const ep of endpoints) {
+      try {
+        const res = await fetch(`${ep}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`, { signal: AbortSignal.timeout(6000) });
+        if (!res.ok) continue;
+        const data = await res.json();
+        if (Array.isArray(data) && data.length > 0) {
+          return data.map(d => ({ t: d[0], o: +d[1], h: +d[2], l: +d[3], c: +d[4], v: +d[5] }));
+        }
+      } catch { continue; }
+    }
+    // Try CORS proxies
+    for (const proxy of corsProxies) {
+      if (!proxy) continue;
+      try {
+        const url = `${proxy}${encodeURIComponent(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`)}`;
+        const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+        if (!res.ok) continue;
+        const data = await res.json();
+        if (Array.isArray(data) && data.length > 0) {
+          return data.map(d => ({ t: d[0], o: +d[1], h: +d[2], l: +d[3], c: +d[4], v: +d[5] }));
+        }
+      } catch { continue; }
+    }
+    return null;
+  },
+
+  // Fetch and analyze all timeframes
+  async fetchAndAnalyze(symbol, endpoints, corsProxies) {
+    try {
+      // Rate limit: don't fetch more than once per minute
+      if (Date.now() - this._lastFetch < this._fetchInterval && this._cache[symbol]) {
+        return this._cache[symbol];
+      }
+
+      const [c5m, c15m, c1h, c4h] = await Promise.all([
+        this.fetchTFCandles(symbol, "5m", 100, endpoints, corsProxies),
+        this.fetchTFCandles(symbol, "15m", 100, endpoints, corsProxies),
+        this.fetchTFCandles(symbol, "1h", 100, endpoints, corsProxies),
+        this.fetchTFCandles(symbol, "4h", 100, endpoints, corsProxies),
+      ]);
+
+      const tf5m = this.analyzeTimeframe(c5m, "5m");
+      const tf15m = this.analyzeTimeframe(c15m, "15m");
+      const tf1h = this.analyzeTimeframe(c1h, "1h");
+      const tf4h = this.analyzeTimeframe(c4h, "4h");
+
+      const combined = this.combineSignals(tf5m, tf15m, tf1h, tf4h);
+
+      const result = { tf5m, tf15m, tf1h, tf4h, combined, timestamp: Date.now(), live: !!(c5m || c15m || c1h || c4h) };
+
+      this._cache[symbol] = result;
+      this._lastFetch = Date.now();
+
+      console.log(`[NEXUS] MTF: ${combined.trend} ${combined.strength}% (${combined.bullTFs}B/${combined.bearTFs}Bear) aligned=${combined.aligned} | 5m:${tf5m.trend} 15m:${tf15m.trend} 1h:${tf1h.trend} 4h:${tf4h.trend}`);
+      return result;
+    } catch(e) {
+      console.warn("[NEXUS] MTF fetch error:", e);
+      return this._cache[symbol] || { tf5m: null, tf15m: null, tf1h: null, tf4h: null, combined: { trend: "neutral", strength: 0, aligned: false, valid: false }, live: false };
+    }
+  },
+};
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// AI DECISION ENGINE v7 — 26 FACTORS + NEWS + SESSIONS + FAKE + BRAIN + SOCIAL + MACRO + MTF
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, socialFG, socialReddit, macroInfo, onChainInfo, mtfData) {
   const WAIT = (reasons, ind = {}, extra = {}) => ({
     action: "WAIT", confidence: 0, sl: 0, tp: 0, reasons, indicators: ind, bullScore: "50.0", bearScore: "50.0",
     riskLevel: "-", analysis: extra, sentiment: { score: 50, label: "-" }, patterns: [],
@@ -2411,7 +2619,7 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     const isMaxTrades = sessionTradeCount >= MAX_TRADES_PER_SESSION;
     const isFakeBlocked = fakeAlert.isSuspicious && fakeAlert.score > 50;
 
-    // ═══ WEIGHTED SCORING — 26 FACTORS ═══
+    // ═══ WEIGHTED SCORING — 28 FACTORS (now including MTF) ═══
     let bull = 0, bear = 0;
     const reasons = [];
 
@@ -2538,6 +2746,39 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       else { bear += Math.min(10, Math.abs(onChainSignal.score)); reasons.push(`On-chain: ${onChainSignal.reasons?.[0] || "bearish"}`); }
     }
 
+    // ═══ MULTI-TIMEFRAME ANALYSIS — The Big Picture (v7.2) ═══
+    // Higher timeframes override 1-min noise. When 4h+1h agree, trade WITH them.
+    const mtf = mtfData && mtfData.combined && mtfData.combined.valid ? mtfData.combined : null;
+    if (mtf) {
+      const mtfWeight = mtf.aligned ? 25 : 15; // Aligned TFs = much stronger signal
+      if (mtf.trend === "bullish") {
+        bull += mtfWeight;
+        reasons.push(`MTF ${mtf.trend} ${mtf.strength}% (${mtf.bullTFs}/${mtf.totalTFs} TFs bull${mtf.aligned ? " ALIGNED" : ""})`);
+      } else if (mtf.trend === "bearish") {
+        bear += mtfWeight;
+        reasons.push(`MTF ${mtf.trend} ${mtf.strength}% (${mtf.bearTFs}/${mtf.totalTFs} TFs bear${mtf.aligned ? " ALIGNED" : ""})`);
+      }
+      // When MTF strongly disagrees with 1-min signal, dampen the 1-min signal
+      // Conservative: don't trade AGAINST the higher timeframes
+      if (mtf.aligned && mtf.trend === "bearish" && bull > bear) {
+        const dampening = Math.round((bull - bear) * 0.4);
+        bear += dampening;
+        reasons.push(`MTF bear aligned - dampening bull by ${dampening}`);
+      }
+      if (mtf.aligned && mtf.trend === "bullish" && bear > bull) {
+        const dampening = Math.round((bear - bull) * 0.4);
+        bull += dampening;
+        reasons.push(`MTF bull aligned - dampening bear by ${dampening}`);
+      }
+      // Also upgrade marketBias when MTF and bias agree
+      if (mtf.trend === "bearish" && marketBias.bias === "bear") {
+        marketBias.strength = Math.min(100, marketBias.strength + 20);
+      }
+      if (mtf.trend === "bullish" && marketBias.bias === "bull") {
+        marketBias.strength = Math.min(100, marketBias.strength + 20);
+      }
+    }
+
     if (newsImpact.confidence > 20) {
       if (newsImpact.score > 30) { bull += Math.min(18, Math.round(newsImpact.score * 0.3)); reasons.push(`News bullish (${newsImpact.bullCount} positive)`); }
       else if (newsImpact.score < -30) { bear += Math.min(18, Math.round(Math.abs(newsImpact.score) * 0.3)); reasons.push(`News bearish (${newsImpact.bearCount} negative)`); }
@@ -2613,7 +2854,7 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
 
     return {
       action, confidence: finalConf, sl, tp, reasons: reasons.slice(0, 18), indicators, bullScore: fx(bullPct, 1), bearScore: fx(bearPct, 1), riskLevel,
-      analysis: { phase, regime, marketBias: marketBias.bias, marketBiasStrength: marketBias.strength, candlePattern: candlePatterns.length > 0 ? candlePatterns[0].name : "None", totalFactors: 26, brainPatterns: Brain.losses.length + Brain.wins.length, mlTrained: MLEngine._trained },
+      analysis: { phase, regime, marketBias: marketBias.bias, marketBiasStrength: marketBias.strength, candlePattern: candlePatterns.length > 0 ? candlePatterns[0].name : "None", totalFactors: 28, brainPatterns: Brain.losses.length + Brain.wins.length, mlTrained: MLEngine._trained, mtfTrend: mtf ? mtf.trend : "loading", mtfStrength: mtf ? mtf.strength : 0, mtfAligned: mtf ? mtf.aligned : false, mtfDetails: mtfData && mtfData.combined ? mtfData.combined.details : [] },
       sentiment, patterns: candlePatterns, newsImpact, fakeAlert, session: sessionInfo,
       socialFG: fg, socialReddit: rd, macroSignal, macroData: macro, onChainSignal, onChainData: onChain, mlPrediction,
     };
@@ -2704,6 +2945,7 @@ export default function NexusV7() {
   const [mlStats, setMlStats] = useState(null);
   const [mlTraining, setMlTraining] = useState(false);
   const [brainStats, setBrainStats] = useState({ totalLosses: 0, totalWins: 0, weekLosses: 0, totalLossPrevented: 0, totalWinValue: 0, topBlocked: [], brainSize: 0 });
+  const [mtfData, setMtfData] = useState(null); // Multi-Timeframe analysis (5m, 15m, 1h, 4h)
 
   // ═══ STREAK & COOLDOWN TRACKING (PERSISTED — survives refresh) ═══
   const [consecutiveLosses, setConsecutiveLosses] = useState(() => DB.get("streak_losses", 0));
@@ -2985,6 +3227,22 @@ export default function NexusV7() {
     fn(); const i = setInterval(fn, 120000); return () => clearInterval(i);
   }, []);
 
+  // ═══ MULTI-TIMEFRAME ANALYSIS — 5m, 15m, 1h, 4h (every 60s) ═══
+  useEffect(() => {
+    if (!isLive) return; // Only fetch when live — don't waste API calls in demo
+    const fn = async () => {
+      try {
+        const endpoints = [...ENDPOINTS.slice(endpointIdx), ...ENDPOINTS.slice(0, endpointIdx)];
+        const result = await MTFEngine.fetchAndAnalyze(pair.sym, endpoints, CORS_PROXIES);
+        setMtfData(result);
+        if (result.live && result.combined.aligned) {
+          addLog("MTF", `${result.combined.trend.toUpperCase()} aligned across ${result.combined.bullTFs + result.combined.bearTFs}/${result.combined.totalTFs} timeframes (${result.combined.strength}%)`);
+        }
+      } catch {}
+    };
+    fn(); const i = setInterval(fn, 60000); return () => clearInterval(i);
+  }, [isLive, pair, endpointIdx]);
+
   // ═══ FETCH LIVE DATA ═══
   const fetchMarketData = useCallback(async () => {
     try {
@@ -3063,15 +3321,15 @@ export default function NexusV7() {
 
   // ═══ AI ANALYSIS ═══
   useEffect(() => {
-    try { if (candles.length > 60 && price > 0) setAiResult(aiDecision(candles, price, pair.sym, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, fgData, redditData, macroData, onChainData)); } catch {}
-  }, [candles, price, pair, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, onChainData]);
+    try { if (candles.length > 60 && price > 0) setAiResult(aiDecision(candles, price, pair.sym, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, fgData, redditData, macroData, onChainData, mtfData)); } catch {}
+  }, [candles, price, pair, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, onChainData, mtfData]);
 
   // ═══ AUTO-TRADING (AI FREE HAND) ═══
   // ═══ LLM BRAIN ANALYSIS (Gemini Flash) ═══
   const llmDataRef = useRef({ aiResult: null, candles: [], price: 0, fgData: null, redditData: null, macroData: null, brainStats: null, balance: 0, history: [] });
   useEffect(() => {
-    llmDataRef.current = { aiResult, candles, price, fgData, redditData, macroData, brainStats, balance, history };
-  }, [aiResult, candles, price, fgData, redditData, macroData, brainStats, balance, history]);
+    llmDataRef.current = { aiResult, candles, price, fgData, redditData, macroData, brainStats, balance, history, mtfData };
+  }, [aiResult, candles, price, fgData, redditData, macroData, brainStats, balance, history, mtfData]);
 
   useEffect(() => {
     if (!geminiKey && !groqKey) return;
@@ -3083,7 +3341,7 @@ export default function NexusV7() {
       const d = llmDataRef.current;
       if (!d.aiResult || !d.candles.length || d.price <= 0) return;
       try {
-        const result = await LLMEngine.analyze(d.aiResult, d.candles, d.price, pair.sym, d.fgData, d.redditData, d.macroData, d.brainStats, d.balance, d.history, geminiKey, groqKey);
+        const result = await LLMEngine.analyze(d.aiResult, d.candles, d.price, pair.sym, d.fgData, d.redditData, d.macroData, d.brainStats, d.balance, d.history, geminiKey, groqKey, d.mtfData);
         if (result) {
           if (result.error && !result.live && !LLMEngine._cache?.live && !result.error.includes("Quota") && !result.error.includes("limited")) {
             addLog("LLM", `Error: ${result.error}`);
@@ -3486,7 +3744,7 @@ export default function NexusV7() {
 
         {/* AI ENGINE */}
         {tab === "ai" && aiResult && <div style={S.card}>
-          <div style={{ fontSize: 8, color: K.txM, letterSpacing: 2, marginBottom: 14 }}>AI ENGINE v7 | 26 FACTORS + SOCIAL + MACRO + ON-CHAIN {(geminiKey || groqKey) ? "+ LLM BRAIN" : ""} | {aiResult.analysis?.brainPatterns || 0} LEARNED | {session?.primary?.name} SESSION</div>
+          <div style={{ fontSize: 8, color: K.txM, letterSpacing: 2, marginBottom: 14 }}>AI ENGINE v7.2 | 28 FACTORS + SOCIAL + MACRO + ON-CHAIN + MTF {(geminiKey || groqKey) ? "+ LLM BRAIN" : ""} | {aiResult.analysis?.brainPatterns || 0} LEARNED | {session?.primary?.name} SESSION</div>
 
           {/* ═══ DRAWDOWN ESCALATION BAR ═══ */}
           <div style={{ marginBottom: 12, padding: 10, background: K.s2, borderRadius: 8, border: `1px solid ${drawdownState?.tier?.color || K.bd}30` }}>
@@ -3519,8 +3777,8 @@ export default function NexusV7() {
             <div><div style={{ fontSize: 8, color: K.txM, textAlign: "center", marginBottom: 2 }}>NEWS</div><SentimentGauge score={clamp(50 + (aiResult.newsImpact?.score || 0), 0, 100)} label={aiResult.newsImpact?.score > 20 ? "Bullish" : aiResult.newsImpact?.score < -20 ? "Bearish" : "Neutral"}/></div>
           </div>
           <div style={{ padding: 12, background: K.s2, borderRadius: 8, marginBottom: 14 }}>
-            <div style={{ fontSize: 8, color: K.txM, letterSpacing: 1.5, marginBottom: 4 }}>ANALYSIS (26 FACTORS + CHAIN{MLEngine._trained ? " + ML" : ""})</div>
-            {aiResult.reasons.map((r, i) => <div key={i} style={{ padding: "4px 0", fontSize: 10, color: r.startsWith("BRAIN") ? K.purple : r.startsWith("LLM") ? K.cyan : r.startsWith("ML ") ? "#e040fb" : r.startsWith("On-chain") ? K.gold : r.startsWith("News") ? K.cyan : r.startsWith("FAKE") ? K.warn : K.txD, borderBottom: i < aiResult.reasons.length - 1 ? `1px solid ${K.bd}` : "none", animation: `slideIn .12s ${i * .03}s both`, fontWeight: r.startsWith("LLM") || r.startsWith("ML ") ? 700 : 400 }}>{r}</div>)}
+            <div style={{ fontSize: 8, color: K.txM, letterSpacing: 1.5, marginBottom: 4 }}>ANALYSIS (28 FACTORS + MTF + CHAIN{MLEngine._trained ? " + ML" : ""})</div>
+            {aiResult.reasons.map((r, i) => <div key={i} style={{ padding: "4px 0", fontSize: 10, color: r.startsWith("BRAIN") ? K.purple : r.startsWith("LLM") ? K.cyan : r.startsWith("ML ") ? "#e040fb" : r.startsWith("On-chain") ? K.gold : r.startsWith("News") ? K.cyan : r.startsWith("FAKE") ? K.warn : r.startsWith("MTF") ? "#42a5f5" : K.txD, borderBottom: i < aiResult.reasons.length - 1 ? `1px solid ${K.bd}` : "none", animation: `slideIn .12s ${i * .03}s both`, fontWeight: r.startsWith("LLM") || r.startsWith("ML ") || r.startsWith("MTF") ? 700 : 400 }}>{r}</div>)}
           </div>
           {/* ML Prediction Bar */}
           {MLEngine._trained && aiResult?.mlPrediction?.available && <div style={{ display: "flex", gap: 8, marginBottom: 14, alignItems: "center", padding: "8px 12px", background: K.s2, borderRadius: 8, border: `1px solid ${"#e040fb"}20` }}>
@@ -3548,7 +3806,24 @@ export default function NexusV7() {
           <div style={{ display: "flex", gap: 12, marginTop: 8, flexWrap: "wrap" }}>
             <div style={{ ...S.metric, border: aiResult.analysis?.marketBias === "bear" ? `1px solid ${K.dn}` : aiResult.analysis?.marketBias === "bull" ? `1px solid ${K.up}` : `1px solid ${K.txD}` }}><div style={{ fontSize: 8, color: K.txM }}>MKT BIAS</div><div style={{ fontSize: 13, fontWeight: 900, color: aiResult.analysis?.marketBias === "bear" ? K.dn : aiResult.analysis?.marketBias === "bull" ? K.up : K.warn }}>{(aiResult.analysis?.marketBias || "neutral").toUpperCase()} {aiResult.analysis?.marketBiasStrength > 0 ? `${aiResult.analysis.marketBiasStrength}%` : ""}</div></div>
             <div style={S.metric}><div style={{ fontSize: 8, color: K.txM }}>REGIME</div><div style={{ fontSize: 11, fontWeight: 700, color: K.gold }}>{aiResult.analysis?.regime || "-"}</div></div>
+            <div style={{ ...S.metric, border: aiResult.analysis?.mtfTrend === "bearish" ? `1px solid ${K.dn}` : aiResult.analysis?.mtfTrend === "bullish" ? `1px solid ${K.up}` : `1px solid ${K.txD}`, minWidth: 90 }}>
+              <div style={{ fontSize: 8, color: K.txM }}>MTF TREND</div>
+              <div style={{ fontSize: 13, fontWeight: 900, color: aiResult.analysis?.mtfTrend === "bearish" ? K.dn : aiResult.analysis?.mtfTrend === "bullish" ? K.up : K.warn }}>
+                {(aiResult.analysis?.mtfTrend || "loading").toUpperCase()} {aiResult.analysis?.mtfStrength > 0 ? `${aiResult.analysis.mtfStrength}%` : ""}
+              </div>
+              <div style={{ fontSize: 7, color: K.txD }}>{aiResult.analysis?.mtfAligned ? "\u2705 ALIGNED" : ""} {mtfData?.live ? "\u25CF LIVE" : "\u25CB"}</div>
+            </div>
           </div>
+
+          {/* ═══ MTF TIMEFRAME BREAKDOWN ═══ */}
+          {mtfData?.live && aiResult.analysis?.mtfDetails?.length > 0 && <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 8, padding: "6px 8px", background: K.s2, borderRadius: 6, border: `1px solid ${K.bd}` }}>
+            <div style={{ fontSize: 7, color: K.txM, fontWeight: 700, letterSpacing: 1, width: "100%", marginBottom: 2 }}>MULTI-TIMEFRAME</div>
+            {aiResult.analysis.mtfDetails.map((d, i) => <div key={i} style={{ display: "flex", gap: 4, alignItems: "center", padding: "2px 6px", borderRadius: 4, background: d.dir === "BULL" ? K.up + "12" : d.dir === "BEAR" ? K.dn + "12" : K.s3, minWidth: 70 }}>
+              <span style={{ fontSize: 9, fontWeight: 800, color: K.txM }}>{d.tf}</span>
+              <span style={{ fontSize: 9, fontWeight: 700, color: d.dir === "BULL" ? K.up : d.dir === "BEAR" ? K.dn : K.txD }}>{d.dir}</span>
+              <span style={{ fontSize: 7, color: K.txD }}>R{d.rsi}</span>
+            </div>)}
+          </div>}
 
           {/* ═══ SOCIAL DATA: F&G + Reddit + Macro ═══ */}
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 14 }}>
