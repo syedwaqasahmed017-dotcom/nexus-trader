@@ -2406,10 +2406,10 @@ const BacktestEngine = {
       const bullPct = (bull / total) * 100;
       const bearPct = (bear / total) * 100;
 
-      // Need clear signal (matching live thresholds)
+      // Need clear signal (matching live v7.2 raised thresholds)
       let action = null;
-      if (bullPct > 63 && bull > 22) action = "LONG";
-      else if (bearPct > 63 && bear > 22) action = "SHORT";
+      if (bullPct > 66 && bull > 28) action = "LONG";
+      else if (bearPct > 66 && bear > 28) action = "SHORT";
       if (!action) continue;
 
       // ═══ SL/TP (matching tighter v7.2 levels) ═══
@@ -3086,8 +3086,9 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     if (atrPct > 3 || volRatio > 3 || regime === "volatile") riskLevel = "HIGH";
     else if (atrPct > 1.5 || volRatio > 2) riskLevel = "MED";
 
-    const confThreshold = riskLevel === "HIGH" ? 35 : riskLevel === "MED" ? 28 : 22;
-    const pctThreshold = riskLevel === "HIGH" ? 66 : 63;
+    // ═══ RAISED THRESHOLDS v7.2 — Only A+ setups trade ═══
+    const confThreshold = riskLevel === "HIGH" ? 42 : riskLevel === "MED" ? 34 : 28;
+    const pctThreshold = riskLevel === "HIGH" ? 72 : riskLevel === "MED" ? 68 : 66;
 
     let action = "WAIT";
     let sl = 0, tp = 0;
