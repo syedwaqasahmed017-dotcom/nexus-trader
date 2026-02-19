@@ -2809,8 +2809,15 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
 
     if (bullPct > pctThreshold && rawConf > confThreshold) {
       action = "LONG";
-      sl = price - atrVal * (riskLevel === "HIGH" ? 2.8 : 2.0);
-      tp = price + atrVal * (riskLevel === "HIGH" ? 4.5 : 3.4);
+      // ═══ TIGHTER SL + MTF-AWARE LEVELS (v7.2) ═══
+      // MTF confirms: moderate SL (trend supports bounce), wider TP (let it run)
+      // MTF neutral: tight SL (no macro support), standard TP
+      // MTF against: shouldn't reach here (blocked by gate), but extra tight
+      const mtfDir = mtf ? mtf.trend : "neutral";
+      const slMult = riskLevel === "HIGH" ? (mtfDir === "bullish" ? 2.0 : 1.8) : (mtfDir === "bullish" ? 1.5 : 1.2);
+      const tpMult = riskLevel === "HIGH" ? (mtfDir === "bullish" ? 5.0 : 3.8) : (mtfDir === "bullish" ? 4.0 : 3.0);
+      sl = price - atrVal * slMult;
+      tp = price + atrVal * tpMult;
       const blockCheck = Brain.shouldBlock(indicators, "LONG", symbol);
       if (blockCheck.blocked) { action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason); }
       const wr = Brain.getWinRate(indicators, "LONG", symbol);
@@ -2818,8 +2825,11 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       finalConf += Brain.getConfidenceModifier(indicators, "LONG", symbol);
     } else if (bearPct > pctThreshold && rawConf > confThreshold) {
       action = "SHORT";
-      sl = price + atrVal * (riskLevel === "HIGH" ? 2.8 : 2.0);
-      tp = price - atrVal * (riskLevel === "HIGH" ? 4.5 : 3.4);
+      const mtfDir = mtf ? mtf.trend : "neutral";
+      const slMult = riskLevel === "HIGH" ? (mtfDir === "bearish" ? 2.0 : 1.8) : (mtfDir === "bearish" ? 1.5 : 1.2);
+      const tpMult = riskLevel === "HIGH" ? (mtfDir === "bearish" ? 5.0 : 3.8) : (mtfDir === "bearish" ? 4.0 : 3.0);
+      sl = price + atrVal * slMult;
+      tp = price - atrVal * tpMult;
       const blockCheck = Brain.shouldBlock(indicators, "SHORT", symbol);
       if (blockCheck.blocked) { action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason); }
       const wr = Brain.getWinRate(indicators, "SHORT", symbol);
