@@ -31,10 +31,17 @@ function simulateSlippage(entryPrice, side, atrPct = 1) {
   } catch { return entryPrice; }
 }
 const MIN_BALANCE = 5;
-const MAX_POSITIONS = 3;
+const MAX_POSITIONS = 5;
+const MIN_STACK_DISTANCE_PCT = 0.25; // Min 0.25% price distance between stacked entries on same pair
+const STACK_SIZE_DECAY = [1, 0.8, 0.6, 0.45, 0.3]; // Position size multiplier: 1st=100%, 2nd=80%, 3rd=60%, 4th=45%, 5th=30%
 const COOL_AFTER_LOSS = 60000;
-const MAX_TRADES_PER_SESSION = 10;
+const MAX_TRADES_PER_SESSION = 20;
 const MIN_CONF_TO_TRADE = 45;
+// ═══ PRICE SANITY — Prevent fake PnL from stale/fallback prices ═══
+const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real (BTC rarely moves more in one candle)
+const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real (anything above is data error)
+const STALE_WINNER_MINS = 180;     // Close stale winners after 3 hours
+const STALE_WINNER_MIN_PCT = 0.5;  // Minimum profit% to keep holding past stale timer
 const SESSION_PROFIT_TARGET = 0.8;
 const SESSION_MAX_LOSS = 1.5;
 const INITIAL_BALANCE = 100;
@@ -1514,10 +1521,12 @@ const MLEngine = {
 };
 
 const FALLBACK_PRICES = {
-  BTCUSDT: { base: 97800, vol: 420 }, ETHUSDT: { base: 2680, vol: 38 },
-  SOLUSDT: { base: 152, vol: 4.5 }, BNBUSDT: { base: 635, vol: 12 },
-  XRPUSDT: { base: 2.48, vol: 0.06 }, DOGEUSDT: { base: 0.178, vol: 0.006 },
-  ADAUSDT: { base: 0.72, vol: 0.018 }, AVAXUSDT: { base: 38.5, vol: 1.4 },
+  // ═══ NOTE: These are FALLBACK ONLY — hasLivePrice flag blocks all trading until real price arrives ═══
+  // Updated Feb 2026 — keep roughly current to minimize damage if sanity checks fail
+  BTCUSDT: { base: 98000, vol: 420 }, ETHUSDT: { base: 2700, vol: 38 },
+  SOLUSDT: { base: 170, vol: 4.5 }, BNBUSDT: { base: 650, vol: 12 },
+  XRPUSDT: { base: 2.60, vol: 0.06 }, DOGEUSDT: { base: 0.25, vol: 0.006 },
+  ADAUSDT: { base: 0.75, vol: 0.018 }, AVAXUSDT: { base: 38.5, vol: 1.4 },
 };
 
 // ═══ COLORS ═══
@@ -1567,7 +1576,7 @@ const StabilityEngine = {
 
   // ═══ SIGNAL DEDUP — hash AI signal to prevent double-trades ═══
   _recentSignals: [],
-  _DEDUP_WINDOW: 30000, // 30s — same signal within window = duplicate
+  _DEDUP_WINDOW: 15000, // 15s — same signal within window = duplicate
   signalHash(action, pair, confidence) {
     // Round confidence to nearest 5 to catch near-identical signals
     const confBucket = Math.round((confidence || 0) / 5) * 5;
@@ -1590,7 +1599,7 @@ const StabilityEngine = {
   },
 
   // ═══ TRADE THROTTLE — minimum time between trades ═══
-  _MIN_TRADE_GAP: 5000, // 5s minimum between any two trades
+  _MIN_TRADE_GAP: 3000, // 3s minimum between any two trades
   _lastTradeTime: 0,
   canTradeNow() {
     return Date.now() - this._lastTradeTime >= this._MIN_TRADE_GAP;
@@ -3142,6 +3151,13 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
 
     finalConf = clamp(finalConf, 0, 95);
     if (action !== "WAIT" && positions.length >= MAX_POSITIONS) { action = "WAIT"; reasons.unshift(`Max ${MAX_POSITIONS} positions`); }
+    // Stack-awareness: note when adding to existing position
+    const samePairOpen = positions.filter(p => p.pair === symbol);
+    if (action !== "WAIT" && samePairOpen.length > 0) {
+      const nearest = Math.min(...samePairOpen.map(p => Math.abs(currentPrice - p.entry) / p.entry * 100));
+      if (nearest < MIN_STACK_DISTANCE_PCT) { action = "WAIT"; reasons.unshift(`Stack too close (${nearest.toFixed(2)}% < ${MIN_STACK_DISTANCE_PCT}%)`); }
+      else { reasons.unshift(`Stacking #${samePairOpen.length + 1} (${nearest.toFixed(1)}% from last)`); }
+    }
     if (action !== "WAIT" && finalConf < MIN_CONF_TO_TRADE) { reasons.unshift(`Confidence ${fx(finalConf,0)}% < ${MIN_CONF_TO_TRADE}%`); action = "WAIT"; }
 
     let phase = action === "WAIT" ? "SCANNING" : "SIGNAL";
@@ -3252,7 +3268,8 @@ export default function NexusV7() {
   const executionLockRef = useRef(false); // React-level double-trigger guard
 
   // ═══ DATA INTEGRITY SHIELD ═══
-  const [lastDataUpdate, setLastDataUpdate] = useState(Date.now());
+  const [lastDataUpdate, setLastDataUpdate] = useState(0); // ═══ FIX: Start at 0 — blocks SL/TP until real price arrives ═══
+  const [hasLivePrice, setHasLivePrice] = useState(false);  // ═══ FIX: Only true after first REAL Binance price ═══
   const [dataFetchFails, setDataFetchFails] = useState(0);
   const STALE_TRADE_BLOCK = 30000;   // 30s — block new trades
   const STALE_SL_BLOCK = 60000;      // 60s — block SL/TP on stale price (could be wrong)
@@ -3411,9 +3428,15 @@ export default function NexusV7() {
       const demo = FALLBACK_PRICES[SYMBOLS[0].sym];
       setCandles(genDemoCandles(demo.base, 200, demo.vol));
       setPrice(demo.base);
+      console.warn(`[NEXUS] ⚠️ FALLBACK PRICE SET: $${demo.base} — SL/TP BLOCKED until live Binance price confirms (hasLivePrice=false)`);
       setChange24h((Math.random() - 0.4) * 5);
       setReady(true);
-      addLog("AI", "NEXUS v7 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
+      addLog("AI", "NEXUS v7.3 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
+      addLog("AI", `Config: ${MAX_POSITIONS} max positions | ${MIN_STACK_DISTANCE_PCT}% min stack dist | ${MAX_TRADES_PER_SESSION} trades/session | MTF gate +3 | Dedup 15s | Gap 3s`);
+      console.log("[NEXUS] 🚀 STARTUP: Balance=$" + fx(saved.balance || INITIAL_BALANCE) + " | Positions:" + (saved.positions?.length || 0) + " | History:" + (saved.history?.length || 0) + " | hasLivePrice=false (waiting for Binance)");
+      if (saved.positions?.length > 0) {
+        saved.positions.forEach(p => console.log(`[NEXUS] 📌 RESTORED POS: ${p.side} ${p.pairName} entry=$${p.entry?.toFixed(2)} qty=${p.qty?.toFixed(6)} cost=$${p.cost?.toFixed(2)}`));
+      }
       if (!validation.valid) addLog("WARN", "Stability: " + validation.issues.length + " state issue(s) auto-repaired on startup");
       if (cooldownUntil > Date.now()) addLog("WARN", "Cooldown restored: " + Math.ceil((cooldownUntil - Date.now()) / 60000) + "min remaining from last session");
       addLog("AI", "Stability layer active: exec-lock + signal-dedup + crash-recovery + trade-throttle");
@@ -3555,9 +3578,9 @@ export default function NexusV7() {
             setCandles(klineRes.map(d => ({ t: d[0], o: +d[1], h: +d[2], l: +d[3], c: +d[4], v: +d[5] })));
             if (!isLive) { setIsLive(true); addLog("AI", "Connected to LIVE Binance feed"); }
             if (i !== 0) setEndpointIdx(ENDPOINTS.indexOf(endpoints[i]));
-            setLastDataUpdate(Date.now()); setDataFetchFails(0);
+            setLastDataUpdate(Date.now()); setDataFetchFails(0); setHasLivePrice(true);
           }
-          if (tickerRes && tickerRes.lastPrice) { setPrice(+tickerRes.lastPrice); setChange24h(+tickerRes.priceChangePercent); setLastDataUpdate(Date.now()); }
+          if (tickerRes && tickerRes.lastPrice) { setPrice(+tickerRes.lastPrice); setChange24h(+tickerRes.priceChangePercent); setLastDataUpdate(Date.now()); setHasLivePrice(true); console.log("[NEXUS] ✅ LIVE price confirmed:", +tickerRes.lastPrice); }
           return;
         } catch { continue; }
       }
@@ -3572,7 +3595,8 @@ export default function NexusV7() {
             setCandles(data.map(d => ({ t: d[0], o: +d[1], h: +d[2], l: +d[3], c: +d[4], v: +d[5] })));
             setPrice(+data[data.length - 1][4]);
             if (!isLive) { setIsLive(true); addLog("AI", "Connected via CORS proxy"); }
-            setLastDataUpdate(Date.now()); setDataFetchFails(0);
+            setLastDataUpdate(Date.now()); setDataFetchFails(0); setHasLivePrice(true);
+            console.log("[NEXUS] ✅ LIVE price via proxy:", +data[data.length - 1][4]);
             return;
           }
         } catch { continue; }
@@ -3619,7 +3643,15 @@ export default function NexusV7() {
 
   // ═══ AI ANALYSIS ═══
   useEffect(() => {
-    try { if (candles.length > 60 && price > 0) setAiResult(aiDecision(candles, price, pair.sym, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, fgData, redditData, macroData, onChainData, mtfData)); } catch {}
+    try { 
+      if (candles.length > 60 && price > 0) {
+        const result = aiDecision(candles, price, pair.sym, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, fgData, redditData, macroData, onChainData, mtfData);
+        setAiResult(result);
+        if (result && result.action !== "WAIT") {
+          console.log(`[NEXUS] 🤖 AI DECISION: ${result.action} ${pair.name} | Conf:${result.confidence}% | SL:${result.sl||'none'} TP:${result.tp||'none'} | Bias:${result.indicators?.marketBias||'?'} ${result.indicators?.marketBiasStrength||0}%`);
+        }
+      }
+    } catch {}
   }, [candles, price, pair, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, onChainData, mtfData]);
 
   // ═══ AUTO-TRADING (AI FREE HAND) ═══
@@ -3689,61 +3721,80 @@ export default function NexusV7() {
     try {
       if (!aiActive || !aiResult) return;
       // ═══ DEMO GUARD: Never auto-trade on fake/offline data ═══
-      if (!isLive) return;
-      if (aiResult.action === "WAIT" || aiResult.action === "PAUSE") return;
-      if ((geminiKey || groqKey) && llmResult?.live && llmResult.override && llmResult.action === "WAIT") return;
-      if (positions.find(p => p.pair === pair.sym)) return;
-      if (positions.length >= MAX_POSITIONS) return;
+      if (!isLive) { console.log("[NEXUS] ⏸ Trade skip: not live"); return; }
+      if (!hasLivePrice) { console.log("[NEXUS] ⏸ Trade skip: no live price confirmed"); return; }
+      if (aiResult.action === "WAIT" || aiResult.action === "PAUSE") { console.log(`[NEXUS] ⏸ AI says ${aiResult.action} (conf: ${aiResult.confidence}%)`); return; }
+      if ((geminiKey || groqKey) && llmResult?.live && llmResult.override && llmResult.action === "WAIT") { console.log("[NEXUS] ⏸ LLM override: WAIT"); return; }
+      // ═══ POSITION STACKING GUARDS ═══
+      const samePairPositions = positions.filter(p => p.pair === pair.sym);
+      // Enforce minimum price distance between stacked entries
+      if (samePairPositions.length > 0) {
+        const tooClose = samePairPositions.some(p => {
+          const dist = Math.abs(price - p.entry) / p.entry * 100;
+          if (dist < MIN_STACK_DISTANCE_PCT) {
+            console.log(`[NEXUS] ⏸ Stack blocked: ${pair.name} distance ${dist.toFixed(2)}% < ${MIN_STACK_DISTANCE_PCT}% min (entry $${p.entry.toFixed(2)} vs now $${price.toFixed(2)})`);
+          }
+          return dist < MIN_STACK_DISTANCE_PCT;
+        });
+        if (tooClose) return; // silently skip — entries too close to stack
+      }
+      if (positions.length >= MAX_POSITIONS) { console.log(`[NEXUS] ⏸ Max positions reached (${positions.length}/${MAX_POSITIONS})`); return; }
 
       // ═══ STABILITY: Execution lock — prevent React double-trigger ═══
-      if (executionLockRef.current) return;
-      if (StabilityEngine.isLocked()) return;
+      if (executionLockRef.current) { console.log("[NEXUS] ⏸ Execution lock active"); return; }
+      if (StabilityEngine.isLocked()) { console.log("[NEXUS] ⏸ StabilityEngine locked"); return; }
 
       // ═══ STABILITY: Trade throttle — minimum 5s between trades ═══
-      if (!StabilityEngine.canTradeNow()) return;
+      if (!StabilityEngine.canTradeNow()) { console.log("[NEXUS] ⏸ Trade throttle active"); return; }
 
       // ═══ STABILITY: Signal dedup — same signal won't fire twice in 30s ═══
-      if (StabilityEngine.isDuplicate(aiResult.action, pair.sym, aiResult.confidence)) return;
+      if (StabilityEngine.isDuplicate(aiResult.action, pair.sym, aiResult.confidence)) { console.log("[NEXUS] ⏸ Duplicate signal filtered"); return; }
 
       // ═══ CONSECUTIVE LOSS COOLDOWN ═══
       if (cooldownUntil > Date.now()) {
         const remaining = Math.ceil((cooldownUntil - Date.now()) / 60000);
+        console.log(`[NEXUS] ⏸ Loss cooldown: ${remaining}min remaining`);
         return; // silently skip — cooldown active
       }
 
       // ═══ DATA INTEGRITY SHIELD — Block trades on stale data ═══
       const dataAge = Date.now() - lastDataUpdate;
       if (dataAge > STALE_TRADE_BLOCK) {
+        console.log(`[NEXUS] ⏸ Stale data: ${Math.round(dataAge/1000)}s old > ${STALE_TRADE_BLOCK/1000}s limit`);
         return; // silently block — data too old for safe entry
       }
       // Validate candle freshness — latest candle should be recent
       if (candles.length > 0 && candles[candles.length - 1].t) {
         const candleAge = Date.now() - candles[candles.length - 1].t;
         if (candleAge > MAX_CANDLE_AGE) {
+          console.log(`[NEXUS] ⏸ Stale candle: ${Math.round(candleAge/1000)}s old`);
           return; // candle data too old — API may be returning cached/stale klines
         }
       }
 
       // Drawdown escalation check
-      if (drawdownState?.isPaused) { return; }
+      if (drawdownState?.isPaused) { console.log("[NEXUS] ⏸ Drawdown pause active"); return; }
 
       // ═══ MTF ALIGNMENT GATE (v7.2) — Don't trade against the big picture ═══
-      // Require multi-timeframe agreement before opening positions
       const mtfCombined = mtfData?.combined;
+      console.log(`[NEXUS] 🧠 AI Signal: ${aiResult.action} ${pair.name} conf=${aiResult.confidence}% | MTF: ${mtfCombined?.valid ? mtfCombined.trend + " " + mtfCombined.strength + "%" + (mtfCombined.aligned ? " ALIGNED" : "") : "no data"} | Positions: ${positions.length}/${MAX_POSITIONS} (${samePairPositions.length} same pair)`);
       if (mtfCombined && mtfCombined.valid) {
         // HARD BLOCK: Never open a LONG when MTF is aligned bearish (or vice versa)
         if (aiResult.action === "LONG" && mtfCombined.trend === "bearish" && mtfCombined.aligned) {
           addLog("MTF", "BLOCKED LONG: 3+ timeframes aligned bearish — not fighting the trend");
+          console.log("[NEXUS] 🚫 MTF HARD BLOCK: LONG vs aligned bearish");
           return;
         }
         if (aiResult.action === "SHORT" && mtfCombined.trend === "bullish" && mtfCombined.aligned) {
           addLog("MTF", "BLOCKED SHORT: 3+ timeframes aligned bullish — not fighting the trend");
+          console.log("[NEXUS] 🚫 MTF HARD BLOCK: SHORT vs aligned bullish");
           return;
         }
-        // SOFT GATE: When MTF is neutral or weak, require higher confidence
+        // SOFT GATE: When MTF is neutral or weak, require slightly higher confidence
         if (mtfCombined.trend === "neutral" || mtfCombined.strength < 20) {
-          // MTF unclear — raise the bar by 8 points
-          if (aiResult.confidence < MIN_CONF_TO_TRADE + 8) {
+          const requiredConf = MIN_CONF_TO_TRADE + 3;
+          if (aiResult.confidence < requiredConf) {
+            console.log(`[NEXUS] ⏸ MTF SOFT GATE: conf ${aiResult.confidence}% < ${requiredConf}% (neutral/weak MTF needs +3)`);
             return; // silently skip — MTF not confirming, need extra confidence
           }
         }
@@ -3782,7 +3833,7 @@ export default function NexusV7() {
           tradeConf += 6; // All timeframes say down — high conviction short
           addLog("MTF", `Short +6 conf: MTF aligned bearish ${mtfCombined.strength}%`);
         }
-        if (tradeConf < MIN_CONF_TO_TRADE) return;
+        if (tradeConf < MIN_CONF_TO_TRADE) { console.log(`[NEXUS] ⏸ Conf too low after SHORT penalty: ${tradeConf.toFixed(0)}% < ${MIN_CONF_TO_TRADE}%`); return; }
       }
 
       // MTF alignment bonus for longs
@@ -3791,11 +3842,11 @@ export default function NexusV7() {
         addLog("MTF", `Long +6 conf: MTF aligned bullish ${mtfCombined.strength}%`);
       }
 
-      if (tradeConf < MIN_CONF_TO_TRADE) return;
+      if (tradeConf < MIN_CONF_TO_TRADE) { console.log(`[NEXUS] ⏸ Final conf too low: ${tradeConf.toFixed(0)}% < ${MIN_CONF_TO_TRADE}%`); return; }
 
       // Apply drawdown risk adjustment
       const ddResult = DrawdownManager.applyToTrade(riskPct, tradeConf, drawdownState);
-      if (ddResult.blocked) { return; }
+      if (ddResult.blocked) { console.log("[NEXUS] ⏸ Drawdown manager blocked trade"); return; }
 
       if (balance < MIN_BALANCE) { addLog("WARN", "Balance too low"); return; }
       let effectiveRisk = ddResult.adjustedRisk || riskPct;
@@ -3809,35 +3860,64 @@ export default function NexusV7() {
       }
 
       const amount = Math.max(1, balance * effectiveRisk / 100);
-      if (amount < 1) return;
+      // ═══ STACK SIZE DECAY — reduce size for 2nd/3rd stacked positions ═══
+      const stackLevel = positions.filter(p => p.pair === pair.sym).length; // 0, 1, or 2
+      const stackMultiplier = STACK_SIZE_DECAY[Math.min(stackLevel, STACK_SIZE_DECAY.length - 1)];
+      const stackedAmount = Math.max(1, amount * stackMultiplier);
+      if (stackLevel > 0) addLog("AI", `Stack level ${stackLevel + 1}: size ${(stackMultiplier * 100).toFixed(0)}% \u2014 $${stackedAmount.toFixed(2)}`);
+      if (stackedAmount < 1) return;
+
+      console.log(`[NEXUS] ✅ ALL GATES PASSED — EXECUTING: ${aiResult.action} ${pair.name} | Conf:${tradeConf.toFixed(0)}% | Amount:$${stackedAmount.toFixed(2)} | Stack:${stackLevel+1}/${MAX_POSITIONS} | SL:${aiResult.sl||'none'} TP:${aiResult.tp||'none'}`);
 
       // ═══ STABILITY: Lock execution, record signal, execute ═══
       executionLockRef.current = true;
       try {
         StabilityEngine.recordSignal(aiResult.action, pair.sym, aiResult.confidence);
         StabilityEngine.recordTrade();
-        executeTrade(aiResult.action, amount, aiResult.sl, aiResult.tp, true);
+        executeTrade(aiResult.action, stackedAmount, aiResult.sl, aiResult.tp, true);
       } finally {
         executionLockRef.current = false;
       }
     } catch {}
-  }, [aiResult, aiActive, llmResult, drawdownState, cooldownUntil, lastDataUpdate, candles, isLive, mtfData]);
+  }, [aiResult, aiActive, llmResult, drawdownState, cooldownUntil, lastDataUpdate, candles, isLive, mtfData, hasLivePrice]);
 
-  // ═══ SL/TP MONITOR + MTF-AWARE SMART EXITS (v7.2) ═══
+  // ═══ SL/TP MONITOR + MTF-AWARE SMART EXITS (v7.3 — Price Sanity + Stale Winner) ═══
   useEffect(() => {
     try {
       if (!price || positions.length === 0) return;
+
+      // ═══ FIX: Block ALL exits until we have confirmed live price ═══
+      if (!hasLivePrice) {
+        console.log("[NEXUS] ⛔ SL/TP BLOCKED: No live price yet (hasLivePrice=false)");
+        return;
+      }
+
       // ═══ DATA INTEGRITY: Don't trigger SL/TP on stale prices ═══
       const dataAge = Date.now() - lastDataUpdate;
-      if (dataAge > STALE_SL_BLOCK) return; // stale price could trigger wrong exits
+      if (dataAge > STALE_SL_BLOCK) {
+        console.log(`[NEXUS] ⛔ SL/TP BLOCKED: Data stale (${Math.round(dataAge/1000)}s old > ${STALE_SL_BLOCK/1000}s limit)`);
+        return;
+      }
+
       const mtfCombined = mtfData?.combined;
       setPositions(prev => {
         let changed = false;
         const updated = prev.filter(p => {
           if (p.pair !== pair.sym) return true;
+
+          // ═══ PRICE SANITY CHECK — Reject exits on impossible prices ═══
+          const priceVsEntry = Math.abs(price - p.entry) / p.entry * 100;
+          if (priceVsEntry > MAX_SANE_MOVE_PCT) {
+            console.warn(`[NEXUS] 🚨 PRICE SANITY BLOCK: ${p.side} ${p.pairName} | Price $${price.toFixed(2)} is ${priceVsEntry.toFixed(1)}% from entry $${p.entry.toFixed(2)} | MAX_SANE=${MAX_SANE_MOVE_PCT}% | BLOCKING EXIT`);
+            return true; // keep position, don't close on insane price
+          }
+
           const pnl = p.side === "LONG" ? (price - p.entry) * p.qty : (p.entry - price) * p.qty;
           const pnlPct = (pnl / p.cost) * 100;
           const holdMins = (Date.now() - new Date(p.entryTime).getTime()) / 60000;
+
+          // ═══ PERIODIC POSITION LOG (every price tick for open positions) ═══
+          console.log(`[NEXUS] 📊 POS: ${p.side} ${p.pairName} | Entry:$${p.entry.toFixed(2)} Now:$${price.toFixed(2)} | PnL:${pnlPct.toFixed(2)}% ($${pnl.toFixed(2)}) | Hold:${holdMins.toFixed(0)}min | SL:$${(p.sl||0).toFixed(2)} TP:$${(p.tp||0).toFixed(2)}`);
 
           // ═══ MTF-AWARE TRAILING STOPS ═══
           const mtfConfirms = mtfCombined?.valid && (
@@ -3851,83 +3931,103 @@ export default function NexusV7() {
           const mtfAlignedAgainst = mtfAgainst && mtfCombined.aligned;
 
           // === TRAIL TO BREAKEVEN ===
-          // Normal: at 2% profit. MTF against: at 1.2% (faster protection)
           const beThreshold = mtfAgainst ? 1.2 : 2;
           if (pnlPct > beThreshold && p.sl) {
             const be = p.entry + (p.side === "LONG" ? 1 : -1) * (p.cost * FEE_RATE * 2 / p.qty);
-            if (p.side === "LONG" && p.sl < be) { p.sl = be; addLog("AI", `Trail SL to breakeven ${p.pairName}${mtfAgainst ? " (MTF opposing)" : ""}`); }
-            if (p.side === "SHORT" && p.sl > be) { p.sl = be; addLog("AI", `Trail SL to breakeven ${p.pairName}${mtfAgainst ? " (MTF opposing)" : ""}`); }
+            if (p.side === "LONG" && p.sl < be) { p.sl = be; addLog("AI", `Trail SL to breakeven ${p.pairName}${mtfAgainst ? " (MTF opposing)" : ""}`); console.log(`[NEXUS] 🔄 TRAIL BE: ${p.pairName} SL→$${be.toFixed(2)}`); }
+            if (p.side === "SHORT" && p.sl > be) { p.sl = be; addLog("AI", `Trail SL to breakeven ${p.pairName}${mtfAgainst ? " (MTF opposing)" : ""}`); console.log(`[NEXUS] 🔄 TRAIL BE: ${p.pairName} SL→$${be.toFixed(2)}`); }
           }
 
           // === PROFIT TRAILING ===
-          // MTF confirms: keep 30% of profit (wider trail, let winners run)
-          // MTF neutral: keep 40% of profit (standard)
-          // MTF against: keep 55% of profit (tight trail, protect gains)
           const trailThreshold = mtfConfirms ? 4.5 : mtfAgainst ? 2.5 : 3.5;
           const trailKeep = mtfConfirms ? 0.3 : mtfAgainst ? 0.55 : 0.4;
           if (pnlPct > trailThreshold && p.sl) {
             const trail = p.side === "LONG" ? price - (price - p.entry) * trailKeep : price + (p.entry - price) * trailKeep;
-            if (p.side === "LONG" && trail > p.sl) { p.sl = trail; }
-            if (p.side === "SHORT" && trail < p.sl) { p.sl = trail; }
+            if (p.side === "LONG" && trail > p.sl) { p.sl = trail; console.log(`[NEXUS] 🔄 PROFIT TRAIL: ${p.pairName} SL→$${trail.toFixed(2)} (keeping ${(trailKeep*100).toFixed(0)}%)`); }
+            if (p.side === "SHORT" && trail < p.sl) { p.sl = trail; console.log(`[NEXUS] 🔄 PROFIT TRAIL: ${p.pairName} SL→$${trail.toFixed(2)} (keeping ${(trailKeep*100).toFixed(0)}%)`); }
           }
 
           // === MTF EARLY EXIT: Take profit when MTF turns against profitable position ===
-          // If profitable >1.5% and MTF is ALIGNED against you, take the money and run
           if (pnlPct > 1.5 && mtfAlignedAgainst) {
-            addLog("MTF", `SMART EXIT: ${p.side} ${p.pairName} +${pnlPct.toFixed(1)}% \u2014 MTF aligned against, locking profit`);
+            addLog("MTF", `SMART EXIT: ${p.side} ${p.pairName} +${pnlPct.toFixed(1)}% — MTF aligned against, locking profit`);
+            console.log(`[NEXUS] 🎯 MTF SMART EXIT: ${p.side} ${p.pairName} +${pnlPct.toFixed(1)}% at $${price.toFixed(2)}`);
             closeTrade(p, price, "MTF Smart Exit");
             changed = true;
             return false;
           }
 
           // === MTF FAST CUT: Cut losers faster when MTF confirms you're wrong ===
-          // If losing >0.8% and MTF is aligned against you and held >5 min, exit early
           if (pnlPct < -0.8 && mtfAlignedAgainst && holdMins > 5) {
-            addLog("MTF", `FAST CUT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% \u2014 MTF aligned against, cutting loss early`);
+            addLog("MTF", `FAST CUT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% — MTF aligned against, cutting loss early`);
+            console.log(`[NEXUS] ✂️ MTF FAST CUT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% at $${price.toFixed(2)}`);
             closeTrade(p, price, "MTF Fast Cut");
             changed = true;
             return false;
           }
 
           // === TIME-BASED EXIT: Stale positions with no MTF support ===
-          // If held >120 min, in loss, and MTF is neutral or against — exit
-          if (holdMins > 120 && pnlPct < 0 && !mtfConfirms) {
-            addLog("AI", `TIME EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% after ${Math.round(holdMins)}min \u2014 no MTF support`);
+          if (holdMins > 120 && pnlPct < 0 && !mtfConfirms && mtfCombined?.valid) {
+            addLog("AI", `TIME EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% after ${Math.round(holdMins)}min — no MTF support`);
+            console.log(`[NEXUS] ⏰ TIME EXIT (loser): ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% held ${Math.round(holdMins)}min`);
             closeTrade(p, price, "Time Exit (no MTF support)");
             changed = true;
             return false;
           }
 
+          // ═══ NEW: STALE WINNER EXIT — Don't let tiny profits sit forever ═══
+          // If held >3hrs and profit is under 0.5%, close and free capital for better trades
+          if (holdMins > STALE_WINNER_MINS && pnlPct > 0 && pnlPct < STALE_WINNER_MIN_PCT) {
+            addLog("AI", `STALE WIN EXIT: ${p.side} ${p.pairName} +${pnlPct.toFixed(2)}% after ${Math.round(holdMins)}min — tiny profit, freeing capital`);
+            console.log(`[NEXUS] 💤 STALE WINNER EXIT: ${p.side} ${p.pairName} +${pnlPct.toFixed(2)}% held ${Math.round(holdMins)}min`);
+            closeTrade(p, price, "Stale Winner Exit");
+            changed = true;
+            return false;
+          }
+
           // === EXTENDED WINNER HOLD: Let winners ride when MTF confirms ===
-          // When MTF confirms and profit >3%, push TP target 30% further
           if (pnlPct > 3 && mtfConfirms && mtfCombined.aligned && p.tp) {
             const tpDist = Math.abs(p.tp - p.entry);
             const extendedTp = p.side === "LONG" ? p.entry + tpDist * 1.3 : p.entry - tpDist * 1.3;
             if (p.side === "LONG" && extendedTp > p.tp) {
-              addLog("MTF", `Extending TP: ${p.pairName} \u2192 $${extendedTp.toFixed(pair.dp)} (MTF aligned, letting winner run)`);
+              addLog("MTF", `Extending TP: ${p.pairName} → $${extendedTp.toFixed(pair.dp)} (MTF aligned, letting winner run)`);
+              console.log(`[NEXUS] 🚀 TP EXTEND: ${p.pairName} TP $${p.tp.toFixed(2)}→$${extendedTp.toFixed(2)}`);
               p.tp = extendedTp;
             }
             if (p.side === "SHORT" && extendedTp < p.tp) {
-              addLog("MTF", `Extending TP: ${p.pairName} \u2192 $${extendedTp.toFixed(pair.dp)} (MTF aligned, letting winner run)`);
+              addLog("MTF", `Extending TP: ${p.pairName} → $${extendedTp.toFixed(pair.dp)} (MTF aligned, letting winner run)`);
+              console.log(`[NEXUS] 🚀 TP EXTEND: ${p.pairName} TP $${p.tp.toFixed(2)}→$${extendedTp.toFixed(2)}`);
               p.tp = extendedTp;
             }
           }
 
           // === STANDARD SL/TP HITS ===
-          if (p.sl && ((p.side === "LONG" && price <= p.sl) || (p.side === "SHORT" && price >= p.sl))) { closeTrade(p, price, "Stop Loss"); changed = true; return false; }
-          if (p.tp && ((p.side === "LONG" && price >= p.tp) || (p.side === "SHORT" && price <= p.tp))) { closeTrade(p, price, "Take Profit"); changed = true; return false; }
+          if (p.sl && ((p.side === "LONG" && price <= p.sl) || (p.side === "SHORT" && price >= p.sl))) {
+            console.log(`[NEXUS] 🛑 STOP LOSS HIT: ${p.side} ${p.pairName} at $${price.toFixed(2)} (SL=$${p.sl.toFixed(2)})`);
+            closeTrade(p, price, "Stop Loss"); changed = true; return false;
+          }
+          if (p.tp && ((p.side === "LONG" && price >= p.tp) || (p.side === "SHORT" && price <= p.tp))) {
+            console.log(`[NEXUS] 🎯 TAKE PROFIT HIT: ${p.side} ${p.pairName} at $${price.toFixed(2)} (TP=$${p.tp.toFixed(2)})`);
+            closeTrade(p, price, "Take Profit"); changed = true; return false;
+          }
           return true;
         });
         return changed ? updated : prev;
       });
     } catch {}
-  }, [price, lastDataUpdate, mtfData]);
+  }, [price, lastDataUpdate, mtfData, hasLivePrice]);
 
   // ═══ TRADE EXECUTION ═══
   function executeTrade(side, amount, sl, tp, isAI = false) {
     try {
+      // ═══ FIX: Block trades if no confirmed live price ═══
+      if (!hasLivePrice) {
+        console.warn(`[NEXUS] ⛔ TRADE BLOCKED: No live price confirmed yet`);
+        addLog("WARN", "Trade blocked — waiting for live price confirmation");
+        return;
+      }
       if (amount > balance) { addLog("ERR", "Insufficient balance"); return; }
       if (balance < MIN_BALANCE) { addLog("ERR", `Min $${MIN_BALANCE} required`); return; }
+      console.log(`[NEXUS] 🔔 OPENING: ${side} ${pair.name} | Amount:$${amount.toFixed(2)} | Price:$${price.toFixed(2)} | SL:${sl||'none'} TP:${tp||'none'}`);
       // ═══ REALISTIC EXECUTION: apply slippage on entry ═══
       const atrPct = aiResult?.indicators?.atrPct || 1;
       const fillPrice = simulateSlippage(price, side, atrPct);
@@ -3952,6 +4052,15 @@ export default function NexusV7() {
 
   function closeTrade(p, exitPrice, reason) {
     try {
+      // ═══ PRICE SANITY CHECK — Reject impossible exits ═══
+      const priceVsEntry = Math.abs(exitPrice - p.entry) / p.entry * 100;
+      if (priceVsEntry > MAX_SANE_PNL_PCT) {
+        console.error(`[NEXUS] 🚨 CLOSE BLOCKED — INSANE PRICE: ${p.side} ${p.pairName} exit $${exitPrice.toFixed(2)} is ${priceVsEntry.toFixed(1)}% from entry $${p.entry.toFixed(2)} | reason: ${reason} | This is likely a fallback/stale price bug`);
+        addLog("ERR", `BLOCKED ${reason}: Price $${exitPrice.toFixed(0)} is ${priceVsEntry.toFixed(1)}% from entry — data error, not closing`);
+        return; // DO NOT CLOSE — price is insane
+      }
+      console.log(`[NEXUS] 💰 CLOSING: ${p.side} ${p.pairName} | Entry:$${p.entry.toFixed(2)} Exit:$${exitPrice.toFixed(2)} (${priceVsEntry.toFixed(2)}% move) | Reason: ${reason}`);
+
       // ═══ REALISTIC EXECUTION: slippage on exit (reversed — works against you) ═══
       const exitSide = p.side === "LONG" ? "SHORT" : "LONG"; // closing is opposite direction
       const atrPct = aiResult?.indicators?.atrPct || 1;
@@ -3965,6 +4074,7 @@ export default function NexusV7() {
       const totalSlippage = (p.slippage || 0) + exitSlippage;
       const isDemo = !isLive || p.isDemo;
       const record = { ...p, exit: realExit, exitTime: new Date().toISOString(), gross: grossPnl, exitFee, net: netPnl, pct, totalFees, totalSlippage, reason, isDemo };
+      console.log(`[NEXUS] 📋 TRADE CLOSED: ${p.side} ${p.pairName} | Entry:$${p.entry.toFixed(2)} Exit:$${realExit.toFixed(2)} | Gross:$${grossPnl.toFixed(4)} Net:$${netPnl.toFixed(4)} (${pct.toFixed(2)}%) | Fees:$${totalFees.toFixed(4)} Slip:$${totalSlippage.toFixed(4)} | ${reason}${isDemo ? " [DEMO]" : ""}`);
       setHistory(prev => [record, ...prev]);
       setBalance(b => b + p.cost + netPnl);
       setSessionPnl(d => d + netPnl);
@@ -3982,9 +4092,9 @@ export default function NexusV7() {
         setConsecutiveLosses(prev => {
           const newStreak = prev + 1;
           if (newStreak >= 3) {
-            const cooldownMs = 15 * 60 * 1000; // 15 minutes
+            const cooldownMs = 5 * 60 * 1000; // 5 minutes
             setCooldownUntil(Date.now() + cooldownMs);
-            addLog("WARN", `${newStreak} consecutive losses — AUTO-COOLDOWN 15min to prevent tilt trading`);
+            addLog("WARN", `${newStreak} consecutive losses — AUTO-COOLDOWN 5min to prevent tilt trading`);
           }
           return newStreak;
         });
