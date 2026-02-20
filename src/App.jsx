@@ -36,7 +36,7 @@ const MIN_STACK_DISTANCE_PCT = 0.25; // Min 0.25% price distance between stacked
 const STACK_SIZE_DECAY = [1, 0.8, 0.6, 0.45, 0.3]; // Position size multiplier: 1st=100%, 2nd=80%, 3rd=60%, 4th=45%, 5th=30%
 const COOL_AFTER_LOSS = 60000;
 const MAX_TRADES_PER_SESSION = 20;
-const MIN_CONF_TO_TRADE = 45;
+const MIN_CONF_TO_TRADE = 40;
 // ═══ PRICE SANITY — Prevent fake PnL from stale/fallback prices ═══
 const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real (BTC rarely moves more in one candle)
 const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real (anything above is data error)
@@ -3095,9 +3095,9 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     if (atrPct > 3 || volRatio > 3 || regime === "volatile") riskLevel = "HIGH";
     else if (atrPct > 1.5 || volRatio > 2) riskLevel = "MED";
 
-    // ═══ RAISED THRESHOLDS v7.2 — Only A+ setups trade ═══
-    const confThreshold = riskLevel === "HIGH" ? 42 : riskLevel === "MED" ? 34 : 28;
-    const pctThreshold = riskLevel === "HIGH" ? 72 : riskLevel === "MED" ? 68 : 66;
+    // ═══ TUNED THRESHOLDS v7.3 — Balance quality vs frequency ═══
+    const confThreshold = riskLevel === "HIGH" ? 38 : riskLevel === "MED" ? 30 : 24;
+    const pctThreshold = riskLevel === "HIGH" ? 64 : riskLevel === "MED" ? 58 : 54;
 
     let action = "WAIT";
     let sl = 0, tp = 0;
@@ -3131,6 +3131,11 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       const wr = Brain.getWinRate(indicators, "SHORT", symbol);
       if (wr.total >= 4 && wr.rate < 32) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate,0)}% (${wr.wins}W/${wr.losses}L) - too low`); }
       finalConf += Brain.getConfidenceModifier(indicators, "SHORT", symbol);
+    }
+
+    // Log signal decision details
+    if (action === "WAIT" && rawConf > 20) {
+      console.log(`[NEXUS] 🔍 Signal check: bull=${fx(bullPct,0)}% bear=${fx(bearPct,0)}% need>${pctThreshold}% | rawConf=${fx(rawConf,0)}% need>${confThreshold} | risk=${riskLevel}`);
     }
 
     // ML Engine prediction
@@ -3274,7 +3279,8 @@ export default function NexusV7() {
   const STALE_TRADE_BLOCK = 30000;   // 30s — block new trades
   const STALE_SL_BLOCK = 60000;      // 60s — block SL/TP on stale price (could be wrong)
   const STALE_CRITICAL = 120000;     // 2min — force pause all activity
-  const MAX_CANDLE_AGE = 180000;     // 3min — latest candle timestamp must be recent
+  const TIMEFRAME_MS = { "1m": 60000, "5m": 300000, "15m": 900000, "1h": 3600000, "4h": 14400000, "1d": 86400000 };
+  const MAX_CANDLE_AGE = (TIMEFRAME_MS[timeframe] || 900000) + 600000; // candle interval + 10min grace
 
   const [news, setNews] = useState([]);
   const [session, setSession] = useState(null);
@@ -3723,7 +3729,7 @@ export default function NexusV7() {
       // ═══ DEMO GUARD: Never auto-trade on fake/offline data ═══
       if (!isLive) { console.log("[NEXUS] ⏸ Trade skip: not live"); return; }
       if (!hasLivePrice) { console.log("[NEXUS] ⏸ Trade skip: no live price confirmed"); return; }
-      if (aiResult.action === "WAIT" || aiResult.action === "PAUSE") { console.log(`[NEXUS] ⏸ AI says ${aiResult.action} (conf: ${aiResult.confidence}%)`); return; }
+      if (aiResult.action === "WAIT" || aiResult.action === "PAUSE") { console.log(`[NEXUS] ⏸ AI says ${aiResult.action} (conf: ${Number(aiResult.confidence).toFixed(1)}%) | Reasons: ${(aiResult.reasons||[]).slice(0,3).join('; ')}`); return; }
       if ((geminiKey || groqKey) && llmResult?.live && llmResult.override && llmResult.action === "WAIT") { console.log("[NEXUS] ⏸ LLM override: WAIT"); return; }
       // ═══ POSITION STACKING GUARDS ═══
       const samePairPositions = positions.filter(p => p.pair === pair.sym);
