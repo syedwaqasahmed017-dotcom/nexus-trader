@@ -42,8 +42,6 @@ const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real (BTC rar
 const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real (anything above is data error)
 const STALE_WINNER_MINS = 180;     // Close stale winners after 3 hours
 const STALE_WINNER_MIN_PCT = 0.5;  // Minimum profit% to keep holding past stale timer
-const STALE_LOSER_MINS = 360;     // Close stale losers after 6 hours — even weak MTF can't save dead trades
-const MIN_MTF_CONFIRM_STRENGTH = 45; // MTF must be at least 45% strength to count as "confirming" — prevents weak signals blocking exits
 const SESSION_PROFIT_TARGET = 0.8;
 const SESSION_MAX_LOSS = 1.5;
 const INITIAL_BALANCE = 100;
@@ -137,12 +135,6 @@ const SocialEngine = {
 
   async fetchRedditSentiment() {
     try {
-      // Return cache if still fresh (30min TTL — sentiment doesn't change fast)
-      const REDDIT_CACHE_TTL = 1800000; // 30 minutes
-      if (this._redditCache && this._redditCache.live && (Date.now() - this._redditCache.timestamp) < REDDIT_CACHE_TTL) {
-        return this._redditCache;
-      }
-
       // Return cache if backoff active
       if (Date.now() < this._redditBackoff && this._redditCache) return this._redditCache;
 
@@ -153,38 +145,30 @@ const SocialEngine = {
         this._redditCache = result;
         this._redditConsecutiveFails = 0;
         this._redditBackoff = 0;
-        console.log(`[NEXUS] Reddit: LIVE score=${result.score} (${result.label}) posts=${result.totalPosts}`);
         return result;
       }
 
-      // All failed — exponential backoff (max 60min)
-      this._redditConsecutiveFails = (this._redditConsecutiveFails || 0) + 1;
-      const backoffMs = Math.min(3600000, 120000 * Math.pow(2, this._redditConsecutiveFails));
+      // All failed — exponential backoff (max 30min)
+      this._redditConsecutiveFails++;
+      const backoffMs = Math.min(1800000, 60000 * Math.pow(2, this._redditConsecutiveFails));
       this._redditBackoff = Date.now() + backoffMs;
-      console.warn(`[NEXUS] Reddit: ${this._redditConsecutiveFails} consecutive fails, backoff ${Math.round(backoffMs/60000)}min`);
+      console.warn(`[NEXUS] Reddit: ${this._redditConsecutiveFails} fails, backoff ${Math.round(backoffMs/1000)}s`);
       return this._redditCache || this._fallbackReddit();
     } catch { return this._redditCache || this._fallbackReddit(); }
   },
 
-  _redditHeaders() {
-    return {
-      "Accept": "application/json",
-      "User-Agent": "NEXUS-Trader/7.3 (market-sentiment-bot)",
-    };
-  },
-
   async _tryRedditJSON() {
-    // Try r/Bitcoin first — only try r/cryptocurrency if Bitcoin fails entirely
-    const subreddits = ["Bitcoin", "cryptocurrency"];
+    const urls = [
+      "https://www.reddit.com/r/Bitcoin/hot.json?limit=25",
+      "https://www.reddit.com/r/cryptocurrency/hot.json?limit=25",
+    ];
     const proxyList = CORS_PROXIES.filter(Boolean);
-    for (const sub of subreddits) {
-      const baseUrl = `https://www.reddit.com/r/${sub}/hot.json?limit=25`;
-      // Try each proxy (MY_PROXY first, then others) — stop on first success
+    for (const baseUrl of urls) {
       for (const proxy of proxyList) {
         try {
           const res = await fetch(proxy + encodeURIComponent(baseUrl), {
-            signal: AbortSignal.timeout(8000),
-            headers: this._redditHeaders(),
+            signal: AbortSignal.timeout(10000),
+            headers: { "Accept": "application/json" },
           });
           if (res.status === 429 || res.status === 403) continue;
           if (!res.ok) continue;
@@ -198,26 +182,30 @@ const SocialEngine = {
   },
 
   async _tryRedditRSS() {
-    // RSS feeds are less rate-limited — try just r/Bitcoin to minimize requests
-    const baseUrl = "https://www.reddit.com/r/Bitcoin/hot.rss?limit=20";
+    // RSS feeds are less rate-limited than JSON API
+    const urls = [
+      "https://www.reddit.com/r/Bitcoin/hot.rss?limit=20",
+      "https://www.reddit.com/r/cryptocurrency/hot.rss?limit=20",
+    ];
     const proxyList = CORS_PROXIES.filter(Boolean);
-    for (const proxy of proxyList) {
-      try {
-        const res = await fetch(proxy + encodeURIComponent(baseUrl), {
-          signal: AbortSignal.timeout(8000),
-          headers: { "User-Agent": "NEXUS-Trader/7.3 (market-sentiment-bot)" },
-        });
-        if (res.status === 429 || res.status === 403) continue;
-        if (!res.ok) continue;
-        const text = await res.text();
-        const titleMatches = [...text.matchAll(/<title[^>]*>([\s\S]*?)<\/title>/gi)];
-        if (titleMatches.length < 3) continue;
-        const posts = titleMatches.slice(1).map(m => ({
-          title: m[1].replace(/<!\[CDATA\[|\]\]>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").trim(),
-          ups: 10, upvote_ratio: 0.7, selftext: "",
-        }));
-        if (posts.length > 0) return this._parseRedditPosts(posts);
-      } catch { continue; }
+    for (const baseUrl of urls) {
+      for (const proxy of proxyList) {
+        try {
+          const res = await fetch(proxy + encodeURIComponent(baseUrl), {
+            signal: AbortSignal.timeout(10000),
+          });
+          if (res.status === 429 || res.status === 403) continue;
+          if (!res.ok) continue;
+          const text = await res.text();
+          const titleMatches = [...text.matchAll(/<title[^>]*>([\s\S]*?)<\/title>/gi)];
+          if (titleMatches.length < 3) continue;
+          const posts = titleMatches.slice(1).map(m => ({
+            title: m[1].replace(/<!\[CDATA\[|\]\]>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").trim(),
+            ups: 10, upvote_ratio: 0.7, selftext: "",
+          }));
+          if (posts.length > 0) return this._parseRedditPosts(posts);
+        } catch { continue; }
+      }
     }
     return null;
   },
@@ -3435,11 +3423,8 @@ export default function NexusV7() {
       const savedSess = DB.get("currentSession", "");
       if (savedSess !== sess.primary.name) {
         DB.set("currentSession", sess.primary.name);
-        setSessionPnl(0);
-        setSessionTradeCount(0);
-        setSessionProfit(0);
-        setSessionStart(saved.balance || INITIAL_BALANCE);
-        addLog("AI", `New session: ${sess.primary.emoji} ${sess.primary.name} - AI continues 24/7`);
+        // DON'T reset session stats — persist across refreshes and session changes
+        addLog("AI", `Session: ${sess.primary.emoji} ${sess.primary.name} - AI continues 24/7 (stats preserved)`);
       }
       setCurrentSession(sess.primary.name);
 
@@ -3537,7 +3522,7 @@ export default function NexusV7() {
         setRedditData(rd);
       } catch {}
     };
-    fn(); const i = setInterval(fn, 900000); return () => clearInterval(i); // 15min — 30min cache TTL means actual API hits are sparse
+    fn(); const i = setInterval(fn, 600000); return () => clearInterval(i); // 10min — Reddit rate-limits aggressively
   }, []);
 
   // ═══ FETCH MACRO DATA — S&P, DXY, Gold (every 10 min) ═══
@@ -3938,8 +3923,7 @@ export default function NexusV7() {
           console.log(`[NEXUS] 📊 POS: ${p.side} ${p.pairName} | Entry:$${p.entry.toFixed(2)} Now:$${price.toFixed(2)} | PnL:${pnlPct.toFixed(2)}% ($${pnl.toFixed(2)}) | Hold:${holdMins.toFixed(0)}min | SL:$${(p.sl||0).toFixed(2)} TP:$${(p.tp||0).toFixed(2)}`);
 
           // ═══ MTF-AWARE TRAILING STOPS ═══
-          const mtfStrong = mtfCombined?.strength >= MIN_MTF_CONFIRM_STRENGTH; // Weak MTF doesn't count
-          const mtfConfirms = mtfStrong && mtfCombined?.valid && (
+          const mtfConfirms = mtfCombined?.valid && (
             (p.side === "LONG" && mtfCombined.trend === "bullish") ||
             (p.side === "SHORT" && mtfCombined.trend === "bearish")
           );
@@ -3999,16 +3983,6 @@ export default function NexusV7() {
             addLog("AI", `STALE WIN EXIT: ${p.side} ${p.pairName} +${pnlPct.toFixed(2)}% after ${Math.round(holdMins)}min — tiny profit, freeing capital`);
             console.log(`[NEXUS] 💤 STALE WINNER EXIT: ${p.side} ${p.pairName} +${pnlPct.toFixed(2)}% held ${Math.round(holdMins)}min`);
             closeTrade(p, price, "Stale Winner Exit");
-            changed = true;
-            return false;
-          }
-
-          // ═══ NEW: STALE LOSER EXIT — Cut hopeless positions even if weak MTF "confirms" ═══
-          // If held >6hrs and losing, no amount of weak MTF can justify holding
-          if (holdMins > STALE_LOSER_MINS && pnlPct < 0) {
-            addLog("AI", `STALE LOSER EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(2)}% after ${Math.round(holdMins)}min — cutting dead weight`);
-            console.log(`[NEXUS] 💀 STALE LOSER EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(2)}% held ${Math.round(holdMins)}min (MTF str:${mtfCombined?.strength||0}%)`);
-            closeTrade(p, price, "Stale Loser Exit");
             changed = true;
             return false;
           }
