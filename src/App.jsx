@@ -3255,7 +3255,7 @@ export default function NexusV7() {
 
   const [aiResult, setAiResult] = useState(null);
   const [aiActive, setAiActive] = useState(false);
-  const [riskPct, setRiskPct] = useState(2);
+  const [riskPct, setRiskPct] = useState(8);
   const [peakBalance, setPeakBalance] = useState(100);
   const [drawdownState, setDrawdownState] = useState(() => DrawdownManager.calculate(100, 100));
   const [journalReports, setJournalReports] = useState([]);
@@ -3855,20 +3855,20 @@ export default function NexusV7() {
       let effectiveRisk = ddResult.adjustedRisk || riskPct;
 
       // ═══ WIN STREAK MOMENTUM ═══
-      // After 3+ consecutive wins, boost position size by 25% (max 50% boost at 5+)
-      if (consecutiveWins >= 3) {
-        const streakBoost = Math.min(0.5, (consecutiveWins - 2) * 0.125); // 12.5% per extra win
+      // After 2+ consecutive wins, boost position size (max 75% boost at 5+)
+      if (consecutiveWins >= 2) {
+        const streakBoost = Math.min(0.75, (consecutiveWins - 1) * 0.2); // 20% per extra win
         effectiveRisk *= (1 + streakBoost);
-        addLog("AI", `Win streak ${consecutiveWins} — size boost +${(streakBoost * 100).toFixed(0)}%`);
+        addLog("AI", `Win streak ${consecutiveWins} \u2014 size boost +${(streakBoost * 100).toFixed(0)}%`);
       }
 
-      const amount = Math.max(1, balance * effectiveRisk / 100);
+      const amount = Math.max(10, balance * effectiveRisk / 100);
       // ═══ STACK SIZE DECAY — reduce size for 2nd/3rd stacked positions ═══
       const stackLevel = positions.filter(p => p.pair === pair.sym).length; // 0, 1, or 2
       const stackMultiplier = STACK_SIZE_DECAY[Math.min(stackLevel, STACK_SIZE_DECAY.length - 1)];
-      const stackedAmount = Math.max(1, amount * stackMultiplier);
+      const stackedAmount = Math.max(5, amount * stackMultiplier);
       if (stackLevel > 0) addLog("AI", `Stack level ${stackLevel + 1}: size ${(stackMultiplier * 100).toFixed(0)}% \u2014 $${stackedAmount.toFixed(2)}`);
-      if (stackedAmount < 1) return;
+      if (stackedAmount < 5) return;
 
       console.log(`[NEXUS] ✅ ALL GATES PASSED — EXECUTING: ${aiResult.action} ${pair.name} | Conf:${tradeConf.toFixed(0)}% | Amount:$${stackedAmount.toFixed(2)} | Stack:${stackLevel+1}/${MAX_POSITIONS} | SL:${aiResult.sl||'none'} TP:${aiResult.tp||'none'}`);
 
@@ -4313,7 +4313,7 @@ export default function NexusV7() {
               {aiActive ? "⏸ STOP AI" : "▶ START AI (AUTO-TRADE)"}
             </button>
             <div style={{ fontSize: 9, color: K.txM }}>Risk:</div>
-            <input type="range" min="0.5" max="5" step="0.5" value={riskPct} onChange={e => setRiskPct(+e.target.value)}/>
+            <input type="range" min="2" max="25" step="1" value={riskPct} onChange={e => setRiskPct(+e.target.value)}/>
             <span style={{ fontSize: 10, color: K.gold, fontWeight: 700 }}>{riskPct}%</span>
           </div>
           {aiResult.sl > 0 && <div style={{ display: "flex", gap: 12, marginTop: 12, flexWrap: "wrap" }}>
