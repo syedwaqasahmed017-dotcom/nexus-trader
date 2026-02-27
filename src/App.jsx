@@ -34,14 +34,15 @@ const MIN_BALANCE = 5;
 const MAX_POSITIONS = 5;
 const MIN_STACK_DISTANCE_PCT = 0.25; // Min 0.25% price distance between stacked entries on same pair
 const STACK_SIZE_DECAY = [1, 0.8, 0.6, 0.45, 0.3]; // Position size multiplier: 1st=100%, 2nd=80%, 3rd=60%, 4th=45%, 5th=30%
-const COOL_AFTER_LOSS = 60000;
+const COOL_AFTER_LOSS_BASE = 120000;  // 2min base cooldown (was 60s)
+const COOL_AFTER_LOSS_MAX = 600000;   // 10min max cooldown for big losses
 const MAX_TRADES_PER_SESSION = 20;
-const MIN_CONF_TO_TRADE = 40;
+const MIN_CONF_TO_TRADE = 55;
 // ═══ PRICE SANITY — Prevent fake PnL from stale/fallback prices ═══
 const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real (BTC rarely moves more in one candle)
 const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real (anything above is data error)
-const STALE_WINNER_MINS = 180;     // Close stale winners after 3 hours
-const STALE_WINNER_MIN_PCT = 0.5;  // Minimum profit% to keep holding past stale timer
+const STALE_WINNER_MINS = 240;     // Close stale winners after 4 hours
+const STALE_WINNER_MIN_PCT = 1.2;  // Minimum profit% to keep holding past stale timer (must clear 0.4% fees + margin)
 const SESSION_PROFIT_TARGET = 0.8;
 const SESSION_MAX_LOSS = 1.5;
 const INITIAL_BALANCE = 100;
@@ -2041,6 +2042,11 @@ const FakeDetector = {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // BRAIN v7 — SELF-LEARNING ENGINE (PERSISTENT ACROSS REFRESH)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ═══════════════════════════════════════════════════════════════════════
+// BRAIN v7.5 — AGGRESSIVE LEARNING UPGRADE
+// Fixes: fingerprint too specific, exit-reason blindness, regime learning,
+// severity-weighted cooldown, MTF-aware blocking, cumulative $ tracking
+// ═══════════════════════════════════════════════════════════════════════
 const Brain = {
   losses: [], wins: [], coolUntil: 0, sessionTrades: {},
   load() {
@@ -2063,10 +2069,10 @@ const Brain = {
   },
   _pruneOldSessions() {
     try {
-      const MAX_AGE = 30 * 24 * 3600000; // 30 days
+      const MAX_AGE = 30 * 24 * 3600000;
       const now = Date.now();
       const keys = Object.keys(this.sessionTrades);
-      if (keys.length <= 720) return; // ~30 days of hourly keys, no need to prune yet
+      if (keys.length <= 720) return;
       for (const key of keys) {
         const dateStr = key.split("_").slice(1).join("_");
         const ts = new Date(dateStr + ":00:00Z").getTime();
@@ -2074,6 +2080,7 @@ const Brain = {
       }
     } catch {}
   },
+  // ═══ v7.5 FINGERPRINT: 13-dim exact (unchanged for backward compat) ═══
   fingerprint(indicators, action, symbol) {
     try {
       const i = indicators || {};
@@ -2094,11 +2101,64 @@ const Brain = {
       ].join("|");
     } catch { return "unknown"; }
   },
+  // ═══ v7.5 BROAD FINGERPRINT: 6-dim (action + core market state) ═══
+  broadFingerprint(indicators, action, symbol) {
+    try {
+      const i = indicators || {};
+      return [
+        action,
+        "rsi" + (Math.round((i.rsi || 50) / 10) * 10),
+        "vol" + (i.volRatio > 2 ? "H" : i.volRatio > 0.8 ? "N" : "L"),
+        "trend" + (i.trendStr > 1 ? "U" : i.trendStr < -1 ? "D" : "F"),
+        "regime" + (i.regime || "n"),
+        "bias" + (i.marketBias || "n"),
+      ].join("|");
+    } catch { return "unknown"; }
+  },
+  // ═══ v7.5 NEW: MEDIUM FINGERPRINT — 8-dim for better matching overlap ═══
+  // Bridges the gap between 13-dim exact (too specific) and 6-dim broad (too general)
+  mediumFingerprint(indicators, action, symbol) {
+    try {
+      const i = indicators || {};
+      return [
+        action, symbol,
+        "rsi" + (Math.round((i.rsi || 50) / 10) * 10),
+        "trend" + (i.trendStr > 1 ? "U" : i.trendStr < -1 ? "D" : "F"),
+        "vol" + (i.volRatio > 1.5 ? "H" : i.volRatio > 0.8 ? "N" : "L"),
+        "regime" + (i.regime || "n"),
+        "macd" + (i.macdDir || "n"),
+        "bias" + (i.marketBias || "n"),
+      ].join("|");
+    } catch { return "unknown"; }
+  },
+  // ═══ v7.5 NEW: REGIME KEY — Learns "SHORT in uptrend = bad" as general rule ═══
+  regimeKey(indicators, action) {
+    try {
+      const i = indicators || {};
+      const trend = i.trendStr > 1 ? "U" : i.trendStr < -1 ? "D" : "F";
+      const regime = i.regime || "n";
+      return `${action}|${trend}|${regime}`;
+    } catch { return "unknown"; }
+  },
   recordLoss(entry) {
     try {
       const fp = this.fingerprint(entry.indicators, entry.action, entry.symbol);
-      this.losses.push({ fp, loss: entry.loss, ts: Date.now(), pair: entry.symbol, action: entry.action, session: Sessions.getCurrent().primary.name, liveVerified: true });
-      this.coolUntil = Date.now() + COOL_AFTER_LOSS;
+      const bfp = this.broadFingerprint(entry.indicators, entry.action, entry.symbol);
+      const mfp = this.mediumFingerprint(entry.indicators, entry.action, entry.symbol);
+      const rk = this.regimeKey(entry.indicators, entry.action);
+      const lossDollar = entry.loss || 0;
+      this.losses.push({
+        fp, bfp, mfp, rk, loss: lossDollar, ts: Date.now(), pair: entry.symbol,
+        action: entry.action, session: Sessions.getCurrent().primary.name,
+        liveVerified: true, exitReason: entry.exitReason || "unknown",
+        holdMins: entry.holdMins || 0
+      });
+      // ═══ v7.5: SEVERITY-SCALED COOLDOWN — Big losses = longer pause ═══
+      const lossPct = entry.indicators?.lastPnlPct || 0;
+      const severityMult = lossDollar > 0.20 ? 3.0 : lossDollar > 0.10 ? 2.0 : lossDollar > 0.05 ? 1.5 : 1.0;
+      const coolMs = Math.min(COOL_AFTER_LOSS_MAX, COOL_AFTER_LOSS_BASE * severityMult);
+      this.coolUntil = Date.now() + coolMs;
+      console.log(`[BRAIN] 🧊 Cooldown ${(coolMs/1000).toFixed(0)}s (loss $${lossDollar.toFixed(3)}, severity ${severityMult}x) | Exit: ${entry.exitReason}`);
       this.trackSession("loss");
       this.save();
     } catch {}
@@ -2106,7 +2166,15 @@ const Brain = {
   recordWin(entry) {
     try {
       const fp = this.fingerprint(entry.indicators, entry.action, entry.symbol);
-      this.wins.push({ fp, profit: entry.profit, ts: Date.now(), pair: entry.symbol, action: entry.action, session: Sessions.getCurrent().primary.name, liveVerified: true });
+      const bfp = this.broadFingerprint(entry.indicators, entry.action, entry.symbol);
+      const mfp = this.mediumFingerprint(entry.indicators, entry.action, entry.symbol);
+      const rk = this.regimeKey(entry.indicators, entry.action);
+      this.wins.push({
+        fp, bfp, mfp, rk, profit: entry.profit, ts: Date.now(), pair: entry.symbol,
+        action: entry.action, session: Sessions.getCurrent().primary.name,
+        liveVerified: true, exitReason: entry.exitReason || "unknown",
+        holdMins: entry.holdMins || 0
+      });
       this.trackSession("win");
       this.save();
     } catch {}
@@ -2120,50 +2188,206 @@ const Brain = {
       result === "win" ? this.sessionTrades[key].wins++ : this.sessionTrades[key].losses++;
     } catch {}
   },
+  // ═══ v7.5 SHOULDBLOCK — MULTI-LAYER BLOCKING with 7 independent checks ═══
   shouldBlock(indicators, action, symbol) {
     try {
       const fp = this.fingerprint(indicators, action, symbol);
+      const bfp = this.broadFingerprint(indicators, action, symbol);
+      const mfp = this.mediumFingerprint(indicators, action, symbol);
+      const rk = this.regimeKey(indicators, action);
       const WEEK = 7 * 864e5;
+      const TWO_WEEKS = 14 * 864e5;
       const HOUR = 36e5;
-      if (Date.now() < this.coolUntil) return { blocked: true, reason: `Cooling down (${Math.ceil((this.coolUntil - Date.now()) / 1000)}s)`, severity: "COOL" };
-      const exactLosses = this.losses.filter(e => e.fp === fp && Date.now() - e.ts < WEEK);
-      if (exactLosses.length >= 2) return { blocked: true, reason: `Exact pattern lost ${exactLosses.length}x this week`, severity: "HIGH" };
-      const parts = fp.split("|");
-      const simKey = parts.slice(0, 4).join("|");
-      const similar = this.losses.filter(e => e.fp.startsWith(simKey) && Date.now() - e.ts < WEEK);
-      if (similar.length >= 3) return { blocked: true, reason: `Similar setup lost ${similar.length}x`, severity: "HIGH" };
-      const pairLosses = this.losses.filter(e => e.pair === symbol && Date.now() - e.ts < HOUR);
-      if (pairLosses.length >= 3) return { blocked: true, reason: `3+ losses on ${symbol} in 1h`, severity: "MED" };
-      const allRecent = this.losses.filter(e => Date.now() - e.ts < HOUR * 2);
-      if (allRecent.length >= 5) return { blocked: true, reason: `${allRecent.length} losses in 2h - emergency brake`, severity: "CRIT" };
+      const now = Date.now();
+
+      // CHECK 1: Cooldown timer (severity-scaled in recordLoss)
+      if (now < this.coolUntil) return { blocked: true, reason: `Cooling down (${Math.ceil((this.coolUntil - now) / 1000)}s)`, severity: "COOL" };
+
+      // CHECK 2: Exact fingerprint — 2 losses in 2 weeks (was 1 week)
+      const exactLosses = this.losses.filter(e => e.fp === fp && now - e.ts < TWO_WEEKS);
+      if (exactLosses.length >= 2) return { blocked: true, reason: `Exact pattern lost ${exactLosses.length}x recently`, severity: "HIGH" };
+
+      // CHECK 3: Medium fingerprint — 2 losses in 1 week (NEW - bridges exact/broad gap)
+      const medLosses = this.losses.filter(e => e.mfp === mfp && now - e.ts < WEEK);
+      const medWins = this.wins.filter(e => e.mfp === mfp && now - e.ts < WEEK);
+      if (medLosses.length >= 2 && medWins.length < medLosses.length * 0.5) {
+        return { blocked: true, reason: `Medium pattern ${medWins.length}W/${medLosses.length}L this week`, severity: "HIGH" };
+      }
+
+      // CHECK 4: Broad pattern — 3 losses with <40% WR (lowered from 4)
+      const broadLosses = this.losses.filter(e => e.bfp === bfp && now - e.ts < WEEK);
+      const broadWins = this.wins.filter(e => e.bfp === bfp && now - e.ts < WEEK);
+      if (broadLosses.length >= 3 && broadWins.length < broadLosses.length * 0.4) {
+        return { blocked: true, reason: `Broad pattern ${broadWins.length}W/${broadLosses.length}L this week`, severity: "MED" };
+      }
+
+      // CHECK 5: ═══ NEW — REGIME LEARNING: "SHORT in uptrend" blocked if consistently losing ═══
+      const regimeLosses = this.losses.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
+      const regimeWins = this.wins.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
+      const regimeTotal = regimeLosses.length + regimeWins.length;
+      if (regimeTotal >= 3 && regimeLosses.length > regimeWins.length * 2) {
+        return { blocked: true, reason: `${action} in this regime: ${regimeWins.length}W/${regimeLosses.length}L — learned to avoid`, severity: "HIGH" };
+      }
+
+      // CHECK 6: ═══ NEW — EXIT-REASON LEARNING: Block if this exit type is a consistent loser ═══
+      // Learn from "Time Exit (no MTF support)", "Stop Loss" patterns
+      const exitReasonBlock = this._checkExitReasonPattern(action, symbol);
+      if (exitReasonBlock) return exitReasonBlock;
+
+      // CHECK 7: ═══ NEW — CUMULATIVE $ LOSS TRACKING: Block patterns that drain money ═══
+      const broadDollarLoss = broadLosses.reduce((a, e) => a + (e.loss || 0), 0);
+      const broadDollarWin = broadWins.reduce((a, e) => a + (e.profit || 0), 0);
+      if (broadLosses.length >= 2 && broadDollarLoss > broadDollarWin * 1.5 && broadDollarLoss > 0.15) {
+        return { blocked: true, reason: `Pattern net loss $${(broadDollarLoss - broadDollarWin).toFixed(2)} — money drain`, severity: "MED" };
+      }
+
+      // CHECK 8: Pair losses in 1 hour — 2 (lowered from 3)
+      const pairLosses = this.losses.filter(e => e.pair === symbol && now - e.ts < HOUR);
+      if (pairLosses.length >= 2) return { blocked: true, reason: `${pairLosses.length} losses on ${symbol} in 1h`, severity: "MED" };
+
+      // CHECK 9: Emergency brake — 4 losses in 2h (lowered from 5)
+      const allRecent = this.losses.filter(e => now - e.ts < HOUR * 2);
+      if (allRecent.length >= 4) return { blocked: true, reason: `${allRecent.length} losses in 2h — emergency brake`, severity: "CRIT" };
+
+      // CHECK 10: Session-specific pattern failure
       const sessionName = Sessions.getCurrent().primary.name;
-      const sessionLosses = this.losses.filter(e => e.session === sessionName && e.fp.startsWith(simKey));
-      const sessionWins = this.wins.filter(e => e.session === sessionName && e.fp.startsWith(simKey));
-      if (sessionLosses.length >= 3 && sessionWins.length < sessionLosses.length * 0.3) return { blocked: true, reason: `Pattern fails in ${sessionName} (${sessionWins.length}W/${sessionLosses.length}L)`, severity: "MED" };
+      const simKey = fp.split("|").slice(0, 4).join("|");
+      const sessionLosses = this.losses.filter(e => e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
+      const sessionWins = this.wins.filter(e => e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
+      if (sessionLosses.length >= 2 && sessionWins.length < sessionLosses.length * 0.4) {
+        return { blocked: true, reason: `Pattern fails in ${sessionName} (${sessionWins.length}W/${sessionLosses.length}L)`, severity: "MED" };
+      }
+
       return { blocked: false };
     } catch { return { blocked: false }; }
   },
+  // ═══ v7.5 NEW: EXIT-REASON PATTERN ANALYSIS ═══
+  // Learns from HOW trades fail, not just that they fail
+  _checkExitReasonPattern(action, symbol) {
+    try {
+      const WEEK = 7 * 864e5;
+      const now = Date.now();
+      const recentLosses = this.losses.filter(e => e.action === action && now - e.ts < WEEK);
+      const recentWins = this.wins.filter(e => e.action === action && now - e.ts < WEEK);
+      if (recentLosses.length < 2) return null;
+
+      // Count exit reasons for losses
+      const exitReasons = {};
+      recentLosses.forEach(e => {
+        const reason = e.exitReason || "unknown";
+        if (!exitReasons[reason]) exitReasons[reason] = { losses: 0, totalLoss: 0 };
+        exitReasons[reason].losses++;
+        exitReasons[reason].totalLoss += (e.loss || 0);
+      });
+
+      // If "Time Exit (no MTF support)" is the dominant loss reason, block
+      for (const [reason, data] of Object.entries(exitReasons)) {
+        if (data.losses >= 3 && data.totalLoss > 0.10) {
+          // Check if this exit reason dominates (>50% of losses)
+          if (data.losses / recentLosses.length > 0.4) {
+            return { blocked: true, reason: `"${reason}" caused ${data.losses} losses ($${data.totalLoss.toFixed(2)}) — learned to avoid ${action}s that end this way`, severity: "HIGH" };
+          }
+        }
+      }
+
+      // If stop losses dominate, the AI's entry timing is bad
+      const slCount = (exitReasons["Stop Loss"]?.losses || 0);
+      if (slCount >= 3 && slCount / recentLosses.length > 0.5) {
+        return { blocked: true, reason: `${slCount} stop losses this week for ${action} — entry timing is bad, pausing`, severity: "HIGH" };
+      }
+
+      return null;
+    } catch { return null; }
+  },
+  // ═══ v7.5 ENHANCED WIN RATE — 3-layer with medium fingerprint ═══
   getWinRate(indicators, action, symbol) {
     try {
       const fp = this.fingerprint(indicators, action, symbol);
-      const baseKey = fp.split("|").slice(0, 5).join("|");
-      const lossCount = this.losses.filter(e => e.fp.startsWith(baseKey)).length;
-      const winCount = this.wins.filter(e => e.fp.startsWith(baseKey)).length;
-      const total = winCount + lossCount;
-      if (total === 0) return { rate: 50, total: 0, wins: 0, losses: 0 };
-      return { rate: (winCount / total) * 100, total, wins: winCount, losses: lossCount };
-    } catch { return { rate: 50, total: 0, wins: 0, losses: 0 }; }
+      const bfp = this.broadFingerprint(indicators, action, symbol);
+      const mfp = this.mediumFingerprint(indicators, action, symbol);
+      const MONTH = 30 * 864e5;
+      const now = Date.now();
+
+      // Layer 1: Exact fingerprint
+      const exactKey = fp.split("|").slice(0, 5).join("|");
+      const exactLoss = this.losses.filter(e => e.fp.startsWith(exactKey) && now - e.ts < MONTH).length;
+      const exactWin = this.wins.filter(e => e.fp.startsWith(exactKey) && now - e.ts < MONTH).length;
+      const exactTotal = exactWin + exactLoss;
+
+      // Layer 2: Medium fingerprint (NEW — better overlap than exact)
+      const mLoss = this.losses.filter(e => e.mfp === mfp && now - e.ts < MONTH).length;
+      const mWin = this.wins.filter(e => e.mfp === mfp && now - e.ts < MONTH).length;
+      const medTotal = mWin + mLoss;
+
+      // Layer 3: Broad fingerprint
+      const bLoss = this.losses.filter(e => e.bfp === bfp && now - e.ts < MONTH).length;
+      const bWin = this.wins.filter(e => e.bfp === bfp && now - e.ts < MONTH).length;
+      const broadTotal = bWin + bLoss;
+
+      // Prefer most specific layer that has enough data
+      if (exactTotal >= 3) return { rate: (exactWin / exactTotal) * 100, total: exactTotal, wins: exactWin, losses: exactLoss, layer: "exact" };
+      if (medTotal >= 2) return { rate: (mWin / medTotal) * 100, total: medTotal, wins: mWin, losses: mLoss, layer: "medium" };
+      if (broadTotal >= 2) return { rate: (bWin / broadTotal) * 100, total: broadTotal, wins: bWin, losses: bLoss, layer: "broad" };
+      return { rate: 50, total: 0, wins: 0, losses: 0, layer: "none" };
+    } catch { return { rate: 50, total: 0, wins: 0, losses: 0, layer: "none" }; }
   },
+  // ═══ v7.5 ENHANCED CONFIDENCE MODIFIER — Steeper penalties, faster learning ═══
   getConfidenceModifier(indicators, action, symbol) {
     try {
       const wr = this.getWinRate(indicators, action, symbol);
-      if (wr.total < 3) return 0;
-      if (wr.rate > 70) return +15;
-      if (wr.rate > 60) return +7;
-      if (wr.rate < 30) return -22;
-      if (wr.rate < 40) return -12;
-      return 0;
+      const rk = this.regimeKey(indicators, action);
+      let mod = 0;
+
+      // Win rate based modifier
+      if (wr.total >= 2) {
+        if (wr.rate > 75) mod += 18;
+        else if (wr.rate > 65) mod += 10;
+        else if (wr.rate > 55) mod += 4;
+        else if (wr.rate < 20) mod -= 30;   // Terrible: near-block level
+        else if (wr.rate < 30) mod -= 20;   // Very bad (was -25 at <25)
+        else if (wr.rate < 40) mod -= 12;   // Bad
+        else if (wr.rate < 48) mod -= 6;    // Below average
+      }
+
+      // ═══ v7.5 NEW: Regime penalty — SHORT in uptrend always penalized ═══
+      const TWO_WEEKS = 14 * 864e5;
+      const now = Date.now();
+      const regimeLosses = this.losses.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS).length;
+      const regimeWins = this.wins.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS).length;
+      const regimeTotal = regimeLosses + regimeWins;
+      if (regimeTotal >= 2) {
+        const regimeWR = (regimeWins / regimeTotal) * 100;
+        if (regimeWR < 35) mod -= 10;  // This action in this regime consistently loses
+        else if (regimeWR < 45) mod -= 5;
+      }
+
+      // ═══ v7.5 NEW: Exit-reason penalty — Penalize actions that keep timing out ═══
+      const WEEK = 7 * 864e5;
+      const timeExitLosses = this.losses.filter(e => e.action === action && (e.exitReason || "").includes("Time Exit") && now - e.ts < WEEK).length;
+      if (timeExitLosses >= 2) mod -= (timeExitLosses * 4);  // -8 for 2, -12 for 3, etc.
+
+      const slLosses = this.losses.filter(e => e.action === action && e.exitReason === "Stop Loss" && now - e.ts < WEEK).length;
+      if (slLosses >= 2) mod -= (slLosses * 3);  // Stop losses indicate bad entry timing
+
+      return mod;
     } catch { return 0; }
+  },
+  // ═══ v7.5 NEW: MTF CONFIDENCE — Check if this action needs MTF support ═══
+  // Returns confidence penalty if trades without MTF have been failing
+  getMtfRequirement(action) {
+    try {
+      const WEEK = 7 * 864e5;
+      const now = Date.now();
+      const noMtfLosses = this.losses.filter(e => e.action === action && (e.exitReason || "").includes("no MTF") && now - e.ts < WEEK);
+      const noMtfWins = this.wins.filter(e => e.action === action && (e.exitReason || "").includes("no MTF") && now - e.ts < WEEK);
+      const totalNoMtf = noMtfLosses.length + noMtfWins.length;
+      if (totalNoMtf < 2) return { requireMtf: false, penalty: 0 };
+      const lossRate = noMtfLosses.length / totalNoMtf;
+      if (lossRate > 0.6) {
+        return { requireMtf: true, penalty: Math.round(lossRate * 20), reason: `${noMtfLosses.length}/${totalNoMtf} no-MTF ${action}s lost — MTF confirmation now required` };
+      }
+      return { requireMtf: false, penalty: 0 };
+    } catch { return { requireMtf: false, penalty: 0 }; }
   },
   getSessionPerformance() {
     try {
@@ -2183,17 +2407,25 @@ const Brain = {
   getStats() {
     try {
       const WEEK = 7 * 864e5;
-      const weekLosses = this.losses.filter(e => Date.now() - e.ts < WEEK);
+      const now = Date.now();
+      const weekLosses = this.losses.filter(e => now - e.ts < WEEK);
       const totalLossPrevented = this.losses.reduce((a, e) => a + (e.loss || 0), 0);
       const totalWinValue = this.wins.reduce((a, e) => a + (e.profit || 0), 0);
       const patterns = {};
-      this.losses.forEach(e => { patterns[e.fp] = (patterns[e.fp] || 0) + 1; });
+      this.losses.forEach(e => { patterns[e.bfp || e.fp] = (patterns[e.bfp || e.fp] || 0) + 1; });
       const topBlocked = Object.entries(patterns).sort((a, b) => b[1] - a[1]).slice(0, 10);
-      return { totalLosses: this.losses.length, totalWins: this.wins.length, weekLosses: weekLosses.length, totalLossPrevented, totalWinValue, topBlocked, brainSize: this.losses.length + this.wins.length };
-    } catch { return { totalLosses: 0, totalWins: 0, weekLosses: 0, totalLossPrevented: 0, totalWinValue: 0, topBlocked: [], brainSize: 0 }; }
+      // v7.5: count blocks by exit reason
+      const exitReasonStats = {};
+      weekLosses.forEach(e => { const r = e.exitReason || "unknown"; exitReasonStats[r] = (exitReasonStats[r] || 0) + 1; });
+      return {
+        totalLosses: this.losses.length, totalWins: this.wins.length,
+        weekLosses: weekLosses.length, totalLossPrevented, totalWinValue,
+        topBlocked, brainSize: this.losses.length + this.wins.length,
+        exitReasonStats, // v7.5: shows which exit types are most common
+      };
+    } catch { return { totalLosses: 0, totalWins: 0, weekLosses: 0, totalLossPrevented: 0, totalWinValue: 0, topBlocked: [], brainSize: 0, exitReasonStats: {} }; }
   },
   reset() { this.losses = []; this.wins = []; this.coolUntil = 0; this.sessionTrades = {}; this.save(); },
-  // ═══ PURGE DEMO DATA: One-time cleanup of entries recorded during offline/demo mode ═══
   purgeDemo() {
     try {
       const before = this.wins.length + this.losses.length;
@@ -2231,10 +2463,10 @@ const BacktestEngine = {
         const results = this._simulate(batches[b], symbol);
         for (const r of results) {
           if (r.won) {
-            Brain.wins.push({ fp: r.fp, profit: r.profit, ts: r.ts, pair: symbol, action: r.action, session: r.session, liveVerified: true, source: "backtest" });
+            Brain.wins.push({ fp: r.fp, bfp: r.bfp, mfp: r.mfp, rk: r.rk, profit: r.profit, ts: r.ts, pair: symbol, action: r.action, session: r.session, liveVerified: true, source: "backtest" });
             wins++;
           } else {
-            Brain.losses.push({ fp: r.fp, loss: r.loss, ts: r.ts, pair: symbol, action: r.action, session: r.session, liveVerified: true, source: "backtest" });
+            Brain.losses.push({ fp: r.fp, bfp: r.bfp, mfp: r.mfp, rk: r.rk, loss: r.loss, ts: r.ts, pair: symbol, action: r.action, session: r.session, liveVerified: true, source: "backtest" });
             losses++;
           }
         }
@@ -2459,11 +2691,14 @@ const BacktestEngine = {
       };
 
       const fp = Brain.fingerprint(indicators, action, symbol);
+      const bfp = Brain.broadFingerprint(indicators, action, symbol);
+      const mfp = Brain.mediumFingerprint(indicators, action, symbol);
+      const rk = Brain.regimeKey(indicators, action);
       const session = this._getSession(candles[i].t);
       const pnl = action === "LONG" ? exitPrice - price : price - exitPrice;
 
       results.push({
-        fp, action, won,
+        fp, bfp, mfp, rk, action, won,
         profit: won ? Math.abs(pnl) : 0,
         loss: won ? 0 : Math.abs(pnl),
         ts: candles[i].t,
@@ -3095,9 +3330,9 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     if (atrPct > 3 || volRatio > 3 || regime === "volatile") riskLevel = "HIGH";
     else if (atrPct > 1.5 || volRatio > 2) riskLevel = "MED";
 
-    // ═══ TUNED THRESHOLDS v7.3 — Balance quality vs frequency ═══
-    const confThreshold = riskLevel === "HIGH" ? 38 : riskLevel === "MED" ? 30 : 24;
-    const pctThreshold = riskLevel === "HIGH" ? 64 : riskLevel === "MED" ? 58 : 54;
+    // ═══ TUNED THRESHOLDS v7.4 — Quality over quantity, must clear fee drag ═══
+    const confThreshold = riskLevel === "HIGH" ? 55 : riskLevel === "MED" ? 48 : 42;
+    const pctThreshold = riskLevel === "HIGH" ? 66 : riskLevel === "MED" ? 62 : 58;
 
     let action = "WAIT";
     let sl = 0, tp = 0;
@@ -3111,25 +3346,31 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       // MTF against: shouldn't reach here (blocked by gate), but extra tight
       const mtfDir = mtf ? mtf.trend : "neutral";
       const slMult = riskLevel === "HIGH" ? (mtfDir === "bullish" ? 2.0 : 1.8) : (mtfDir === "bullish" ? 1.5 : 1.2);
-      const tpMult = riskLevel === "HIGH" ? (mtfDir === "bullish" ? 5.0 : 3.8) : (mtfDir === "bullish" ? 4.0 : 3.0);
+      const tpMult = riskLevel === "HIGH" ? (mtfDir === "bullish" ? 5.0 : 3.8) : (mtfDir === "bullish" ? 4.5 : 3.5);
       sl = price - atrVal * slMult;
       tp = price + atrVal * tpMult;
+      // ═══ MIN TP FLOOR v7.4 — TP must be at least 1.0% to clear fees ═══
+      const minTpDist = price * 0.01; // 1.0% minimum
+      if (tp - price < minTpDist) tp = price + minTpDist;
       const blockCheck = Brain.shouldBlock(indicators, "LONG", symbol);
       if (blockCheck.blocked) { action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason); }
       const wr = Brain.getWinRate(indicators, "LONG", symbol);
-      if (wr.total >= 4 && wr.rate < 32) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate,0)}% (${wr.wins}W/${wr.losses}L) - too low`); }
+      if (wr.total >= 3 && wr.rate < 42) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate,0)}% (${wr.wins}W/${wr.losses}L) [${wr.layer}] — too low`); }
       finalConf += Brain.getConfidenceModifier(indicators, "LONG", symbol);
     } else if (bearPct > pctThreshold && rawConf > confThreshold) {
       action = "SHORT";
       const mtfDir = mtf ? mtf.trend : "neutral";
       const slMult = riskLevel === "HIGH" ? (mtfDir === "bearish" ? 2.0 : 1.8) : (mtfDir === "bearish" ? 1.5 : 1.2);
-      const tpMult = riskLevel === "HIGH" ? (mtfDir === "bearish" ? 5.0 : 3.8) : (mtfDir === "bearish" ? 4.0 : 3.0);
+      const tpMult = riskLevel === "HIGH" ? (mtfDir === "bearish" ? 5.0 : 3.8) : (mtfDir === "bearish" ? 4.5 : 3.5);
       sl = price + atrVal * slMult;
       tp = price - atrVal * tpMult;
+      // ═══ MIN TP FLOOR v7.4 — TP must be at least 1.0% to clear fees ═══
+      const minTpDist = price * 0.01;
+      if (price - tp < minTpDist) tp = price - minTpDist;
       const blockCheck = Brain.shouldBlock(indicators, "SHORT", symbol);
       if (blockCheck.blocked) { action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason); }
       const wr = Brain.getWinRate(indicators, "SHORT", symbol);
-      if (wr.total >= 4 && wr.rate < 32) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate,0)}% (${wr.wins}W/${wr.losses}L) - too low`); }
+      if (wr.total >= 3 && wr.rate < 42) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate,0)}% (${wr.wins}W/${wr.losses}L) [${wr.layer}] — too low`); }
       finalConf += Brain.getConfidenceModifier(indicators, "SHORT", symbol);
     }
 
@@ -3155,6 +3396,25 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     }
 
     finalConf = clamp(finalConf, 0, 95);
+    // ═══ FEE CLEARANCE GATE v7.4 — Reject trades where TP can't overcome round-trip costs ═══
+    if (action !== "WAIT" && sl > 0 && tp > 0) {
+      const tpPct = Math.abs(tp - price) / price * 100;
+      const slPct = Math.abs(sl - price) / price * 100;
+      const feeDrag = 0.45; // 0.2% entry + 0.2% exit + ~0.05% slippage
+      const minTpPct = feeDrag * 2.5; // TP must be at least 2.5x fee drag (~1.1%)
+      if (tpPct < minTpPct) {
+        action = "WAIT";
+        reasons.unshift(`TP ${tpPct.toFixed(2)}% < ${minTpPct.toFixed(1)}% min (can't clear fees)`);
+      }
+      // Risk:reward must be at least 1.5:1 after fees
+      const netTP = tpPct - feeDrag;
+      const netSL = slPct + feeDrag;
+      if (netTP > 0 && netSL > 0 && netTP / netSL < 1.5) {
+        action = "WAIT";
+        reasons.unshift(`R:R ${(netTP/netSL).toFixed(1)}:1 after fees < 1.5:1 min`);
+      }
+    }
+
     if (action !== "WAIT" && positions.length >= MAX_POSITIONS) { action = "WAIT"; reasons.unshift(`Max ${MAX_POSITIONS} positions`); }
     // Stack-awareness: note when adding to existing position
     const samePairOpen = positions.filter(p => p.pair === symbol);
@@ -3815,6 +4075,22 @@ export default function NexusV7() {
         tradeConf = Math.max(0, Math.min(95, tradeConf + llmResult.adjustConfidence));
       }
 
+      // ═══ v7.5 BRAIN MTF-LEARNING GATE — If no-MTF trades keep losing, require MTF ═══
+      const mtfReq = Brain.getMtfRequirement(aiResult.action);
+      if (mtfReq.requireMtf) {
+        if (!mtfCombined || !mtfCombined.valid || mtfCombined.trend === "neutral") {
+          addLog("BRAIN", `BLOCKED: ${mtfReq.reason}`);
+          console.log(`[NEXUS] 🧠 BRAIN MTF GATE: ${aiResult.action} blocked — Brain learned no-MTF trades fail`);
+          return;
+        }
+        // Even with MTF data, apply a confidence penalty
+        tradeConf -= mtfReq.penalty;
+        if (tradeConf < MIN_CONF_TO_TRADE) {
+          console.log(`[NEXUS] ⏸ Brain MTF penalty dropped conf: ${tradeConf.toFixed(0)}% < ${MIN_CONF_TO_TRADE}%`);
+          return;
+        }
+      }
+
       // ═══ DYNAMIC SHORT CONFIDENCE — adapts to market bias + MTF (v7.2) ═══
       // Bull market: shorts need extra confidence (crypto upward bias)
       // Bear market: shorts get a BONUS (trend-aligned)
@@ -3854,10 +4130,10 @@ export default function NexusV7() {
       if (balance < MIN_BALANCE) { addLog("WARN", "Balance too low"); return; }
       let effectiveRisk = ddResult.adjustedRisk || riskPct;
 
-      // ═══ WIN STREAK MOMENTUM ═══
-      // After 2+ consecutive wins, boost position size (max 75% boost at 5+)
-      if (consecutiveWins >= 2) {
-        const streakBoost = Math.min(0.75, (consecutiveWins - 1) * 0.2); // 20% per extra win
+      // ═══ WIN STREAK MOMENTUM (v7.5 — capped to prevent bad trade escalation) ═══
+      // After 3+ consecutive wins, boost position size (max 50% boost at 5+)
+      if (consecutiveWins >= 3) {
+        const streakBoost = Math.min(0.50, (consecutiveWins - 2) * 0.15); // 15% per extra win, max 50%
         effectiveRisk *= (1 + streakBoost);
         addLog("AI", `Win streak ${consecutiveWins} \u2014 size boost +${(streakBoost * 100).toFixed(0)}%`);
       }
@@ -4084,13 +4360,15 @@ export default function NexusV7() {
       if (netPnl > 0) {
         setSessionProfit(d => d + netPnl);
         // ═══ DEMO GUARD: Never pollute Brain with offline/demo data ═══
-        if (!isDemo) Brain.recordWin({ symbol: p.pair, action: p.side, indicators: p.indicators, profit: netPnl });
+        const holdMins = p.entryTime ? (Date.now() - new Date(p.entryTime).getTime()) / 60000 : 0;
+        if (!isDemo) Brain.recordWin({ symbol: p.pair, action: p.side, indicators: p.indicators, profit: netPnl, exitReason: reason, holdMins });
         addLog("WIN", `${p.side} ${p.pairName} | ${fMoney(netPnl)} (${fPct(pct)}) | ${reason}${isDemo ? " [DEMO]" : ""}`);
         setConsecutiveWins(prev => prev + 1);
         setConsecutiveLosses(0);
       } else {
         // ═══ DEMO GUARD: Never pollute Brain with offline/demo data ═══
-        if (!isDemo) Brain.recordLoss({ symbol: p.pair, action: p.side, indicators: p.indicators, loss: Math.abs(netPnl) });
+        const holdMins = p.entryTime ? (Date.now() - new Date(p.entryTime).getTime()) / 60000 : 0;
+        if (!isDemo) Brain.recordLoss({ symbol: p.pair, action: p.side, indicators: p.indicators, loss: Math.abs(netPnl), exitReason: reason, holdMins });
         addLog("LOSS", `${p.side} ${p.pairName} | ${fMoney(netPnl)} (${fPct(pct)}) | ${reason}${isDemo ? " [DEMO]" : ""}`);
         setConsecutiveLosses(prev => {
           const newStreak = prev + 1;
@@ -4731,13 +5009,25 @@ export default function NexusV7() {
             {brainStats.topBlocked.slice(0, 5).map(([fp, count], i) => <div key={i} style={{ fontSize: 9, color: K.dn, padding: "3px 0", borderBottom: `1px solid ${K.bd}`, wordBreak: "break-all" }}>{fp.split("|").slice(0, 6).join(" | ")} - <span style={{ fontWeight: 700 }}>{count}x</span></div>)}
           </div>}
           <div style={{ padding: 10, background: K.s2, borderRadius: 8, fontSize: 9, color: K.txM, marginBottom: 12 }}>
-            <div style={{ fontWeight: 700, marginBottom: 4, color: K.purple }}>HOW THE BRAIN WORKS</div>
-            <div>Every trade creates a 12-dimension fingerprint</div>
-            <div>Losing patterns blocked after 2 exact matches in 7 days</div>
+            <div style={{ fontWeight: 700, marginBottom: 4, color: K.purple }}>BRAIN v7.5 — AGGRESSIVE LEARNING</div>
+            <div>3-layer fingerprint: 13-dim exact + 8-dim medium + 6-dim broad</div>
+            <div>Regime learning: learns "SHORT in uptrend = bad" as a rule</div>
+            <div>Exit-reason learning: tracks WHY trades fail, blocks repeat causes</div>
+            <div>MTF-requirement learning: auto-requires MTF if no-MTF trades keep losing</div>
+            <div>Severity-scaled cooldown: big losses = longer pause (2-10min)</div>
+            <div>Cumulative $ tracking: blocks patterns that drain money</div>
             <div>Session-aware: learns which patterns fail per session</div>
-            <div>Confidence boost for proven winners, penalty for losers</div>
-            <div>Brain persists across page refreshes - never forgets</div>
+            <div>Brain persists across page refreshes — never forgets</div>
           </div>
+          {/* Exit Reason Stats v7.5 */}
+          {brainStats.exitReasonStats && Object.keys(brainStats.exitReasonStats).length > 0 && <div style={{ padding: 10, background: K.s2, borderRadius: 8, marginBottom: 12 }}>
+            <div style={{ fontSize: 8, color: K.txM, marginBottom: 4 }}>EXIT REASON ANALYSIS (This Week)</div>
+            {Object.entries(brainStats.exitReasonStats).sort((a,b) => b[1] - a[1]).map(([reason, count], i) => (
+              <div key={i} style={{ fontSize: 9, color: count >= 3 ? K.dn : K.warn, padding: "3px 0", borderBottom: `1px solid ${K.bd}` }}>
+                {reason}: <span style={{ fontWeight: 700 }}>{count}x</span> {count >= 3 ? " ⚠️ BLOCKING" : ""}
+              </div>
+            ))}
+          </div>}
           {/* ML Engine Status */}
           <div style={{ padding: 10, background: "#e040fb" + "08", borderRadius: 8, fontSize: 9, color: K.txM, marginBottom: 12, border: `1px solid ${"#e040fb"}15` }}>
             <div style={{ fontWeight: 700, marginBottom: 4, color: "#e040fb" }}>ML NEURAL NETWORK</div>
