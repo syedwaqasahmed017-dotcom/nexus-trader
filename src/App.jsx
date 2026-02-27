@@ -41,8 +41,8 @@ const MIN_CONF_TO_TRADE = 55;
 // ═══ PRICE SANITY — Prevent fake PnL from stale/fallback prices ═══
 const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real (BTC rarely moves more in one candle)
 const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real (anything above is data error)
-const STALE_WINNER_MINS = 240;     // Close stale winners after 4 hours
-const STALE_WINNER_MIN_PCT = 1.2;  // Minimum profit% to keep holding past stale timer (must clear 0.4% fees + margin)
+const STALE_WINNER_MINS = 480;     // Close stale winners after 8 hours (was 4h — too aggressive)
+const STALE_WINNER_MIN_PCT = 0.8;  // Minimum profit% to keep holding past stale timer (lowered — let winners develop)
 const SESSION_PROFIT_TARGET = 0.8;
 const SESSION_MAX_LOSS = 1.5;
 const INITIAL_BALANCE = 100;
@@ -2361,13 +2361,14 @@ const Brain = {
         else if (regimeWR < 45) mod -= 5;
       }
 
-      // ═══ v7.5 NEW: Exit-reason penalty — Penalize actions that keep timing out ═══
+      // ═══ v7.5 FIX: Exit-reason penalty — Reduced from v7.4 which created death spiral ═══
+      // Old premature time exits (2h) poisoned Brain data, causing excessive penalties
       const WEEK = 7 * 864e5;
       const timeExitLosses = this.losses.filter(e => e.action === action && (e.exitReason || "").includes("Time Exit") && now - e.ts < WEEK).length;
-      if (timeExitLosses >= 2) mod -= (timeExitLosses * 4);  // -8 for 2, -12 for 3, etc.
+      if (timeExitLosses >= 3) mod -= (timeExitLosses * 2);  // -6 for 3, -8 for 4 (was -8 for 2, -12 for 3)
 
       const slLosses = this.losses.filter(e => e.action === action && e.exitReason === "Stop Loss" && now - e.ts < WEEK).length;
-      if (slLosses >= 2) mod -= (slLosses * 3);  // Stop losses indicate bad entry timing
+      if (slLosses >= 3) mod -= (slLosses * 2);  // Reduced — SL hits aren't always bad entries
 
       return mod;
     } catch { return 0; }
@@ -2381,9 +2382,9 @@ const Brain = {
       const noMtfLosses = this.losses.filter(e => e.action === action && (e.exitReason || "").includes("no MTF") && now - e.ts < WEEK);
       const noMtfWins = this.wins.filter(e => e.action === action && (e.exitReason || "").includes("no MTF") && now - e.ts < WEEK);
       const totalNoMtf = noMtfLosses.length + noMtfWins.length;
-      if (totalNoMtf < 2) return { requireMtf: false, penalty: 0 };
+      if (totalNoMtf < 3) return { requireMtf: false, penalty: 0 }; // Need more data (was 2)
       const lossRate = noMtfLosses.length / totalNoMtf;
-      if (lossRate > 0.6) {
+      if (lossRate > 0.75) { // Was 0.6 — require stronger evidence before blocking
         return { requireMtf: true, penalty: Math.round(lossRate * 20), reason: `${noMtfLosses.length}/${totalNoMtf} no-MTF ${action}s lost — MTF confirmation now required` };
       }
       return { requireMtf: false, penalty: 0 };
@@ -4075,16 +4076,23 @@ export default function NexusV7() {
         tradeConf = Math.max(0, Math.min(95, tradeConf + llmResult.adjustConfidence));
       }
 
-      // ═══ v7.5 BRAIN MTF-LEARNING GATE — If no-MTF trades keep losing, require MTF ═══
+      // ═══ v7.5 BRAIN MTF-LEARNING GATE — Loosened: old premature exits poisoned data ═══
       const mtfReq = Brain.getMtfRequirement(aiResult.action);
       if (mtfReq.requireMtf) {
-        if (!mtfCombined || !mtfCombined.valid || mtfCombined.trend === "neutral") {
-          addLog("BRAIN", `BLOCKED: ${mtfReq.reason}`);
-          console.log(`[NEXUS] 🧠 BRAIN MTF GATE: ${aiResult.action} blocked — Brain learned no-MTF trades fail`);
+        // Only block if MTF is ACTIVELY against the trade direction (not neutral/missing)
+        const mtfBlocksEntry = mtfCombined?.valid && (
+          (aiResult.action === "LONG" && mtfCombined.trend === "bearish" && mtfCombined.aligned) ||
+          (aiResult.action === "SHORT" && mtfCombined.trend === "bullish" && mtfCombined.aligned)
+        );
+        if (mtfBlocksEntry) {
+          addLog("BRAIN", `BLOCKED: MTF aligned against ${aiResult.action}`);
+          console.log(`[NEXUS] 🧠 BRAIN MTF GATE: ${aiResult.action} blocked — MTF strongly opposing`);
           return;
         }
-        // Even with MTF data, apply a confidence penalty
-        tradeConf -= mtfReq.penalty;
+        // Apply reduced penalty when MTF is neutral/unknown
+        if (!mtfCombined || !mtfCombined.valid || mtfCombined.trend === "neutral") {
+          tradeConf -= Math.round(mtfReq.penalty * 0.5); // Half penalty for neutral MTF
+        }
         if (tradeConf < MIN_CONF_TO_TRADE) {
           console.log(`[NEXUS] ⏸ Brain MTF penalty dropped conf: ${tradeConf.toFixed(0)}% < ${MIN_CONF_TO_TRADE}%`);
           return;
@@ -4227,7 +4235,8 @@ export default function NexusV7() {
           }
 
           // === MTF EARLY EXIT: Take profit when MTF turns against profitable position ===
-          if (pnlPct > 1.5 && mtfAlignedAgainst) {
+          // v7.5 FIX: Was 1.5% which was barely above fees — now requires meaningful profit
+          if (pnlPct > 2.5 && mtfAlignedAgainst) {
             addLog("MTF", `SMART EXIT: ${p.side} ${p.pairName} +${pnlPct.toFixed(1)}% — MTF aligned against, locking profit`);
             console.log(`[NEXUS] 🎯 MTF SMART EXIT: ${p.side} ${p.pairName} +${pnlPct.toFixed(1)}% at $${price.toFixed(2)}`);
             closeTrade(p, price, "MTF Smart Exit");
@@ -4236,7 +4245,8 @@ export default function NexusV7() {
           }
 
           // === MTF FAST CUT: Cut losers faster when MTF confirms you're wrong ===
-          if (pnlPct < -0.8 && mtfAlignedAgainst && holdMins > 5) {
+          // v7.5 FIX: Was -0.8%/5min which killed trades during normal BTC volatility
+          if (pnlPct < -1.5 && mtfAlignedAgainst && holdMins > 30) {
             addLog("MTF", `FAST CUT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% — MTF aligned against, cutting loss early`);
             console.log(`[NEXUS] ✂️ MTF FAST CUT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% at $${price.toFixed(2)}`);
             closeTrade(p, price, "MTF Fast Cut");
@@ -4245,10 +4255,24 @@ export default function NexusV7() {
           }
 
           // === TIME-BASED EXIT: Stale positions with no MTF support ===
-          if (holdMins > 120 && pnlPct < 0 && !mtfConfirms && mtfCombined?.valid) {
-            addLog("AI", `TIME EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% after ${Math.round(holdMins)}min — no MTF support`);
+          // v7.5 FIX: Was 120min/-0% which killed most trades before they could develop
+          // Now: 360min minimum hold, must be losing >1% AND MTF actively against (not just neutral)
+          const mtfActivelyAgainst = mtfCombined?.valid && (
+            (p.side === "LONG" && mtfCombined.trend === "bearish") ||
+            (p.side === "SHORT" && mtfCombined.trend === "bullish")
+          );
+          if (holdMins > 360 && pnlPct < -1.0 && mtfActivelyAgainst) {
+            addLog("AI", `TIME EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% after ${Math.round(holdMins)}min — MTF against, cutting`);
             console.log(`[NEXUS] ⏰ TIME EXIT (loser): ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% held ${Math.round(holdMins)}min`);
-            closeTrade(p, price, "Time Exit (no MTF support)");
+            closeTrade(p, price, "Time Exit (MTF against)");
+            changed = true;
+            return false;
+          }
+          // Ultra-stale fallback: if held 12+ hours and still red, close regardless of MTF
+          if (holdMins > 720 && pnlPct < -0.5) {
+            addLog("AI", `TIME EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% after ${Math.round(holdMins/60)}h — too stale, cutting`);
+            console.log(`[NEXUS] ⏰ ULTRA-STALE EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% held ${Math.round(holdMins/60)}h`);
+            closeTrade(p, price, "Time Exit (stale)");
             changed = true;
             return false;
           }
