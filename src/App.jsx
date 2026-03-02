@@ -34,15 +34,15 @@ const MIN_BALANCE = 5;
 const MAX_POSITIONS = 5;
 const MIN_STACK_DISTANCE_PCT = 0.25; // Min 0.25% price distance between stacked entries on same pair
 const STACK_SIZE_DECAY = [1, 0.8, 0.6, 0.45, 0.3]; // Position size multiplier: 1st=100%, 2nd=80%, 3rd=60%, 4th=45%, 5th=30%
-const COOL_AFTER_LOSS_BASE = 120000;  // 2min base cooldown (was 60s)
-const COOL_AFTER_LOSS_MAX = 600000;   // 10min max cooldown for big losses
+const COOL_AFTER_LOSS_BASE = 60000;   // 1min base cooldown — reduced to prevent trade drought
+const COOL_AFTER_LOSS_MAX = 300000;   // 5min max cooldown — was 10min, too long
 const MAX_TRADES_PER_SESSION = 20;
-const MIN_CONF_TO_TRADE = 55;
+const MIN_CONF_TO_TRADE = 52; // Lowered from 55 — Brain was blocking too aggressively after losses
 // ═══ PRICE SANITY — Prevent fake PnL from stale/fallback prices ═══
 const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real (BTC rarely moves more in one candle)
 const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real (anything above is data error)
-const STALE_WINNER_MINS = 480;     // Close stale winners after 8 hours (was 4h — too aggressive)
-const STALE_WINNER_MIN_PCT = 0.8;  // Minimum profit% to keep holding past stale timer (lowered — let winners develop)
+const STALE_WINNER_MINS = 960;     // 16 hours — give winners much more time to develop
+const STALE_WINNER_MIN_PCT = 0.3;  // Only exit if profit is truly tiny (<0.3%) — let decent winners ride
 const SESSION_PROFIT_TARGET = 0.8;
 const SESSION_MAX_LOSS = 1.5;
 const INITIAL_BALANCE = 100;
@@ -2269,7 +2269,7 @@ const Brain = {
       const now = Date.now();
       const recentLosses = this.losses.filter(e => e.action === action && now - e.ts < WEEK);
       const recentWins = this.wins.filter(e => e.action === action && now - e.ts < WEEK);
-      if (recentLosses.length < 2) return null;
+      if (recentLosses.length < 5) return null; // Need at least 5 losses before considering a block (was 2)
 
       // Count exit reasons for losses
       const exitReasons = {};
@@ -2282,9 +2282,9 @@ const Brain = {
 
       // If "Time Exit (no MTF support)" is the dominant loss reason, block
       for (const [reason, data] of Object.entries(exitReasons)) {
-        if (data.losses >= 3 && data.totalLoss > 0.10) {
-          // Check if this exit reason dominates (>50% of losses)
-          if (data.losses / recentLosses.length > 0.4) {
+        if (data.losses >= 6 && data.totalLoss > 0.40) {
+          // Check if this exit reason dominates (>65% of losses) — raised from 40%
+          if (data.losses / recentLosses.length > 0.65) {
             return { blocked: true, reason: `"${reason}" caused ${data.losses} losses ($${data.totalLoss.toFixed(2)}) — learned to avoid ${action}s that end this way`, severity: "HIGH" };
           }
         }
@@ -2292,7 +2292,7 @@ const Brain = {
 
       // If stop losses dominate, the AI's entry timing is bad
       const slCount = (exitReasons["Stop Loss"]?.losses || 0);
-      if (slCount >= 3 && slCount / recentLosses.length > 0.5) {
+      if (slCount >= 6 && slCount / recentLosses.length > 0.65) { // Raised from 3/0.5 — less aggressive blocking
         return { blocked: true, reason: `${slCount} stop losses this week for ${action} — entry timing is bad, pausing`, severity: "HIGH" };
       }
 
@@ -3351,7 +3351,7 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       sl = price - atrVal * slMult;
       tp = price + atrVal * tpMult;
       // ═══ MIN TP FLOOR v7.4 — TP must be at least 1.0% to clear fees ═══
-      const minTpDist = price * 0.01; // 1.0% minimum
+      const minTpDist = price * 0.02; // 2.0% minimum — ensures TP clears 0.45% fee+slippage drag with margin
       if (tp - price < minTpDist) tp = price + minTpDist;
       const blockCheck = Brain.shouldBlock(indicators, "LONG", symbol);
       if (blockCheck.blocked) { action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason); }
@@ -3366,7 +3366,7 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       sl = price + atrVal * slMult;
       tp = price - atrVal * tpMult;
       // ═══ MIN TP FLOOR v7.4 — TP must be at least 1.0% to clear fees ═══
-      const minTpDist = price * 0.01;
+      const minTpDist = price * 0.02; // 2.0% minimum — ensures TP clears fee drag (same as LONG fix)
       if (price - tp < minTpDist) tp = price - minTpDist;
       const blockCheck = Brain.shouldBlock(indicators, "SHORT", symbol);
       if (blockCheck.blocked) { action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason); }
@@ -4113,7 +4113,7 @@ export default function NexusV7() {
         } else if (bias === "bull" && biasStr > 40) {
           tradeConf -= 12; // Strong bull: shorts heavily penalized
         } else {
-          tradeConf -= 5; // Neutral: small penalty (was -8)
+          tradeConf -= 2; // Neutral: very small penalty (was -5, caused shorts to fail confidence check)
         }
         // MTF alignment bonus for shorts
         if (mtfCombined?.valid && mtfCombined.trend === "bearish" && mtfCombined.aligned) {
@@ -4261,7 +4261,7 @@ export default function NexusV7() {
             (p.side === "LONG" && mtfCombined.trend === "bearish") ||
             (p.side === "SHORT" && mtfCombined.trend === "bullish")
           );
-          if (holdMins > 360 && pnlPct < -1.0 && mtfActivelyAgainst) {
+          if (holdMins > 600 && pnlPct < -2.0 && mtfActivelyAgainst) { // Extended from 360min/-1% — BTC needs room to breathe
             addLog("AI", `TIME EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% after ${Math.round(holdMins)}min — MTF against, cutting`);
             console.log(`[NEXUS] ⏰ TIME EXIT (loser): ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% held ${Math.round(holdMins)}min`);
             closeTrade(p, price, "Time Exit (MTF against)");
