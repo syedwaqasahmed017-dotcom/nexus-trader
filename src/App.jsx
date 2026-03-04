@@ -37,7 +37,7 @@ const STACK_SIZE_DECAY = [1, 0.8, 0.6, 0.45, 0.3]; // Position size multiplier: 
 const COOL_AFTER_LOSS_BASE = 120000;  // 2min base cooldown (was 60s)
 const COOL_AFTER_LOSS_MAX = 600000;   // 10min max cooldown for big losses
 const MAX_TRADES_PER_SESSION = 20;
-const MIN_CONF_TO_TRADE = 55;
+const MIN_CONF_TO_TRADE = 42;
 // ═══ PRICE SANITY — Prevent fake PnL from stale/fallback prices ═══
 const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real (BTC rarely moves more in one candle)
 const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real (anything above is data error)
@@ -2970,7 +2970,7 @@ const MTFEngine = {
         else if (d.macdSignal === "mildBear") tfBear += 1 * w;
 
         // RSI context
-        if (d.rsi > 70) tfBear += 1 * w; // overbought on this TF
+        if (d.rsi > 78) tfBear += 1 * w; // overbought on this TF
         else if (d.rsi < 30) tfBull += 1 * w; // oversold
 
         bullScore += tfBull;
@@ -3157,9 +3157,9 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     if (curRSI < 18) { bull += 28; reasons.push(`RSI extreme oversold ${fx(curRSI,0)}`); }
     else if (curRSI < 28) { bull += 20; reasons.push(`RSI oversold ${fx(curRSI,0)}`); }
     else if (curRSI < 40 && curRSI > prevRSI) { bull += 8; reasons.push(`RSI recovering ${fx(curRSI,0)}`); }
-    else if (curRSI > 82) { bear += 28; reasons.push(`RSI extreme overbought ${fx(curRSI,0)}`); }
-    else if (curRSI > 72) { bear += 20; reasons.push(`RSI overbought ${fx(curRSI,0)}`); }
-    else if (curRSI > 60 && curRSI < prevRSI) { bear += 8; reasons.push(`RSI weakening ${fx(curRSI,0)}`); }
+    else if (curRSI > 88) { bear += 28; reasons.push(`RSI extreme overbought ${fx(curRSI,0)}`); }
+    else if (curRSI > 80) { bear += 20; reasons.push(`RSI overbought ${fx(curRSI,0)}`); }
+    else if (curRSI > 68 && curRSI < prevRSI) { bear += 8; reasons.push(`RSI weakening ${fx(curRSI,0)}`); }
 
     if (curRSI < 35 && curRSI > prevRSI && closes[L-1] < closes[L-2]) { bull += 16; reasons.push("Bullish RSI divergence"); }
     if (curRSI > 65 && curRSI < prevRSI && closes[L-1] > closes[L-2]) { bear += 16; reasons.push("Bearish RSI divergence"); }
@@ -3332,8 +3332,8 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     else if (atrPct > 1.5 || volRatio > 2) riskLevel = "MED";
 
     // ═══ TUNED THRESHOLDS v7.4 — Quality over quantity, must clear fee drag ═══
-    const confThreshold = riskLevel === "HIGH" ? 55 : riskLevel === "MED" ? 48 : 42;
-    const pctThreshold = riskLevel === "HIGH" ? 66 : riskLevel === "MED" ? 62 : 58;
+    const confThreshold = riskLevel === "HIGH" ? 42 : riskLevel === "MED" ? 36 : 30;
+    const pctThreshold = riskLevel === "HIGH" ? 58 : riskLevel === "MED" ? 55 : 52;
 
     let action = "WAIT";
     let sl = 0, tp = 0;
