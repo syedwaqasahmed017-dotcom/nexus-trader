@@ -704,6 +704,449 @@ const OnChainEngine = {
 };
 
 // ╔══════════════════════════════════════════════════════════════════╗
+// ║  IQ ENGINE 1: FUNDING RATE — Crowd positioning detector         ║
+// ║  Positive funding = longs pay shorts (overcrowded longs)        ║
+// ║  Negative funding = shorts pay longs (overcrowded shorts)       ║
+// ║  Extreme funding = contrarian reversal signal                    ║
+// ║  API: Binance Futures (free, no key, CORS via proxy)            ║
+// ╚══════════════════════════════════════════════════════════════════╝
+const FundingRateEngine = {
+  _cache: null,
+  _cacheTime: 0,
+  _interval: 300000, // 5 min cache (funding updates every 8h but rate changes)
+
+  async fetchFundingRates() {
+    try {
+      if (this._cache && Date.now() - this._cacheTime < this._interval) return this._cache;
+      const symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"];
+      const results = {};
+      const proxies = CORS_PROXIES.filter(Boolean);
+
+      for (const sym of symbols) {
+        const url = `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${sym}&limit=3`;
+        for (const proxy of proxies) {
+          try {
+            const res = await fetch(proxy + encodeURIComponent(url), { signal: AbortSignal.timeout(8000) });
+            if (!res.ok) continue;
+            const data = await res.json();
+            if (!Array.isArray(data) || data.length === 0) continue;
+            const current = parseFloat(data[0].fundingRate);
+            const prev = data.length > 1 ? parseFloat(data[1].fundingRate) : current;
+            results[sym] = {
+              rate: current,
+              prevRate: prev,
+              annualized: current * 3 * 365 * 100, // APR equivalent
+              trend: current > prev ? "rising" : current < prev ? "falling" : "stable",
+              extreme: Math.abs(current) > 0.001, // >0.1% is extreme
+              veryExtreme: Math.abs(current) > 0.003, // >0.3% is very extreme
+              crowded: current > 0.0005 ? "longs" : current < -0.0005 ? "shorts" : "balanced",
+            };
+            break;
+          } catch { continue; }
+        }
+      }
+
+      if (Object.keys(results).length > 0) {
+        this._cache = { rates: results, live: true, timestamp: Date.now() };
+        this._cacheTime = Date.now();
+      }
+      return this._cache || this._fallback();
+    } catch { return this._cache || this._fallback(); }
+  },
+
+  getSignal(symbol) {
+    try {
+      if (!this._cache?.live) return { score: 0, signal: 0, description: "Funding data unavailable", crowded: "unknown" };
+      const r = this._cache.rates[symbol];
+      if (!r) return { score: 0, signal: 0, description: "No funding data for " + symbol, crowded: "unknown" };
+
+      let score = 0;
+      const reasons = [];
+
+      // Contrarian: extreme positive funding = longs overcrowded = SHORT signal
+      if (r.veryExtreme && r.rate > 0) { score -= 15; reasons.push(`Funding EXTREME +${(r.rate*100).toFixed(3)}% — longs overcrowded, reversal risk`); }
+      else if (r.extreme && r.rate > 0) { score -= 8; reasons.push(`Funding high +${(r.rate*100).toFixed(3)}% — longs paying, caution`); }
+      else if (r.rate > 0.0003) { score -= 3; reasons.push(`Funding positive ${(r.rate*100).toFixed(3)}%`); }
+      // Contrarian: extreme negative funding = shorts overcrowded = LONG signal
+      else if (r.veryExtreme && r.rate < 0) { score += 15; reasons.push(`Funding EXTREME ${(r.rate*100).toFixed(3)}% — shorts overcrowded, squeeze likely`); }
+      else if (r.extreme && r.rate < 0) { score += 8; reasons.push(`Funding negative ${(r.rate*100).toFixed(3)}% — shorts paying, bounce likely`); }
+      else if (r.rate < -0.0003) { score += 3; reasons.push(`Funding negative ${(r.rate*100).toFixed(3)}%`); }
+
+      // Trend amplifier
+      if (r.trend === "rising" && r.rate > 0.0005) { score -= 3; reasons.push("Funding rising — more longs piling in"); }
+      if (r.trend === "falling" && r.rate < -0.0005) { score += 3; reasons.push("Funding falling — more shorts piling in"); }
+
+      return { score, signal: clamp(score / 15, -1, 1), reasons, description: reasons.join(" | ") || "Funding neutral", crowded: r.crowded, rate: r.rate, live: true };
+    } catch { return { score: 0, signal: 0, description: "Funding error", crowded: "unknown" }; }
+  },
+
+  _fallback() { return { rates: {}, live: false, timestamp: 0 }; },
+};
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  IQ ENGINE 2: ORDER BOOK DEPTH — Smart Money Wall Detection     ║
+// ║  Detects large buy/sell walls that act as support/resistance     ║
+// ║  Imbalance ratio: if bids >> asks, price likely to rise          ║
+// ║  API: Binance Spot (free, no key)                                ║
+// ╚══════════════════════════════════════════════════════════════════╝
+const OrderBookEngine = {
+  _cache: {},
+  _cacheTime: {},
+  _interval: 30000, // 30s cache (order book changes fast)
+
+  async fetchDepth(symbol) {
+    try {
+      if (this._cache[symbol] && Date.now() - (this._cacheTime[symbol] || 0) < this._interval) return this._cache[symbol];
+      const proxies = CORS_PROXIES.filter(Boolean);
+      const url = `https://api.binance.com/api/v3/depth?symbol=${symbol}&limit=50`;
+
+      for (const proxy of proxies) {
+        try {
+          const res = await fetch(proxy + encodeURIComponent(url), { signal: AbortSignal.timeout(8000) });
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (!data?.bids?.length || !data?.asks?.length) continue;
+
+          // Calculate total bid/ask volume in top 50 levels
+          const bidVol = data.bids.reduce((a, b) => a + parseFloat(b[1]), 0);
+          const askVol = data.asks.reduce((a, b) => a + parseFloat(b[1]), 0);
+          const totalVol = bidVol + askVol;
+          const imbalance = totalVol > 0 ? (bidVol - askVol) / totalVol : 0; // -1 to +1
+
+          // Find large walls (>5x average level size)
+          const avgBid = bidVol / data.bids.length;
+          const avgAsk = askVol / data.asks.length;
+          const bidWalls = data.bids.filter(b => parseFloat(b[1]) > avgBid * 5).map(b => ({ price: parseFloat(b[0]), size: parseFloat(b[1]) }));
+          const askWalls = data.asks.filter(a => parseFloat(a[1]) > avgAsk * 5).map(a => ({ price: parseFloat(a[0]), size: parseFloat(a[1]) }));
+
+          // Spread analysis
+          const bestBid = parseFloat(data.bids[0][0]);
+          const bestAsk = parseFloat(data.asks[0][0]);
+          const spreadPct = ((bestAsk - bestBid) / bestBid) * 100;
+
+          const result = {
+            bidVol, askVol, imbalance, bidWalls, askWalls, spreadPct,
+            bidStrength: bidVol / (askVol || 1),
+            pressure: imbalance > 0.15 ? "BUY" : imbalance < -0.15 ? "SELL" : "BALANCED",
+            live: true, timestamp: Date.now(),
+          };
+          this._cache[symbol] = result;
+          this._cacheTime[symbol] = Date.now();
+          return result;
+        } catch { continue; }
+      }
+      return this._cache[symbol] || this._fallback();
+    } catch { return this._cache[symbol] || this._fallback(); }
+  },
+
+  getSignal(depthData, currentPrice) {
+    try {
+      if (!depthData?.live) return { score: 0, description: "Order book unavailable" };
+      let score = 0;
+      const reasons = [];
+
+      // Imbalance signal
+      if (depthData.imbalance > 0.3) { score += 12; reasons.push(`Buy wall dominant (${(depthData.imbalance*100).toFixed(0)}% imbalance)`); }
+      else if (depthData.imbalance > 0.15) { score += 6; reasons.push(`Bid pressure (${(depthData.imbalance*100).toFixed(0)}%)`); }
+      else if (depthData.imbalance < -0.3) { score -= 12; reasons.push(`Sell wall dominant (${(Math.abs(depthData.imbalance)*100).toFixed(0)}% imbalance)`); }
+      else if (depthData.imbalance < -0.15) { score -= 6; reasons.push(`Ask pressure (${(Math.abs(depthData.imbalance)*100).toFixed(0)}%)`); }
+
+      // Wall proximity — if big buy wall is close below, support is strong
+      if (depthData.bidWalls.length > 0) {
+        const nearestBidWall = depthData.bidWalls[0];
+        const distPct = ((currentPrice - nearestBidWall.price) / currentPrice) * 100;
+        if (distPct < 0.5 && distPct > 0) { score += 8; reasons.push(`Buy wall $${nearestBidWall.price.toFixed(0)} (${distPct.toFixed(2)}% below)`); }
+      }
+      if (depthData.askWalls.length > 0) {
+        const nearestAskWall = depthData.askWalls[0];
+        const distPct = ((nearestAskWall.price - currentPrice) / currentPrice) * 100;
+        if (distPct < 0.5 && distPct > 0) { score -= 8; reasons.push(`Sell wall $${nearestAskWall.price.toFixed(0)} (${distPct.toFixed(2)}% above)`); }
+      }
+
+      // Wide spread = low liquidity = dangerous
+      if (depthData.spreadPct > 0.1) { score -= 4; reasons.push(`Wide spread ${depthData.spreadPct.toFixed(3)}% — low liquidity`); }
+
+      return { score, signal: clamp(score / 15, -1, 1), reasons, description: reasons.join(" | ") || "Order book balanced", pressure: depthData.pressure, live: true };
+    } catch { return { score: 0, description: "Order book error" }; }
+  },
+
+  _fallback() { return { bidVol: 0, askVol: 0, imbalance: 0, bidWalls: [], askWalls: [], spreadPct: 0, bidStrength: 1, pressure: "UNKNOWN", live: false }; },
+};
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  IQ ENGINE 3: LIQUIDATION ZONES — Where forced exits will hit    ║
+// ║  Estimates where leveraged positions will get liquidated          ║
+// ║  Price moving toward a liquidation cluster = magnet effect       ║
+// ║  Based on Open Interest + Funding Rate + Price levels            ║
+// ╚══════════════════════════════════════════════════════════════════╝
+const LiquidationEngine = {
+  _cache: null,
+  _cacheTime: 0,
+
+  async fetchOpenInterest(symbol) {
+    try {
+      if (this._cache && Date.now() - this._cacheTime < 300000) return this._cache;
+      const proxies = CORS_PROXIES.filter(Boolean);
+      const url = `https://fapi.binance.com/fapi/v1/openInterest?symbol=${symbol}`;
+
+      for (const proxy of proxies) {
+        try {
+          const res = await fetch(proxy + encodeURIComponent(url), { signal: AbortSignal.timeout(8000) });
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (!data?.openInterest) continue;
+          const oi = parseFloat(data.openInterest);
+          this._cache = { openInterest: oi, symbol, live: true, timestamp: Date.now() };
+          this._cacheTime = Date.now();
+          return this._cache;
+        } catch { continue; }
+      }
+      return this._cache || { openInterest: 0, live: false };
+    } catch { return this._cache || { openInterest: 0, live: false }; }
+  },
+
+  estimateLiquidationZones(currentPrice, fundingData, oiData) {
+    try {
+      if (!currentPrice) return { zones: [], live: false };
+      // Common leverage levels and their liquidation distances
+      const leverages = [3, 5, 10, 20, 50, 100];
+      const zones = [];
+
+      for (const lev of leverages) {
+        // Liquidation distance ≈ 1/leverage (simplified)
+        const liqDistPct = (1 / lev) * 100 * 0.85; // 85% of theoretical (maintenance margin)
+        const longLiqPrice = currentPrice * (1 - liqDistPct / 100);
+        const shortLiqPrice = currentPrice * (1 + liqDistPct / 100);
+
+        // Weight by popularity (10x and 20x are most common)
+        const weight = lev === 10 ? 3 : lev === 20 ? 3 : lev === 5 ? 2 : lev === 50 ? 2 : 1;
+
+        zones.push({ leverage: lev, longLiq: longLiqPrice, shortLiq: shortLiqPrice, distPct: liqDistPct, weight });
+      }
+
+      // Determine if price is near a liquidation magnet
+      const crowded = fundingData?.crowded || "balanced";
+      let magnetDirection = "none";
+      let magnetStrength = 0;
+
+      // If longs are overcrowded (positive funding), market makers may push price DOWN to liquidate them
+      if (crowded === "longs") {
+        magnetDirection = "down";
+        magnetStrength = Math.min(Math.abs(fundingData?.rate || 0) * 10000, 10);
+      } else if (crowded === "shorts") {
+        magnetDirection = "up";
+        magnetStrength = Math.min(Math.abs(fundingData?.rate || 0) * 10000, 10);
+      }
+
+      return {
+        zones, magnetDirection, magnetStrength, crowded,
+        nearestLongLiq: zones.find(z => z.leverage === 10)?.longLiq || 0,
+        nearestShortLiq: zones.find(z => z.leverage === 10)?.shortLiq || 0,
+        live: true,
+      };
+    } catch { return { zones: [], live: false }; }
+  },
+
+  getSignal(liqData, currentPrice) {
+    try {
+      if (!liqData?.live) return { score: 0, description: "Liquidation data unavailable" };
+      let score = 0;
+      const reasons = [];
+
+      // Liquidation magnet effect
+      if (liqData.magnetDirection === "down" && liqData.magnetStrength > 3) {
+        score -= 8;
+        reasons.push(`Liq magnet DOWN — longs overcrowded, hunt likely (str:${liqData.magnetStrength.toFixed(0)})`);
+      } else if (liqData.magnetDirection === "up" && liqData.magnetStrength > 3) {
+        score += 8;
+        reasons.push(`Liq magnet UP — shorts overcrowded, squeeze likely (str:${liqData.magnetStrength.toFixed(0)})`);
+      }
+
+      // If near a major liquidation zone, volatility is likely
+      const tenXLongDist = currentPrice > 0 ? ((currentPrice - liqData.nearestLongLiq) / currentPrice) * 100 : 100;
+      const tenXShortDist = currentPrice > 0 ? ((liqData.nearestShortLiq - currentPrice) / currentPrice) * 100 : 100;
+
+      if (tenXLongDist < 5) { reasons.push(`10x long liq zone ${tenXLongDist.toFixed(1)}% below — volatility magnet`); }
+      if (tenXShortDist < 5) { reasons.push(`10x short liq zone ${tenXShortDist.toFixed(1)}% above — volatility magnet`); }
+
+      return { score, signal: clamp(score / 15, -1, 1), reasons, description: reasons.join(" | ") || "No liquidation pressure", live: true };
+    } catch { return { score: 0, description: "Liquidation error" }; }
+  },
+};
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  IQ ENGINE 4: CORRELATION ENGINE — Cross-market intelligence     ║
+// ║  BTC Dominance: rising = money flowing to BTC (good for BTC)    ║
+// ║  ETH/BTC ratio: divergence signals rotation                      ║
+// ║  Alt season detector: when alts outperform BTC                   ║
+// ╚══════════════════════════════════════════════════════════════════╝
+const CorrelationEngine = {
+  _cache: null,
+  _cacheTime: 0,
+
+  async fetchCorrelations() {
+    try {
+      if (this._cache?.live && Date.now() - this._cacheTime < 300000) return this._cache;
+      const proxies = CORS_PROXIES.filter(Boolean);
+
+      // Fetch BTC dominance from CoinGecko
+      let btcDominance = null;
+      for (const proxy of proxies) {
+        try {
+          const url = proxy + encodeURIComponent("https://api.coingecko.com/api/v3/global");
+          const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (data?.data?.market_cap_percentage?.btc) {
+            btcDominance = data.data.market_cap_percentage.btc;
+            break;
+          }
+        } catch { continue; }
+      }
+
+      // Fetch ETH/BTC ratio from Binance
+      let ethBtcRatio = null;
+      for (const proxy of proxies) {
+        try {
+          const url = proxy + encodeURIComponent("https://api.binance.com/api/v3/klines?symbol=ETHBTC&interval=1d&limit=7");
+          const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (Array.isArray(data) && data.length >= 2) {
+            const current = parseFloat(data[data.length - 1][4]);
+            const prev = parseFloat(data[data.length - 2][4]);
+            const weekAgo = parseFloat(data[0][4]);
+            ethBtcRatio = {
+              current, prev,
+              dayChange: ((current - prev) / prev) * 100,
+              weekChange: ((current - weekAgo) / weekAgo) * 100,
+              trend: current > prev ? "ETH gaining" : "BTC gaining",
+            };
+            break;
+          }
+        } catch { continue; }
+      }
+
+      const result = {
+        btcDominance: btcDominance || 50,
+        ethBtcRatio,
+        altSeason: btcDominance !== null && btcDominance < 45,
+        btcSeason: btcDominance !== null && btcDominance > 60,
+        live: btcDominance !== null || ethBtcRatio !== null,
+        timestamp: Date.now(),
+      };
+
+      if (result.live) { this._cache = result; this._cacheTime = Date.now(); }
+      return result;
+    } catch { return this._cache || { btcDominance: 50, ethBtcRatio: null, altSeason: false, btcSeason: false, live: false }; }
+  },
+
+  getSignal(corrData, symbol) {
+    try {
+      if (!corrData?.live) return { score: 0, description: "Correlation data unavailable" };
+      let score = 0;
+      const reasons = [];
+      const isBTC = symbol === "BTCUSDT";
+      const isAlt = !isBTC;
+
+      // BTC dominance signal
+      if (corrData.btcSeason) {
+        if (isBTC) { score += 8; reasons.push(`BTC dominance ${corrData.btcDominance.toFixed(1)}% — BTC season`); }
+        else { score -= 6; reasons.push(`BTC dominance ${corrData.btcDominance.toFixed(1)}% — money flowing to BTC, alts weak`); }
+      }
+      if (corrData.altSeason) {
+        if (isAlt) { score += 6; reasons.push(`BTC dom ${corrData.btcDominance.toFixed(1)}% — alt season, alts outperforming`); }
+        else { score -= 3; reasons.push(`BTC dom ${corrData.btcDominance.toFixed(1)}% — money rotating to alts`); }
+      }
+
+      // ETH/BTC divergence
+      if (corrData.ethBtcRatio) {
+        const r = corrData.ethBtcRatio;
+        if (r.weekChange > 5 && isAlt) { score += 5; reasons.push(`ETH/BTC rising ${r.weekChange.toFixed(1)}%w — alts gaining`); }
+        else if (r.weekChange < -5 && isBTC) { score += 4; reasons.push(`ETH/BTC falling ${r.weekChange.toFixed(1)}%w — BTC leading`); }
+      }
+
+      return { score, signal: clamp(score / 12, -1, 1), reasons, description: reasons.join(" | ") || "Correlation neutral", live: true };
+    } catch { return { score: 0, description: "Correlation error" }; }
+  },
+};
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  IQ ENGINE 5: ADAPTIVE TP/SL — Per-setup historical performance  ║
+// ║  Looks at Brain history to find optimal TP/SL for THIS regime    ║
+// ║  Trades in trending markets get wider TP, tighter SL             ║
+// ║  Trades in ranging markets get tighter TP, wider SL              ║
+// ╚══════════════════════════════════════════════════════════════════╝
+const AdaptiveTPSL = {
+  calculate(indicators, action, atrVal, price, brainWins, brainLosses) {
+    try {
+      const regime = indicators?.regime || "unknown";
+      const rk = (action + "|" + (indicators?.trendStr > 0 ? "up" : indicators?.trendStr < -0 ? "dn" : "fl") + "|" + regime);
+
+      // Find historical performance for this regime+action
+      const TWO_WEEKS = 14 * 864e5;
+      const now = Date.now();
+      const regimeWins = (brainWins || []).filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
+      const regimeLosses = (brainLosses || []).filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
+
+      // Default ATR multipliers
+      let slMult = 1.5;
+      let tpMult = 4.0;
+
+      // Adaptive based on regime
+      if (regime === "trending") {
+        tpMult = 5.5;  // Trending: let winners run far
+        slMult = 1.8;  // Wider SL to avoid noise
+      } else if (regime === "volatile") {
+        tpMult = 3.5;  // Take profit faster in chaos
+        slMult = 2.2;  // Wider SL for volatility
+      } else if (regime === "ranging") {
+        tpMult = 3.0;  // Tight TP in range
+        slMult = 1.2;  // Tight SL
+      } else if (regime === "squeeze") {
+        tpMult = 6.0;  // Breakout potential: wide TP
+        slMult = 1.5;  // Moderate SL
+      }
+
+      // Adjust based on win rate history
+      const total = regimeWins.length + regimeLosses.length;
+      if (total >= 5) {
+        const wr = regimeWins.length / total;
+        if (wr > 0.65) {
+          tpMult *= 1.2;  // Winning streak: widen TP for bigger gains
+          slMult *= 0.9;  // Tighten SL — you're picking good entries
+        } else if (wr < 0.35) {
+          tpMult *= 0.8;  // Losing: take profit earlier
+          slMult *= 1.2;  // Wider SL to give more room
+        }
+      }
+
+      // Calculate actual prices
+      let sl, tp;
+      if (action === "LONG") {
+        sl = price - atrVal * slMult;
+        tp = price + atrVal * tpMult;
+      } else {
+        sl = price + atrVal * slMult;
+        tp = price - atrVal * tpMult;
+      }
+
+      // Enforce minimum TP of 2%
+      const minTpDist = price * 0.02;
+      if (action === "LONG" && tp - price < minTpDist) tp = price + minTpDist;
+      if (action === "SHORT" && price - tp < minTpDist) tp = price - minTpDist;
+
+      return { sl, tp, slMult, tpMult, regime, adapted: total >= 5, historyCount: total };
+    } catch {
+      // Fallback to basic ATR
+      const sl = action === "LONG" ? price - atrVal * 1.5 : price + atrVal * 1.5;
+      const tp = action === "LONG" ? price + atrVal * 4.0 : price - atrVal * 4.0;
+      return { sl, tp, slMult: 1.5, tpMult: 4.0, regime: "unknown", adapted: false, historyCount: 0 };
+    }
+  },
+};
+
+// ╔══════════════════════════════════════════════════════════════════╗
 // ║  LLM BRAIN ENGINE v2 — DUAL PROVIDER (Groq + Gemini)          ║
 // ║  Smart change detection — only calls when market shifts        ║
 // ║  Groq primary: 30 RPM / 14,400 RPD (6x more than Gemini)     ║
@@ -769,12 +1212,16 @@ const LLMEngine = {
       const macro = macroData || {};
       const mtf = mtfData && mtfData.combined && mtfData.combined.valid ? mtfData.combined : null;
       const mtfStr = mtf ? `MTF:${mtf.trend} ${mtf.strength}% ${mtf.aligned?"ALIGNED":""} (${(mtfData.combined.details||[]).map(d=>`${d.tf}:${d.dir}`).join(" ")})` : "MTF:loading";
+      const fundSig = FundingRateEngine.getSignal(symbol);
+      const fundStr = fundSig.live ? `Fund:${fundSig.crowded} ${(fundSig.rate*100).toFixed(3)}%` : "Fund:?";
+      const obData = OrderBookEngine._cache[symbol];
+      const obStr = obData?.live ? `Book:${obData.pressure} ${(obData.imbalance*100).toFixed(0)}%` : "Book:?";
       return `BTC trading analyst. JSON only.
 
 ${symbol} $${currentPrice.toFixed(0)} RSI:${ind.rsi?.toFixed(0)||"?"} MACD:${ind.macd?.toFixed(1)||"?"} EMA9v21:${currentPrice>(ind.ema9||0)?"above":"below"} BB:${ind.bbPos?.toFixed(1)||"?"} Vol:${ind.volRatio?.toFixed(1)||"?"}x ${aiResult?.analysis?.regime||"?"}
-Signal:${aiResult?.action||"WAIT"} ${aiResult?.confidence?.toFixed(0)||0}% | F&G:${fg.value||"?"} ${fg.label||""} | Macro:${macro.regime||"?"} | Bias:${ind.marketBias||"neutral"} | ${mtfStr} | Bal:$${balance?.toFixed(0)||100} ${recentWins}W/${recentLosses}L
+Signal:${aiResult?.action||"WAIT"} ${aiResult?.confidence?.toFixed(0)||0}% | F&G:${fg.value||"?"} ${fg.label||""} | Macro:${macro.regime||"?"} | Bias:${ind.marketBias||"neutral"} | ${mtfStr} | ${fundStr} | ${obStr} | Bal:$${balance?.toFixed(0)||100} ${recentWins}W/${recentLosses}L
 ${brainStats?.brainSize > 0 ? `Brain:${brainStats.brainSize} WR:${brainStats.totalWins+brainStats.totalLosses>0?((brainStats.totalWins/(brainStats.totalWins+brainStats.totalLosses))*100).toFixed(0):"0"}%` : ""}
-Fee:0.4% RT. Trade ONLY if move>0.6%. In bear markets, prefer shorts over contrarian longs. When MTF is ALIGNED, trade WITH the higher timeframe trend.
+Fee:0.4% RT. Trade ONLY if move>0.6%. Extreme funding = contrarian signal (overcrowded side gets liquidated). Book imbalance >20% = directional pressure. In bear markets, prefer shorts. When MTF ALIGNED, trade WITH trend.
 
 {"action":"LONG|SHORT|WAIT","confidence":0-100,"reasoning":"1 sentence","risks":"brief","conviction":"HIGH|MEDIUM|LOW","override":false,"adjustConfidence":0}`;
     } catch { return null; }
@@ -1158,10 +1605,10 @@ Respond in this EXACT JSON format:
 // ║  PHASE 6: ML ENGINE — In-Browser Neural Network + CSV Export   ║
 // ╚══════════════════════════════════════════════════════════════════╝
 const MLEngine = {
-  // Network architecture: 20 inputs → 16 hidden → 8 hidden → 1 output
+  // Network architecture: 24 inputs → 16 hidden → 8 hidden → 1 output (v8: +4 IQ features)
   FEATURES: ["rsi","rsi7","macdHist","atrPct","bbWidth","volRatio","trendStr","mom5","mom20",
     "stochRSI","greenStreak","redStreak","sentiment","newsScore","fgIndex","redditScore",
-    "macroScore","onChainScore","obvTrend","regime_enc"],
+    "macroScore","onChainScore","obvTrend","regime_enc","fundingRate","obImbalance","btcDom","liqMagnet"],
   LEARN_RATE: 0.03,
   MIN_SAMPLES: 30,
   RETRAIN_EVERY: 20,
@@ -1195,7 +1642,7 @@ const MLEngine = {
   },
 
   _initWeights() {
-    const nIn = 20, nH1 = 16, nH2 = 8, nOut = 1;
+    const nIn = 24, nH1 = 16, nH2 = 8, nOut = 1;
     const he = (fan_in) => Math.sqrt(2 / fan_in);
     const rw = (rows, cols, scale) => Array.from({ length: rows }, () =>
       Array.from({ length: cols }, () => (Math.random() * 2 - 1) * scale));
@@ -1254,6 +1701,11 @@ const MLEngine = {
       clamp(((extra.onChainScore || 0) + 30) / 60, 0, 1),
       clamp((i.obvTrend === "up" ? 0.8 : i.obvTrend === "down" ? 0.2 : 0.5), 0, 1),
       regimeMap[i.regime] || 0.5,
+      // ═══ IQ v8: New features ═══
+      clamp(((extra.fundingRate || 0) * 10000 + 50) / 100, 0, 1),  // Funding rate normalized
+      clamp(((extra.obImbalance || 0) + 1) / 2, 0, 1),              // Order book imbalance (-1 to +1) → (0 to 1)
+      clamp((extra.btcDom || 50) / 100, 0, 1),                       // BTC dominance
+      clamp(((extra.liqMagnet || 0) + 10) / 20, 0, 1),              // Liquidation magnet strength
     ];
   },
 
@@ -3094,7 +3546,7 @@ const MTFEngine = {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // AI DECISION ENGINE v7 — 26 FACTORS + NEWS + SESSIONS + FAKE + BRAIN + SOCIAL + MACRO + MTF
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, socialFG, socialReddit, macroInfo, onChainInfo, mtfData) {
+function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, socialFG, socialReddit, macroInfo, onChainInfo, mtfData, fundingInfo, orderBookInfo, correlationInfo, liqInfo) {
   const WAIT = (reasons, ind = {}, extra = {}) => ({
     action: "WAIT", confidence: 0, sl: 0, tp: 0, reasons, indicators: ind, bullScore: "50.0", bearScore: "50.0",
     riskLevel: "-", analysis: extra, sentiment: { score: 50, label: "-" }, patterns: [],
@@ -3299,6 +3751,34 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       else { bear += Math.min(10, Math.abs(onChainSignal.score)); reasons.push(`On-chain: ${onChainSignal.reasons?.[0] || "bearish"}`); }
     }
 
+    // ═══ IQ ENGINE: FUNDING RATE — Crowd positioning (contrarian) ═══
+    const fundingSignal = FundingRateEngine.getSignal(symbol);
+    if (fundingSignal.live && Math.abs(fundingSignal.score) > 3) {
+      if (fundingSignal.score > 0) { bull += Math.min(15, fundingSignal.score); reasons.push(`Funding: ${fundingSignal.reasons?.[0] || "short squeeze"}`); }
+      else { bear += Math.min(15, Math.abs(fundingSignal.score)); reasons.push(`Funding: ${fundingSignal.reasons?.[0] || "long liquidation"}`); }
+    }
+
+    // ═══ IQ ENGINE: ORDER BOOK DEPTH — Smart money walls ═══
+    const obSignal = OrderBookEngine.getSignal(orderBookInfo, price);
+    if (obSignal.live && Math.abs(obSignal.score) > 4) {
+      if (obSignal.score > 0) { bull += Math.min(12, obSignal.score); reasons.push(`Book: ${obSignal.reasons?.[0] || "buy pressure"}`); }
+      else { bear += Math.min(12, Math.abs(obSignal.score)); reasons.push(`Book: ${obSignal.reasons?.[0] || "sell pressure"}`); }
+    }
+
+    // ═══ IQ ENGINE: CORRELATION — BTC dominance + cross-pair ═══
+    const corrSignal = CorrelationEngine.getSignal(correlationInfo, symbol);
+    if (corrSignal.live && Math.abs(corrSignal.score) > 2) {
+      if (corrSignal.score > 0) { bull += Math.min(8, corrSignal.score); reasons.push(`Corr: ${corrSignal.reasons?.[0] || "favorable"}`); }
+      else { bear += Math.min(8, Math.abs(corrSignal.score)); reasons.push(`Corr: ${corrSignal.reasons?.[0] || "headwind"}`); }
+    }
+
+    // ═══ IQ ENGINE: LIQUIDATION ZONES — Magnet effect ═══
+    const liqSignal = LiquidationEngine.getSignal(liqInfo, price);
+    if (liqSignal.live && Math.abs(liqSignal.score) > 3) {
+      if (liqSignal.score > 0) { bull += Math.min(8, liqSignal.score); reasons.push(`Liq: ${liqSignal.reasons?.[0] || "short squeeze zone"}`); }
+      else { bear += Math.min(8, Math.abs(liqSignal.score)); reasons.push(`Liq: ${liqSignal.reasons?.[0] || "long liquidation zone"}`); }
+    }
+
     // ═══ MULTI-TIMEFRAME ANALYSIS — The Big Picture (v7.2) ═══
     // Higher timeframes override 1-min noise. When 4h+1h agree, trade WITH them.
     const mtf = mtfData && mtfData.combined && mtfData.combined.valid ? mtfData.combined : null;
@@ -3363,18 +3843,11 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
 
     if (bullPct > pctThreshold && rawConf > confThreshold) {
       action = "LONG";
-      // ═══ TIGHTER SL + MTF-AWARE LEVELS (v7.2) ═══
-      // MTF confirms: moderate SL (trend supports bounce), wider TP (let it run)
-      // MTF neutral: tight SL (no macro support), standard TP
-      // MTF against: shouldn't reach here (blocked by gate), but extra tight
-      const mtfDir = mtf ? mtf.trend : "neutral";
-      const slMult = riskLevel === "HIGH" ? (mtfDir === "bullish" ? 2.0 : 1.8) : (mtfDir === "bullish" ? 1.5 : 1.2);
-      const tpMult = riskLevel === "HIGH" ? (mtfDir === "bullish" ? 5.0 : 3.8) : (mtfDir === "bullish" ? 4.5 : 3.5);
-      sl = price - atrVal * slMult;
-      tp = price + atrVal * tpMult;
-      // ═══ MIN TP FLOOR v8.0 — TP must be at least 2.0% to clear fees with profit ═══
-      const minTpDist = price * 0.02; // 2.0% minimum (was 1.0% — too close to fee drag)
-      if (tp - price < minTpDist) tp = price + minTpDist;
+      // ═══ IQ v8: ADAPTIVE TP/SL — Per-regime historical optimization ═══
+      const adapted = AdaptiveTPSL.calculate(indicators, "LONG", atrVal, price, Brain.wins, Brain.losses);
+      sl = adapted.sl;
+      tp = adapted.tp;
+      if (adapted.adapted) reasons.push(`Adaptive TP/SL: ${adapted.regime} (${adapted.historyCount} trades)`);
       const blockCheck = Brain.shouldBlock(indicators, "LONG", symbol);
       if (blockCheck.blocked) { action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason); }
       const wr = Brain.getWinRate(indicators, "LONG", symbol);
@@ -3382,14 +3855,11 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       finalConf += Brain.getConfidenceModifier(indicators, "LONG", symbol);
     } else if (bearPct > pctThreshold && rawConf > confThreshold) {
       action = "SHORT";
-      const mtfDir = mtf ? mtf.trend : "neutral";
-      const slMult = riskLevel === "HIGH" ? (mtfDir === "bearish" ? 2.0 : 1.8) : (mtfDir === "bearish" ? 1.5 : 1.2);
-      const tpMult = riskLevel === "HIGH" ? (mtfDir === "bearish" ? 5.0 : 3.8) : (mtfDir === "bearish" ? 4.5 : 3.5);
-      sl = price + atrVal * slMult;
-      tp = price - atrVal * tpMult;
-      // ═══ MIN TP FLOOR v8.0 — TP must be at least 2.0% to clear fees with profit ═══
-      const minTpDist = price * 0.02; // 2.0% minimum (was 1.0%)
-      if (price - tp < minTpDist) tp = price - minTpDist;
+      // ═══ IQ v8: ADAPTIVE TP/SL — Per-regime historical optimization ═══
+      const adapted = AdaptiveTPSL.calculate(indicators, "SHORT", atrVal, price, Brain.wins, Brain.losses);
+      sl = adapted.sl;
+      tp = adapted.tp;
+      if (adapted.adapted) reasons.push(`Adaptive TP/SL: ${adapted.regime} (${adapted.historyCount} trades)`);
       const blockCheck = Brain.shouldBlock(indicators, "SHORT", symbol);
       if (blockCheck.blocked) { action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason); }
       const wr = Brain.getWinRate(indicators, "SHORT", symbol);
@@ -3405,7 +3875,7 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     // ML Engine prediction
     let mlPrediction = { probability: 0.5, confidence: 0, available: false };
     if (action !== "WAIT" && MLEngine._trained) {
-      const mlExtra = { fgIndex: fg?.value || 50, redditScore: rd?.score || 0, macroScore: macroSignal?.score || 0, onChainScore: onChainSignal?.score || 0 };
+      const mlExtra = { fgIndex: fg?.value || 50, redditScore: rd?.score || 0, macroScore: macroSignal?.score || 0, onChainScore: onChainSignal?.score || 0, fundingRate: fundingSignal?.rate || 0, obImbalance: orderBookInfo?.imbalance || 0, btcDom: correlationInfo?.btcDominance || 50, liqMagnet: liqSignal?.score || 0 };
       mlPrediction = MLEngine.predict(indicators, action, mlExtra);
       if (mlPrediction.available && mlPrediction.confidence > 15) {
         const mlAdj = action === "LONG"
@@ -3606,6 +4076,11 @@ export default function NexusV7() {
   const [redditData, setRedditData] = useState(SocialEngine._fallbackReddit());
   const [macroData, setMacroData] = useState({ sp500: null, dxy: null, gold: null, regime: "NEUTRAL", live: false, timestamp: 0 });
   const [onChainData, setOnChainData] = useState({ whales: OnChainEngine._fallbackWhales(), mempool: OnChainEngine._fallbackMempool(), exchangeFlow: OnChainEngine._fallbackExchangeFlow(), live: false, timestamp: 0 });
+  // ═══ IQ ENGINE STATE ═══
+  const [fundingData, setFundingData] = useState(FundingRateEngine._fallback());
+  const [orderBookData, setOrderBookData] = useState(OrderBookEngine._fallback());
+  const [correlationData, setCorrelationData] = useState({ btcDominance: 50, live: false });
+  const [liqData, setLiqData] = useState({ zones: [], live: false });
 
   // ═══ CLOUD SYNC STATE ═══
   const [cloudUrl, setCloudUrl] = useState("");
@@ -3844,6 +4319,29 @@ export default function NexusV7() {
     fn(); const i = setInterval(fn, 120000); return () => clearInterval(i);
   }, []);
 
+  // ═══ IQ: FUNDING RATE + ORDER BOOK + CORRELATIONS + LIQUIDATIONS (every 2 min) ═══
+  useEffect(() => {
+    if (!isLive) return;
+    const fn = async () => {
+      try {
+        const fr = await FundingRateEngine.fetchFundingRates();
+        setFundingData(fr);
+        const ob = await OrderBookEngine.fetchDepth(pair.sym);
+        setOrderBookData(ob);
+        const corr = await CorrelationEngine.fetchCorrelations();
+        setCorrelationData(corr);
+        const oi = await LiquidationEngine.fetchOpenInterest(pair.sym);
+        const fundingSig = FundingRateEngine.getSignal(pair.sym);
+        const liq = LiquidationEngine.estimateLiquidationZones(price, fundingSig, oi);
+        setLiqData(liq);
+        if (fr.live && fundingSig?.crowded === "longs" && fundingSig.score < -10) addLog("IQ", `FUNDING: Longs overcrowded — reversal risk`);
+        if (fr.live && fundingSig?.crowded === "shorts" && fundingSig.score > 10) addLog("IQ", `FUNDING: Shorts overcrowded — squeeze likely`);
+        if (ob.live && Math.abs(ob.imbalance) > 0.3) addLog("IQ", `BOOK: ${ob.pressure} pressure (${(ob.imbalance*100).toFixed(0)}% imbalance)`);
+      } catch {}
+    };
+    fn(); const i = setInterval(fn, 120000); return () => clearInterval(i);
+  }, [isLive, pair, price]);
+
   // ═══ MULTI-TIMEFRAME ANALYSIS — 5m, 15m, 1h, 4h (every 60s) ═══
   useEffect(() => {
     if (!isLive) return; // Only fetch when live — don't waste API calls in demo
@@ -3941,7 +4439,7 @@ export default function NexusV7() {
   useEffect(() => {
     try { 
       if (candles.length > 60 && price > 0) {
-        const result = aiDecision(candles, price, pair.sym, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, fgData, redditData, macroData, onChainData, mtfData);
+        const result = aiDecision(candles, price, pair.sym, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, fgData, redditData, macroData, onChainData, mtfData, fundingData, orderBookData, correlationData, liqData);
         setAiResult(result);
         if (result && result.action !== "WAIT") {
           console.log(`[NEXUS] 🤖 AI DECISION: ${result.action} ${pair.name} | Conf:${result.confidence}% | SL:${result.sl||'none'} TP:${result.tp||'none'} | Bias:${result.indicators?.marketBias||'?'} ${result.indicators?.marketBiasStrength||0}%`);
