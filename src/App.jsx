@@ -4212,7 +4212,6 @@ export default function NexusV7() {
         stackedAmount = Math.max(5, stackedAmount * (1 + regimeConfig.sizeBonus));
       }
 
-      if (stackedAmount < 5) return; \u2014 $${stackedAmount.toFixed(2)}`);
       if (stackedAmount < 5) return;
 
       console.log(`[NEXUS] ✅ ALL GATES PASSED — EXECUTING: ${aiResult.action} ${pair.name} | Conf:${tradeConf.toFixed(0)}% | Amount:$${stackedAmount.toFixed(2)} | Stack:${stackLevel+1}/${MAX_POSITIONS} | SL:${aiResult.sl||'none'} TP:${aiResult.tp||'none'}`);
