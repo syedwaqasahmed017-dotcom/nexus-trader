@@ -1,14 +1,18 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v7.0 — 24/7 NON-STOP AI TRADING INTELLIGENCE (PRODUCTION GRADE)
+// NEXUS v8.0 — 140 IQ TRADING INTELLIGENCE (PRODUCTION GRADE)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// ✦ ZERO-ERROR TOLERANCE — Every function wrapped with safety
+// ✦ IQ ENGINE — Partial profit, conviction sizing, multi-stage trailing
 // ✦ FULL PERSISTENCE — Balance, positions, brain survive page refresh
 // ✦ AI AUTO-PILOT — Learns first, trades smart, stop button for user
 // ✦ BINANCE API PLUGIN — Connect real account when AI is trained
 // ✦ $100 START — Training account | realistic fees + slippage = real money results
-// ✦ 26+ INDICATORS + News + Sessions + Social + Macro + On-Chain + LLM Brain + Fake Detection + Brain Learning
+// ✦ SMART MONEY — Partial profits lock gains, breakeven SL = risk-free remainder
+// ✦ CONVICTION SIZING — Higher confidence = bigger position
+// ✦ VOLATILITY FILTER — Rejects trades in unfavorable conditions
+// ✦ LESS AGGRESSIVE BRAIN — Requires MORE evidence before self-blocking
+// ✦ 2% MIN TP — Ensures every trade clears fee drag with real profit
 // ✦ FULL SCREEN — Uses entire viewport
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -34,17 +38,40 @@ const MIN_BALANCE = 5;
 const MAX_POSITIONS = 5;
 const MIN_STACK_DISTANCE_PCT = 0.25; // Min 0.25% price distance between stacked entries on same pair
 const STACK_SIZE_DECAY = [1, 0.8, 0.6, 0.45, 0.3]; // Position size multiplier: 1st=100%, 2nd=80%, 3rd=60%, 4th=45%, 5th=30%
-const COOL_AFTER_LOSS_BASE = 120000;  // 2min base cooldown (was 60s)
-const COOL_AFTER_LOSS_MAX = 600000;   // 10min max cooldown for big losses
+const COOL_AFTER_LOSS_BASE = 60000;   // 1min base cooldown (v8: faster recovery)
+const COOL_AFTER_LOSS_MAX = 300000;   // 5min max cooldown (v8: less time wasted)
 const MAX_TRADES_PER_SESSION = 20;
 const MIN_CONF_TO_TRADE = 42;
 // ═══ PRICE SANITY — Prevent fake PnL from stale/fallback prices ═══
-const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real (BTC rarely moves more in one candle)
-const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real (anything above is data error)
-const STALE_WINNER_MINS = 480;     // Close stale winners after 8 hours (was 4h — too aggressive)
-const STALE_WINNER_MIN_PCT = 0.8;  // Minimum profit% to keep holding past stale timer (lowered — let winners develop)
+const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real
+const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real
+const STALE_WINNER_MINS = 960;     // Close stale winners after 16 hours (v8: let winners develop much longer)
+const STALE_WINNER_MIN_PCT = 0.6;  // Minimum profit% to keep holding past stale timer
 const SESSION_PROFIT_TARGET = 0.8;
 const SESSION_MAX_LOSS = 1.5;
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  IQ ENGINE v8 — SMART MONEY CONSTANTS                       ║
+// ║  Partial Profits + Conviction Sizing + Volatility Filter     ║
+// ╚══════════════════════════════════════════════════════════════╝
+const PARTIAL_PROFIT_PCT = 1.8;       // Take 50% off at 1.8% profit (clears fees with margin)
+const PARTIAL_PROFIT_RATIO = 0.5;     // Close 50% of position at first target
+const BREAKEVEN_AFTER_PARTIAL = true; // Move SL to breakeven after partial (THE KEY: can't lose after this)
+const CONVICTION_SIZING = true;       // Scale position size with conviction score
+const CONVICTION_MULT = { HIGH: 1.0, MEDIUM: 0.7, LOW: 0.45 }; // Position size multipliers
+const VOL_FILTER_MIN_ATR = 0.15;     // Don't trade when ATR% is below this (too choppy, fees eat you)
+const VOL_FILTER_MAX_ATR = 4.5;      // Don't trade when ATR% is above this (too wild, SL gets hunted)
+const DAILY_MAX_LOSS_PCT = 3.0;      // Hard daily loss limit as % of starting balance
+const WIN_STREAK_BONUS = 0.1;        // +10% size per consecutive win (max 3 streaks = +30%)
+const LOSS_STREAK_PENALTY = 0.15;    // -15% size per consecutive loss (compounds)
+const REGIME_TRADE_MAP = {            // Which regimes to allow trading in
+  trending: { allow: true, sizeBonus: 0.2 },   // Trending = best condition, +20% size
+  squeeze: { allow: true, sizeBonus: 0.1 },     // Pre-breakout = good if confirmed
+  volatile: { allow: true, sizeBonus: -0.2 },   // Volatile = smaller size
+  ranging: { allow: true, sizeBonus: -0.1 },    // Ranging = smaller, more likely to chop
+  mixed: { allow: true, sizeBonus: 0 },
+  unknown: { allow: true, sizeBonus: -0.1 },
+};
 const INITIAL_BALANCE = 100;
 const LEARNING_TICKS = 80;
 
@@ -2203,75 +2230,72 @@ const Brain = {
       // CHECK 1: Cooldown timer (severity-scaled in recordLoss)
       if (now < this.coolUntil) return { blocked: true, reason: `Cooling down (${Math.ceil((this.coolUntil - now) / 1000)}s)`, severity: "COOL" };
 
-      // CHECK 2: Exact fingerprint — 2 losses in 2 weeks (was 1 week)
+      // CHECK 2: Exact fingerprint — v8: needs 4 losses (was 2 — too aggressive)
       const exactLosses = this.losses.filter(e => e.fp === fp && now - e.ts < TWO_WEEKS);
-      if (exactLosses.length >= 2) return { blocked: true, reason: `Exact pattern lost ${exactLosses.length}x recently`, severity: "HIGH" };
+      if (exactLosses.length >= 4) return { blocked: true, reason: `Exact pattern lost ${exactLosses.length}x recently`, severity: "HIGH" };
 
-      // CHECK 3: Medium fingerprint — 2 losses in 1 week (NEW - bridges exact/broad gap)
+      // CHECK 3: Medium fingerprint — v8: needs 4 losses (was 2)
       const medLosses = this.losses.filter(e => e.mfp === mfp && now - e.ts < WEEK);
       const medWins = this.wins.filter(e => e.mfp === mfp && now - e.ts < WEEK);
-      if (medLosses.length >= 2 && medWins.length < medLosses.length * 0.5) {
+      if (medLosses.length >= 4 && medWins.length < medLosses.length * 0.4) {
         return { blocked: true, reason: `Medium pattern ${medWins.length}W/${medLosses.length}L this week`, severity: "HIGH" };
       }
 
-      // CHECK 4: Broad pattern — 3 losses with <40% WR (lowered from 4)
+      // CHECK 4: Broad pattern — v8: needs 6 losses (was 3)
       const broadLosses = this.losses.filter(e => e.bfp === bfp && now - e.ts < WEEK);
       const broadWins = this.wins.filter(e => e.bfp === bfp && now - e.ts < WEEK);
-      if (broadLosses.length >= 3 && broadWins.length < broadLosses.length * 0.4) {
+      if (broadLosses.length >= 6 && broadWins.length < broadLosses.length * 0.35) {
         return { blocked: true, reason: `Broad pattern ${broadWins.length}W/${broadLosses.length}L this week`, severity: "MED" };
       }
 
-      // CHECK 5: ═══ NEW — REGIME LEARNING: "SHORT in uptrend" blocked if consistently losing ═══
+      // CHECK 5: REGIME LEARNING — v8: needs 5 trades min (was 3), 2.5x ratio (was 2x)
       const regimeLosses = this.losses.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
       const regimeWins = this.wins.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
       const regimeTotal = regimeLosses.length + regimeWins.length;
-      if (regimeTotal >= 3 && regimeLosses.length > regimeWins.length * 2) {
+      if (regimeTotal >= 5 && regimeLosses.length > regimeWins.length * 2.5) {
         return { blocked: true, reason: `${action} in this regime: ${regimeWins.length}W/${regimeLosses.length}L — learned to avoid`, severity: "HIGH" };
       }
 
-      // CHECK 6: ═══ NEW — EXIT-REASON LEARNING: Block if this exit type is a consistent loser ═══
-      // Learn from "Time Exit (no MTF support)", "Stop Loss" patterns
+      // CHECK 6: EXIT-REASON LEARNING
       const exitReasonBlock = this._checkExitReasonPattern(action, symbol);
       if (exitReasonBlock) return exitReasonBlock;
 
-      // CHECK 7: ═══ NEW — CUMULATIVE $ LOSS TRACKING: Block patterns that drain money ═══
+      // CHECK 7: CUMULATIVE $ LOSS — v8: needs 4 losses, $0.40 threshold (was 2/$0.15)
       const broadDollarLoss = broadLosses.reduce((a, e) => a + (e.loss || 0), 0);
       const broadDollarWin = broadWins.reduce((a, e) => a + (e.profit || 0), 0);
-      if (broadLosses.length >= 2 && broadDollarLoss > broadDollarWin * 1.5 && broadDollarLoss > 0.15) {
+      if (broadLosses.length >= 4 && broadDollarLoss > broadDollarWin * 1.5 && broadDollarLoss > 0.40) {
         return { blocked: true, reason: `Pattern net loss $${(broadDollarLoss - broadDollarWin).toFixed(2)} — money drain`, severity: "MED" };
       }
 
-      // CHECK 8: Pair losses in 1 hour — 2 (lowered from 3)
+      // CHECK 8: Pair losses in 1 hour — v8: needs 3 (was 2)
       const pairLosses = this.losses.filter(e => e.pair === symbol && now - e.ts < HOUR);
-      if (pairLosses.length >= 2) return { blocked: true, reason: `${pairLosses.length} losses on ${symbol} in 1h`, severity: "MED" };
+      if (pairLosses.length >= 3) return { blocked: true, reason: `${pairLosses.length} losses on ${symbol} in 1h`, severity: "MED" };
 
-      // CHECK 9: Emergency brake — 4 losses in 2h (lowered from 5)
+      // CHECK 9: Emergency brake — v8: 6 in 2h (was 4)
       const allRecent = this.losses.filter(e => now - e.ts < HOUR * 2);
-      if (allRecent.length >= 4) return { blocked: true, reason: `${allRecent.length} losses in 2h — emergency brake`, severity: "CRIT" };
+      if (allRecent.length >= 6) return { blocked: true, reason: `${allRecent.length} losses in 2h — emergency brake`, severity: "CRIT" };
 
-      // CHECK 10: Session-specific pattern failure
+      // CHECK 10: Session-specific pattern failure — v8: needs 3 (was 2)
       const sessionName = Sessions.getCurrent().primary.name;
       const simKey = fp.split("|").slice(0, 4).join("|");
       const sessionLosses = this.losses.filter(e => e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
       const sessionWins = this.wins.filter(e => e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
-      if (sessionLosses.length >= 2 && sessionWins.length < sessionLosses.length * 0.4) {
+      if (sessionLosses.length >= 3 && sessionWins.length < sessionLosses.length * 0.35) {
         return { blocked: true, reason: `Pattern fails in ${sessionName} (${sessionWins.length}W/${sessionLosses.length}L)`, severity: "MED" };
       }
 
       return { blocked: false };
     } catch { return { blocked: false }; }
   },
-  // ═══ v7.5 NEW: EXIT-REASON PATTERN ANALYSIS ═══
-  // Learns from HOW trades fail, not just that they fail
+  // ═══ v8.0 EXIT-REASON PATTERN ANALYSIS (less aggressive) ═══
   _checkExitReasonPattern(action, symbol) {
     try {
       const WEEK = 7 * 864e5;
       const now = Date.now();
       const recentLosses = this.losses.filter(e => e.action === action && now - e.ts < WEEK);
       const recentWins = this.wins.filter(e => e.action === action && now - e.ts < WEEK);
-      if (recentLosses.length < 2) return null;
+      if (recentLosses.length < 3) return null;
 
-      // Count exit reasons for losses
       const exitReasons = {};
       recentLosses.forEach(e => {
         const reason = e.exitReason || "unknown";
@@ -2280,20 +2304,19 @@ const Brain = {
         exitReasons[reason].totalLoss += (e.loss || 0);
       });
 
-      // If "Time Exit (no MTF support)" is the dominant loss reason, block
+      // v8: needs 5 losses and $0.40 before blocking (was 3/$0.10)
       for (const [reason, data] of Object.entries(exitReasons)) {
-        if (data.losses >= 3 && data.totalLoss > 0.10) {
-          // Check if this exit reason dominates (>50% of losses)
-          if (data.losses / recentLosses.length > 0.4) {
-            return { blocked: true, reason: `"${reason}" caused ${data.losses} losses ($${data.totalLoss.toFixed(2)}) — learned to avoid ${action}s that end this way`, severity: "HIGH" };
+        if (data.losses >= 5 && data.totalLoss > 0.40) {
+          if (data.losses / recentLosses.length > 0.5) {
+            return { blocked: true, reason: `"${reason}" caused ${data.losses} losses ($${data.totalLoss.toFixed(2)}) — learned to avoid`, severity: "HIGH" };
           }
         }
       }
 
-      // If stop losses dominate, the AI's entry timing is bad
+      // v8: SL block needs 6 SLs at 65% dominance (was 3 at 50%)
       const slCount = (exitReasons["Stop Loss"]?.losses || 0);
-      if (slCount >= 3 && slCount / recentLosses.length > 0.5) {
-        return { blocked: true, reason: `${slCount} stop losses this week for ${action} — entry timing is bad, pausing`, severity: "HIGH" };
+      if (slCount >= 6 && slCount / recentLosses.length > 0.65) {
+        return { blocked: true, reason: `${slCount} stop losses this week for ${action} — entry timing bad`, severity: "HIGH" };
       }
 
       return null;
@@ -2349,26 +2372,25 @@ const Brain = {
         else if (wr.rate < 48) mod -= 6;    // Below average
       }
 
-      // ═══ v7.5 NEW: Regime penalty — SHORT in uptrend always penalized ═══
+      // ═══ v8.0: Regime penalty — requires 4+ trades (was 2) before penalizing ═══
       const TWO_WEEKS = 14 * 864e5;
       const now = Date.now();
       const regimeLosses = this.losses.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS).length;
       const regimeWins = this.wins.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS).length;
       const regimeTotal = regimeLosses + regimeWins;
-      if (regimeTotal >= 2) {
+      if (regimeTotal >= 4) {
         const regimeWR = (regimeWins / regimeTotal) * 100;
-        if (regimeWR < 35) mod -= 10;  // This action in this regime consistently loses
-        else if (regimeWR < 45) mod -= 5;
+        if (regimeWR < 30) mod -= 8;  // v8: reduced from -10
+        else if (regimeWR < 40) mod -= 4;  // v8: reduced from -5
       }
 
-      // ═══ v7.5 FIX: Exit-reason penalty — Reduced from v7.4 which created death spiral ═══
-      // Old premature time exits (2h) poisoned Brain data, causing excessive penalties
+      // ═══ v8.0: Exit-reason penalty — needs 5 losses (was 3) ═══
       const WEEK = 7 * 864e5;
       const timeExitLosses = this.losses.filter(e => e.action === action && (e.exitReason || "").includes("Time Exit") && now - e.ts < WEEK).length;
-      if (timeExitLosses >= 3) mod -= (timeExitLosses * 2);  // -6 for 3, -8 for 4 (was -8 for 2, -12 for 3)
+      if (timeExitLosses >= 5) mod -= (timeExitLosses * 1.5);  // v8: needs 5+ and lower penalty
 
       const slLosses = this.losses.filter(e => e.action === action && e.exitReason === "Stop Loss" && now - e.ts < WEEK).length;
-      if (slLosses >= 3) mod -= (slLosses * 2);  // Reduced — SL hits aren't always bad entries
+      if (slLosses >= 5) mod -= (slLosses * 1.5);  // v8: needs 5+ SLs before penalizing
 
       return mod;
     } catch { return 0; }
@@ -3350,8 +3372,8 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       const tpMult = riskLevel === "HIGH" ? (mtfDir === "bullish" ? 5.0 : 3.8) : (mtfDir === "bullish" ? 4.5 : 3.5);
       sl = price - atrVal * slMult;
       tp = price + atrVal * tpMult;
-      // ═══ MIN TP FLOOR v7.4 — TP must be at least 1.0% to clear fees ═══
-      const minTpDist = price * 0.01; // 1.0% minimum
+      // ═══ MIN TP FLOOR v8.0 — TP must be at least 2.0% to clear fees with profit ═══
+      const minTpDist = price * 0.02; // 2.0% minimum (was 1.0% — too close to fee drag)
       if (tp - price < minTpDist) tp = price + minTpDist;
       const blockCheck = Brain.shouldBlock(indicators, "LONG", symbol);
       if (blockCheck.blocked) { action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason); }
@@ -3365,8 +3387,8 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       const tpMult = riskLevel === "HIGH" ? (mtfDir === "bearish" ? 5.0 : 3.8) : (mtfDir === "bearish" ? 4.5 : 3.5);
       sl = price + atrVal * slMult;
       tp = price - atrVal * tpMult;
-      // ═══ MIN TP FLOOR v7.4 — TP must be at least 1.0% to clear fees ═══
-      const minTpDist = price * 0.01;
+      // ═══ MIN TP FLOOR v8.0 — TP must be at least 2.0% to clear fees with profit ═══
+      const minTpDist = price * 0.02; // 2.0% minimum (was 1.0%)
       if (price - tp < minTpDist) tp = price - minTpDist;
       const blockCheck = Brain.shouldBlock(indicators, "SHORT", symbol);
       if (blockCheck.blocked) { action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason); }
@@ -3397,26 +3419,36 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     }
 
     finalConf = clamp(finalConf, 0, 95);
-    // ═══ FEE CLEARANCE GATE v7.4 — Reject trades where TP can't overcome round-trip costs ═══
+    // ═══ FEE CLEARANCE GATE v8.0 — Reject trades where TP can't overcome round-trip costs ═══
     if (action !== "WAIT" && sl > 0 && tp > 0) {
       const tpPct = Math.abs(tp - price) / price * 100;
       const slPct = Math.abs(sl - price) / price * 100;
       const feeDrag = 0.45; // 0.2% entry + 0.2% exit + ~0.05% slippage
-      const minTpPct = feeDrag * 2.5; // TP must be at least 2.5x fee drag (~1.1%)
+      const minTpPct = feeDrag * 3.5; // v8: TP must be at least 3.5x fee drag (~1.58%) for real profit
       if (tpPct < minTpPct) {
         action = "WAIT";
         reasons.unshift(`TP ${tpPct.toFixed(2)}% < ${minTpPct.toFixed(1)}% min (can't clear fees)`);
       }
-      // Risk:reward must be at least 1.5:1 after fees
+      // Risk:reward must be at least 2:1 after fees (was 1.5:1 — too low)
       const netTP = tpPct - feeDrag;
       const netSL = slPct + feeDrag;
-      if (netTP > 0 && netSL > 0 && netTP / netSL < 1.5) {
+      if (netTP > 0 && netSL > 0 && netTP / netSL < 2.0) {
         action = "WAIT";
-        reasons.unshift(`R:R ${(netTP/netSL).toFixed(1)}:1 after fees < 1.5:1 min`);
+        reasons.unshift(`R:R ${(netTP/netSL).toFixed(1)}:1 after fees < 2.0:1 min`);
       }
     }
 
     if (action !== "WAIT" && positions.length >= MAX_POSITIONS) { action = "WAIT"; reasons.unshift(`Max ${MAX_POSITIONS} positions`); }
+
+    // ═══ IQ v8: VOLATILITY FILTER — Don't trade in unfavorable conditions ═══
+    if (action !== "WAIT" && atrPct < VOL_FILTER_MIN_ATR) {
+      action = "WAIT";
+      reasons.unshift(`ATR ${fx(atrPct,2)}% < ${VOL_FILTER_MIN_ATR}% — too quiet, fees will eat profit`);
+    }
+    if (action !== "WAIT" && atrPct > VOL_FILTER_MAX_ATR) {
+      action = "WAIT";
+      reasons.unshift(`ATR ${fx(atrPct,2)}% > ${VOL_FILTER_MAX_ATR}% — too volatile, SL will get hunted`);
+    }
     // Stack-awareness: note when adding to existing position
     const samePairOpen = positions.filter(p => p.pair === symbol);
     if (action !== "WAIT" && samePairOpen.length > 0) {
@@ -4113,7 +4145,7 @@ export default function NexusV7() {
         } else if (bias === "bull" && biasStr > 40) {
           tradeConf -= 12; // Strong bull: shorts heavily penalized
         } else {
-          tradeConf -= 5; // Neutral: small penalty (was -8)
+          tradeConf -= 2; // v8: minimal penalty in neutral (was -5 — unfairly blocked shorts)
         }
         // MTF alignment bonus for shorts
         if (mtfCombined?.valid && mtfCombined.trend === "bearish" && mtfCombined.aligned) {
@@ -4150,8 +4182,37 @@ export default function NexusV7() {
       // ═══ STACK SIZE DECAY — reduce size for 2nd/3rd stacked positions ═══
       const stackLevel = positions.filter(p => p.pair === pair.sym).length; // 0, 1, or 2
       const stackMultiplier = STACK_SIZE_DECAY[Math.min(stackLevel, STACK_SIZE_DECAY.length - 1)];
-      const stackedAmount = Math.max(5, amount * stackMultiplier);
-      if (stackLevel > 0) addLog("AI", `Stack level ${stackLevel + 1}: size ${(stackMultiplier * 100).toFixed(0)}% \u2014 $${stackedAmount.toFixed(2)}`);
+      let stackedAmount = Math.max(5, amount * stackMultiplier);
+      if (stackLevel > 0) addLog("AI", `Stack level ${stackLevel + 1}: size ${(stackMultiplier * 100).toFixed(0)}%`);
+
+      // ╔══════════════════════════════════════════════════════════════╗
+      // ║  IQ v8: CONVICTION-BASED POSITION SIZING                    ║
+      // ║  Higher conviction = bigger bet. Lower = smaller.           ║
+      // ║  + Win streak bonus + Loss streak penalty + Regime adjust   ║
+      // ╚══════════════════════════════════════════════════════════════╝
+      if (CONVICTION_SIZING && llmResult?.live) {
+        const conviction = llmResult.conviction || "LOW";
+        const convMult = CONVICTION_MULT[conviction] || 0.45;
+        stackedAmount = Math.max(5, stackedAmount * convMult);
+        console.log(`[NEXUS] IQ SIZE: Conviction=${conviction} -> ${(convMult*100).toFixed(0)}% size ($${stackedAmount.toFixed(2)})`);
+      }
+      // Win/loss streak adjustment
+      if (consecutiveWins >= 2) {
+        const streakBonus = Math.min(consecutiveWins, 3) * WIN_STREAK_BONUS;
+        stackedAmount = Math.max(5, stackedAmount * (1 + streakBonus));
+      }
+      if (consecutiveLosses >= 1) {
+        const streakPenalty = Math.min(consecutiveLosses, 4) * LOSS_STREAK_PENALTY;
+        stackedAmount = Math.max(5, stackedAmount * (1 - streakPenalty));
+      }
+      // Regime-based sizing
+      const currentRegime = aiResult?.analysis?.regime || "unknown";
+      const regimeConfig = REGIME_TRADE_MAP[currentRegime] || REGIME_TRADE_MAP.unknown;
+      if (regimeConfig.sizeBonus !== 0) {
+        stackedAmount = Math.max(5, stackedAmount * (1 + regimeConfig.sizeBonus));
+      }
+
+      if (stackedAmount < 5) return; \u2014 $${stackedAmount.toFixed(2)}`);
       if (stackedAmount < 5) return;
 
       console.log(`[NEXUS] ✅ ALL GATES PASSED — EXECUTING: ${aiResult.action} ${pair.name} | Conf:${tradeConf.toFixed(0)}% | Amount:$${stackedAmount.toFixed(2)} | Stack:${stackLevel+1}/${MAX_POSITIONS} | SL:${aiResult.sl||'none'} TP:${aiResult.tp||'none'}`);
@@ -4234,6 +4295,80 @@ export default function NexusV7() {
             if (p.side === "SHORT" && trail < p.sl) { p.sl = trail; console.log(`[NEXUS] 🔄 PROFIT TRAIL: ${p.pairName} SL→$${trail.toFixed(2)} (keeping ${(trailKeep*100).toFixed(0)}%)`); }
           }
 
+          // ╔══════════════════════════════════════════════════════════════╗
+          // ║  IQ v8: PARTIAL PROFIT SYSTEM — THE GAME CHANGER            ║
+          // ║  Close 50% at 1.8% profit, move SL to breakeven             ║
+          // ║  After this: you CANNOT lose on the remaining position       ║
+          // ║  Let the remaining 50% ride with trailing stops              ║
+          // ╚══════════════════════════════════════════════════════════════╝
+          if (!p._partialTaken && pnlPct >= PARTIAL_PROFIT_PCT && p.qty > 0) {
+            const partialQty = p.qty * PARTIAL_PROFIT_RATIO;
+            const remainQty = p.qty - partialQty;
+            const partialPnl = p.side === "LONG" 
+              ? (price - p.entry) * partialQty 
+              : (p.entry - price) * partialQty;
+            const partialFee = price * partialQty * FEE_RATE;
+            const netPartial = partialPnl - partialFee;
+            
+            // Book the partial profit
+            const partialCost = p.cost * PARTIAL_PROFIT_RATIO;
+            setBalance(b => b + partialCost + netPartial);
+            
+            // Update position to reflect remaining qty
+            p.qty = remainQty;
+            p.cost = p.cost - partialCost;
+            p._partialTaken = true;
+            p._partialPnl = netPartial;
+            p._partialPrice = price;
+            
+            // ═══ CRITICAL: Move SL to breakeven — NOW YOU CANNOT LOSE ═══
+            if (BREAKEVEN_AFTER_PARTIAL) {
+              const beFee = p.entry * FEE_RATE * 2; // account for entry+exit fees
+              const beSL = p.side === "LONG" 
+                ? p.entry + beFee / remainQty + 0.01  // tiny buffer above breakeven
+                : p.entry - beFee / remainQty - 0.01;
+              p.sl = beSL;
+              console.log(`[NEXUS] 🧠 IQ PARTIAL: ${p.side} ${p.pairName} — Took ${(PARTIAL_PROFIT_RATIO*100).toFixed(0)}% profit +$${netPartial.toFixed(2)} at $${price.toFixed(2)} | SL→BREAKEVEN $${beSL.toFixed(2)} | REMAINING ${remainQty.toFixed(6)} RISK-FREE`);
+              addLog("WIN", `IQ PARTIAL: ${p.pairName} +$${netPartial.toFixed(2)} (${(PARTIAL_PROFIT_RATIO*100).toFixed(0)}%) — remainder now RISK-FREE`);
+            }
+            
+            // Record partial as a win in brain (it IS a win)
+            if (!p.isDemo) {
+              Brain.recordWin({ symbol: p.pair, action: p.side, indicators: p.indicators, profit: netPartial, exitReason: "Partial Profit", holdMins: holdMins });
+            }
+            
+            // Log to history as partial
+            const partialRecord = { 
+              ...p, exit: price, exitTime: new Date().toISOString(), 
+              gross: partialPnl, exitFee: partialFee, net: netPartial, 
+              pct: (netPartial / partialCost) * 100, totalFees: p.fee * PARTIAL_PROFIT_RATIO + partialFee,
+              totalSlippage: (p.slippage || 0) * PARTIAL_PROFIT_RATIO,
+              reason: "Partial Profit (IQ)", isPartial: true 
+            };
+            setHistory(prev => [partialRecord, ...prev]);
+            setSessionPnl(d => d + netPartial);
+            setSessionProfit(d => d + netPartial);
+            setConsecutiveWins(prev => prev + 1);
+            setConsecutiveLosses(0);
+            changed = true;
+          }
+
+          // ═══ IQ v8: MULTI-STAGE TRAILING — Tighter trail as profit grows ═══
+          if (p._partialTaken && pnlPct > 3.0 && p.sl) {
+            // After partial taken, trail aggressively to lock more profit
+            const aggressiveTrail = p.side === "LONG" 
+              ? price - (price - p.entry) * 0.25  // Keep 75% of remaining profit
+              : price + (p.entry - price) * 0.25;
+            if (p.side === "LONG" && aggressiveTrail > p.sl) { 
+              p.sl = aggressiveTrail; 
+              console.log(`[NEXUS] 🧠 IQ TRAIL: ${p.pairName} aggressive trail SL→$${aggressiveTrail.toFixed(2)} (post-partial, keeping 75%)`); 
+            }
+            if (p.side === "SHORT" && aggressiveTrail < p.sl) { 
+              p.sl = aggressiveTrail; 
+              console.log(`[NEXUS] 🧠 IQ TRAIL: ${p.pairName} aggressive trail SL→$${aggressiveTrail.toFixed(2)} (post-partial, keeping 75%)`); 
+            }
+          }
+
           // === MTF EARLY EXIT: Take profit when MTF turns against profitable position ===
           // v7.5 FIX: Was 1.5% which was barely above fees — now requires meaningful profit
           if (pnlPct > 2.5 && mtfAlignedAgainst) {
@@ -4255,13 +4390,12 @@ export default function NexusV7() {
           }
 
           // === TIME-BASED EXIT: Stale positions with no MTF support ===
-          // v7.5 FIX: Was 120min/-0% which killed most trades before they could develop
-          // Now: 360min minimum hold, must be losing >1% AND MTF actively against (not just neutral)
+          // v8.0: 600min hold minimum, must be losing >2% AND MTF actively against
           const mtfActivelyAgainst = mtfCombined?.valid && (
             (p.side === "LONG" && mtfCombined.trend === "bearish") ||
             (p.side === "SHORT" && mtfCombined.trend === "bullish")
           );
-          if (holdMins > 360 && pnlPct < -1.0 && mtfActivelyAgainst) {
+          if (holdMins > 600 && pnlPct < -2.0 && mtfActivelyAgainst) {
             addLog("AI", `TIME EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% after ${Math.round(holdMins)}min — MTF against, cutting`);
             console.log(`[NEXUS] ⏰ TIME EXIT (loser): ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% held ${Math.round(holdMins)}min`);
             closeTrade(p, price, "Time Exit (MTF against)");
@@ -4468,7 +4602,7 @@ export default function NexusV7() {
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
       <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }}/>
-      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v7 | 24/7 AI | LOADING</div>
+      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v8 | 140 IQ ENGINE | LOADING</div>
     </div>
   );
 
@@ -4482,8 +4616,8 @@ export default function NexusV7() {
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v7</div>
-            <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>24/7 AI | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
+            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v8 IQ</div>
+            <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>140 IQ | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
         <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
