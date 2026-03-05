@@ -49,6 +49,95 @@ const STALE_WINNER_MINS = 960;     // Close stale winners after 16 hours (v8: le
 const STALE_WINNER_MIN_PCT = 0.6;  // Minimum profit% to keep holding past stale timer
 const SESSION_PROFIT_TARGET = 0.8;
 const SESSION_MAX_LOSS = 1.5;
+// =============================
+// ADVANCED MARKET INTELLIGENCE
+// =============================
+
+// Detect stop hunts / liquidity grabs
+export function detectLiquidityGrab(candles) {
+  if (!candles || candles.length < 3) return null;
+
+  const last = candles[candles.length - 1];
+  const prev = candles[candles.length - 2];
+
+  const lastHigh = parseFloat(last[2]);
+  const lastLow = parseFloat(last[3]);
+  const prevHigh = parseFloat(prev[2]);
+  const prevLow = parseFloat(prev[3]);
+  const close = parseFloat(last[4]);
+
+  if (lastHigh > prevHigh && close < prevHigh) {
+    return "SHORT"; // stop hunt above highs
+  }
+
+  if (lastLow < prevLow && close > prevLow) {
+    return "LONG"; // stop hunt below lows
+  }
+
+  return null;
+}
+
+
+// Average True Range (volatility measurement)
+export function calculateATR(candles, period = 14) {
+  if (!candles || candles.length < period + 1) return 0;
+
+  let trs = [];
+
+  for (let i = 1; i < candles.length; i++) {
+
+    const high = parseFloat(candles[i][2]);
+    const low = parseFloat(candles[i][3]);
+    const prevClose = parseFloat(candles[i - 1][4]);
+
+    const tr = Math.max(
+      high - low,
+      Math.abs(high - prevClose),
+      Math.abs(low - prevClose)
+    );
+
+    trs.push(tr);
+  }
+
+  const recent = trs.slice(-period);
+  const atr = recent.reduce((a, b) => a + b, 0) / recent.length;
+
+  return atr;
+}
+
+
+// Volatility filter
+export function isLowVolatility(price, atr) {
+
+  if (!atr || !price) return true;
+
+  const volatility = atr / price;
+
+  return volatility < 0.002;
+}
+
+
+
+// Dynamic TP/SL calculation
+export function calculateTargets(entryPrice, atr, direction) {
+
+  if (!atr) return null;
+
+  let TP;
+  let SL;
+
+  if (direction === "LONG") {
+    TP = entryPrice + atr * 2.2;
+    SL = entryPrice - atr * 1.1;
+  }
+
+  if (direction === "SHORT") {
+    TP = entryPrice - atr * 2.2;
+    SL = entryPrice + atr * 1.1;
+  }
+
+  return { TP, SL };
+}
 
 // ╔══════════════════════════════════════════════════════════════╗
 // ║  IQ ENGINE v8 — SMART MONEY CONSTANTS                       ║
@@ -180,7 +269,7 @@ const SocialEngine = {
       this._redditConsecutiveFails++;
       const backoffMs = Math.min(1800000, 60000 * Math.pow(2, this._redditConsecutiveFails));
       this._redditBackoff = Date.now() + backoffMs;
-      console.warn(`[NEXUS] Reddit: ${this._redditConsecutiveFails} fails, backoff ${Math.round(backoffMs/1000)}s`);
+      console.warn(`[NEXUS] Reddit: ${this._redditConsecutiveFails} fails, backoff ${Math.round(backoffMs / 1000)}s`);
       return this._redditCache || this._fallbackReddit();
     } catch { return this._redditCache || this._fallbackReddit(); }
   },
@@ -242,8 +331,8 @@ const SocialEngine = {
     try {
       let totalScore = 0;
       let bullCount = 0, bearCount = 0, totalPosts = 0;
-      const bullWords = ["bull","moon","pump","ath","buy","long","breakout","rally","surge","adoption","institutional","etf approved","bullish","higher","recover","bounce","support held","accumulate","halving"];
-      const bearWords = ["bear","crash","dump","sell","short","plunge","fear","collapse","scam","ban","regulation","bubble","ponzi","correction","lower","resistance","breakdown","capitulation","bearish"];
+      const bullWords = ["bull", "moon", "pump", "ath", "buy", "long", "breakout", "rally", "surge", "adoption", "institutional", "etf approved", "bullish", "higher", "recover", "bounce", "support held", "accumulate", "halving"];
+      const bearWords = ["bear", "crash", "dump", "sell", "short", "plunge", "fear", "collapse", "scam", "ban", "regulation", "bubble", "ponzi", "correction", "lower", "resistance", "breakdown", "capitulation", "bearish"];
       for (const post of posts.slice(0, 25)) {
         const text = (post.title + " " + (post.selftext || "")).toLowerCase();
         let postScore = 0;
@@ -330,7 +419,7 @@ const MacroEngine = {
 
       const results = { sp500: null, dxy: null, gold: null, regime: "NEUTRAL", live: false, timestamp: Date.now(), source: "" };
       const proxies = CORS_PROXIES.filter(Boolean);
-      const orderedProxies = this._lastWorkingProxy 
+      const orderedProxies = this._lastWorkingProxy
         ? [this._lastWorkingProxy, ...proxies.filter(p => p !== this._lastWorkingProxy)]
         : proxies;
 
@@ -393,12 +482,12 @@ const MacroEngine = {
             const r = fxData.rates;
             // Official DXY basket weights: EUR 57.6%, JPY 13.6%, GBP 11.9%, CAD 9.1%, SEK 4.2%, CHF 3.6%
             if (r.EUR && r.JPY && r.GBP && r.CAD && r.SEK && r.CHF) {
-              const syntheticDXY = 50.14348 
-                * Math.pow(1 / r.EUR, 0.576) 
-                * Math.pow(r.JPY, 0.136) 
-                * Math.pow(1 / r.GBP, 0.119) 
-                * Math.pow(r.CAD, 0.091) 
-                * Math.pow(r.SEK, 0.042) 
+              const syntheticDXY = 50.14348
+                * Math.pow(1 / r.EUR, 0.576)
+                * Math.pow(r.JPY, 0.136)
+                * Math.pow(1 / r.GBP, 0.119)
+                * Math.pow(r.CAD, 0.091)
+                * Math.pow(r.SEK, 0.042)
                 * Math.pow(r.CHF, 0.036);
               // % change vs previous cached value (first fetch = 0%)
               const prevDXY = this._cache?.dxy?.price || syntheticDXY;
@@ -450,18 +539,18 @@ const MacroEngine = {
       else results.regime = "NEUTRAL";
 
       // Debug log what worked
-      console.log("[NEXUS] Macro fetch:", 
-        "SP500=" + (results.sp500?.live ? "LIVE" : "FAIL"), 
-        "DXY=" + (results.dxy?.live ? "LIVE" : "FAIL"), 
-        "Gold=" + (results.gold?.live ? "LIVE" : "FAIL"), 
+      console.log("[NEXUS] Macro fetch:",
+        "SP500=" + (results.sp500?.live ? "LIVE" : "FAIL"),
+        "DXY=" + (results.dxy?.live ? "LIVE" : "FAIL"),
+        "Gold=" + (results.gold?.live ? "LIVE" : "FAIL"),
         "via " + (results.source || "none"));
 
       // Cache successful results
       if (results.live) { this._cache = results; this._cacheTime = Date.now(); }
       return results;
-    } catch(e) { 
+    } catch (e) {
       console.warn("[NEXUS] MacroEngine error:", e?.message);
-      return { sp500: null, dxy: null, gold: null, regime: "NEUTRAL", live: false, timestamp: Date.now(), source: "" }; 
+      return { sp500: null, dxy: null, gold: null, regime: "NEUTRAL", live: false, timestamp: Date.now(), source: "" };
     }
   },
 
@@ -764,13 +853,13 @@ const FundingRateEngine = {
       const reasons = [];
 
       // Contrarian: extreme positive funding = longs overcrowded = SHORT signal
-      if (r.veryExtreme && r.rate > 0) { score -= 15; reasons.push(`Funding EXTREME +${(r.rate*100).toFixed(3)}% — longs overcrowded, reversal risk`); }
-      else if (r.extreme && r.rate > 0) { score -= 8; reasons.push(`Funding high +${(r.rate*100).toFixed(3)}% — longs paying, caution`); }
-      else if (r.rate > 0.0003) { score -= 3; reasons.push(`Funding positive ${(r.rate*100).toFixed(3)}%`); }
+      if (r.veryExtreme && r.rate > 0) { score -= 15; reasons.push(`Funding EXTREME +${(r.rate * 100).toFixed(3)}% — longs overcrowded, reversal risk`); }
+      else if (r.extreme && r.rate > 0) { score -= 8; reasons.push(`Funding high +${(r.rate * 100).toFixed(3)}% — longs paying, caution`); }
+      else if (r.rate > 0.0003) { score -= 3; reasons.push(`Funding positive ${(r.rate * 100).toFixed(3)}%`); }
       // Contrarian: extreme negative funding = shorts overcrowded = LONG signal
-      else if (r.veryExtreme && r.rate < 0) { score += 15; reasons.push(`Funding EXTREME ${(r.rate*100).toFixed(3)}% — shorts overcrowded, squeeze likely`); }
-      else if (r.extreme && r.rate < 0) { score += 8; reasons.push(`Funding negative ${(r.rate*100).toFixed(3)}% — shorts paying, bounce likely`); }
-      else if (r.rate < -0.0003) { score += 3; reasons.push(`Funding negative ${(r.rate*100).toFixed(3)}%`); }
+      else if (r.veryExtreme && r.rate < 0) { score += 15; reasons.push(`Funding EXTREME ${(r.rate * 100).toFixed(3)}% — shorts overcrowded, squeeze likely`); }
+      else if (r.extreme && r.rate < 0) { score += 8; reasons.push(`Funding negative ${(r.rate * 100).toFixed(3)}% — shorts paying, bounce likely`); }
+      else if (r.rate < -0.0003) { score += 3; reasons.push(`Funding negative ${(r.rate * 100).toFixed(3)}%`); }
 
       // Trend amplifier
       if (r.trend === "rising" && r.rate > 0.0005) { score -= 3; reasons.push("Funding rising — more longs piling in"); }
@@ -846,10 +935,10 @@ const OrderBookEngine = {
       const reasons = [];
 
       // Imbalance signal
-      if (depthData.imbalance > 0.3) { score += 12; reasons.push(`Buy wall dominant (${(depthData.imbalance*100).toFixed(0)}% imbalance)`); }
-      else if (depthData.imbalance > 0.15) { score += 6; reasons.push(`Bid pressure (${(depthData.imbalance*100).toFixed(0)}%)`); }
-      else if (depthData.imbalance < -0.3) { score -= 12; reasons.push(`Sell wall dominant (${(Math.abs(depthData.imbalance)*100).toFixed(0)}% imbalance)`); }
-      else if (depthData.imbalance < -0.15) { score -= 6; reasons.push(`Ask pressure (${(Math.abs(depthData.imbalance)*100).toFixed(0)}%)`); }
+      if (depthData.imbalance > 0.3) { score += 12; reasons.push(`Buy wall dominant (${(depthData.imbalance * 100).toFixed(0)}% imbalance)`); }
+      else if (depthData.imbalance > 0.15) { score += 6; reasons.push(`Bid pressure (${(depthData.imbalance * 100).toFixed(0)}%)`); }
+      else if (depthData.imbalance < -0.3) { score -= 12; reasons.push(`Sell wall dominant (${(Math.abs(depthData.imbalance) * 100).toFixed(0)}% imbalance)`); }
+      else if (depthData.imbalance < -0.15) { score -= 6; reasons.push(`Ask pressure (${(Math.abs(depthData.imbalance) * 100).toFixed(0)}%)`); }
 
       // Wall proximity — if big buy wall is close below, support is strong
       if (depthData.bidWalls.length > 0) {
@@ -1211,16 +1300,16 @@ const LLMEngine = {
       const fg = fgData || {};
       const macro = macroData || {};
       const mtf = mtfData && mtfData.combined && mtfData.combined.valid ? mtfData.combined : null;
-      const mtfStr = mtf ? `MTF:${mtf.trend} ${mtf.strength}% ${mtf.aligned?"ALIGNED":""} (${(mtfData.combined.details||[]).map(d=>`${d.tf}:${d.dir}`).join(" ")})` : "MTF:loading";
+      const mtfStr = mtf ? `MTF:${mtf.trend} ${mtf.strength}% ${mtf.aligned ? "ALIGNED" : ""} (${(mtfData.combined.details || []).map(d => `${d.tf}:${d.dir}`).join(" ")})` : "MTF:loading";
       const fundSig = FundingRateEngine.getSignal(symbol);
-      const fundStr = fundSig.live ? `Fund:${fundSig.crowded} ${(fundSig.rate*100).toFixed(3)}%` : "Fund:?";
+      const fundStr = fundSig.live ? `Fund:${fundSig.crowded} ${(fundSig.rate * 100).toFixed(3)}%` : "Fund:?";
       const obData = OrderBookEngine._cache[symbol];
-      const obStr = obData?.live ? `Book:${obData.pressure} ${(obData.imbalance*100).toFixed(0)}%` : "Book:?";
+      const obStr = obData?.live ? `Book:${obData.pressure} ${(obData.imbalance * 100).toFixed(0)}%` : "Book:?";
       return `BTC trading analyst. JSON only.
 
-${symbol} $${currentPrice.toFixed(0)} RSI:${ind.rsi?.toFixed(0)||"?"} MACD:${ind.macd?.toFixed(1)||"?"} EMA9v21:${currentPrice>(ind.ema9||0)?"above":"below"} BB:${ind.bbPos?.toFixed(1)||"?"} Vol:${ind.volRatio?.toFixed(1)||"?"}x ${aiResult?.analysis?.regime||"?"}
-Signal:${aiResult?.action||"WAIT"} ${aiResult?.confidence?.toFixed(0)||0}% | F&G:${fg.value||"?"} ${fg.label||""} | Macro:${macro.regime||"?"} | Bias:${ind.marketBias||"neutral"} | ${mtfStr} | ${fundStr} | ${obStr} | Bal:$${balance?.toFixed(0)||100} ${recentWins}W/${recentLosses}L
-${brainStats?.brainSize > 0 ? `Brain:${brainStats.brainSize} WR:${brainStats.totalWins+brainStats.totalLosses>0?((brainStats.totalWins/(brainStats.totalWins+brainStats.totalLosses))*100).toFixed(0):"0"}%` : ""}
+${symbol} $${currentPrice.toFixed(0)} RSI:${ind.rsi?.toFixed(0) || "?"} MACD:${ind.macd?.toFixed(1) || "?"} EMA9v21:${currentPrice > (ind.ema9 || 0) ? "above" : "below"} BB:${ind.bbPos?.toFixed(1) || "?"} Vol:${ind.volRatio?.toFixed(1) || "?"}x ${aiResult?.analysis?.regime || "?"}
+Signal:${aiResult?.action || "WAIT"} ${aiResult?.confidence?.toFixed(0) || 0}% | F&G:${fg.value || "?"} ${fg.label || ""} | Macro:${macro.regime || "?"} | Bias:${ind.marketBias || "neutral"} | ${mtfStr} | ${fundStr} | ${obStr} | Bal:$${balance?.toFixed(0) || 100} ${recentWins}W/${recentLosses}L
+${brainStats?.brainSize > 0 ? `Brain:${brainStats.brainSize} WR:${brainStats.totalWins + brainStats.totalLosses > 0 ? ((brainStats.totalWins / (brainStats.totalWins + brainStats.totalLosses)) * 100).toFixed(0) : "0"}%` : ""}
 Fee:0.4% RT. Trade ONLY if move>0.6%. Extreme funding = contrarian signal (overcrowded side gets liquidated). Book imbalance >20% = directional pressure. In bear markets, prefer shorts. When MTF ALIGNED, trade WITH trend.
 
 {"action":"LONG|SHORT|WAIT","confidence":0-100,"reasoning":"1 sentence","risks":"brief","conviction":"HIGH|MEDIUM|LOW","override":false,"adjustConfidence":0}`;
@@ -1238,7 +1327,7 @@ Fee:0.4% RT. Trade ONLY if move>0.6%. Extreme funding = contrarian signal (overc
     });
     if (!res.ok) {
       const errBody = await res.text().catch(() => "");
-      console.error(`Groq ${res.status}: key=${key.substring(0,8)}...${key.substring(key.length-4)} len=${key.length} body=${errBody.substring(0,200)}`);
+      console.error(`Groq ${res.status}: key=${key.substring(0, 8)}...${key.substring(key.length - 4)} len=${key.length} body=${errBody.substring(0, 200)}`);
       throw { code: res.status, provider: "groq" };
     }
     const data = await res.json();
@@ -1311,7 +1400,7 @@ Fee:0.4% RT. Trade ONLY if move>0.6%. Extreme funding = contrarian signal (overc
         this._backoffUntil = now + backoff;
         this._consecutiveErrors++;
         if (this._cache?.live) return this._cache;
-        this._lastError = `All providers rate-limited - retry ${Math.round(backoff/1000)}s`;
+        this._lastError = `All providers rate-limited - retry ${Math.round(backoff / 1000)}s`;
         return { ...this.getFallback(), error: this._lastError };
       }
 
@@ -1326,7 +1415,7 @@ Fee:0.4% RT. Trade ONLY if move>0.6%. Extreme funding = contrarian signal (overc
       this._saveSnapshot(aiResult, currentPrice, fgData, macroData);
       this._cache = { ...parsed, timestamp: now, model: result.model, provider: result.provider, latency: Date.now() - now, live: true };
       return this._cache;
-    } catch(e) {
+    } catch (e) {
       this._consecutiveErrors++;
       if (this._cache?.live) return this._cache;
       this._lastError = e?.message || "Network error";
@@ -1336,7 +1425,7 @@ Fee:0.4% RT. Trade ONLY if move>0.6%. Extreme funding = contrarian signal (overc
 
   parseResponse(text) {
     try { return this.validateResult(JSON.parse(text)); } catch {
-      try { const m = text.match(/\{[\s\S]*?\}/); if (m) return this.validateResult(JSON.parse(m[0])); } catch {}
+      try { const m = text.match(/\{[\s\S]*?\}/); if (m) return this.validateResult(JSON.parse(m[0])); } catch { }
       return null;
     }
   },
@@ -1391,10 +1480,10 @@ Fee:0.4% RT. Trade ONLY if move>0.6%. Extreme funding = contrarian signal (overc
 // ╚══════════════════════════════════════════════════════════════════╝
 const DrawdownManager = {
   TIERS: [
-    { name: "NORMAL",    threshold: 0,  riskMult: 1.0,  minConf: 0,  color: "#00e676", desc: "Full trading capacity" },
-    { name: "CAUTIOUS",  threshold: 5,  riskMult: 0.5,  minConf: 72, color: "#ffd740", desc: "Reduced size, higher bar" },
-    { name: "RECOVERY",  threshold: 10, riskMult: 0.25, minConf: 80, color: "#ff9100", desc: "Minimal size, only A+ setups" },
-    { name: "EMERGENCY", threshold: 15, riskMult: 0.0,  minConf: 99, color: "#ff1744", desc: "Trading PAUSED — protect capital" },
+    { name: "NORMAL", threshold: 0, riskMult: 1.0, minConf: 0, color: "#00e676", desc: "Full trading capacity" },
+    { name: "CAUTIOUS", threshold: 5, riskMult: 0.5, minConf: 72, color: "#ffd740", desc: "Reduced size, higher bar" },
+    { name: "RECOVERY", threshold: 10, riskMult: 0.25, minConf: 80, color: "#ff9100", desc: "Minimal size, only A+ setups" },
+    { name: "EMERGENCY", threshold: 15, riskMult: 0.0, minConf: 99, color: "#ff1744", desc: "Trading PAUSED — protect capital" },
   ],
 
   calculate(balance, peakBalance) {
@@ -1436,7 +1525,7 @@ const TradeJournal = {
   },
 
   _save() {
-    try { localStorage.setItem("nexus7_journal", JSON.stringify(this._reports.slice(0, 50))); DB._dirty.add("journal"); } catch {}
+    try { localStorage.setItem("nexus7_journal", JSON.stringify(this._reports.slice(0, 50))); DB._dirty.add("journal"); } catch { }
   },
 
   buildReportPrompt(history, stats, balance, startBalance, brainStats) {
@@ -1503,13 +1592,13 @@ SESSION SUMMARY:
 
 STREAK ANALYSIS:
 ${(() => {
-  let maxWin = 0, maxLoss = 0, curW = 0, curL = 0;
-  last24h.forEach(h => {
-    if (h.net > 0) { curW++; curL = 0; maxWin = Math.max(maxWin, curW); }
-    else { curL++; curW = 0; maxLoss = Math.max(maxLoss, curL); }
-  });
-  return `- Max consecutive wins: ${maxWin}\n- Max consecutive losses: ${maxLoss}\n- Current streak: ${curW > 0 ? curW + " wins" : curL > 0 ? curL + " losses" : "even"}`;
-})()}
+          let maxWin = 0, maxLoss = 0, curW = 0, curL = 0;
+          last24h.forEach(h => {
+            if (h.net > 0) { curW++; curL = 0; maxWin = Math.max(maxWin, curW); }
+            else { curL++; curW = 0; maxLoss = Math.max(maxLoss, curL); }
+          });
+          return `- Max consecutive wins: ${maxWin}\n- Max consecutive losses: ${maxLoss}\n- Current streak: ${curW > 0 ? curW + " wins" : curL > 0 ? curL + " losses" : "even"}`;
+        })()}
 
 BY PAIR:
 ${Object.entries(byPair).map(([k, v]) => `- ${k}: ${v.wins}W/${v.losses}L, $${v.pnl.toFixed(2)}`).join("\n")}
@@ -1546,7 +1635,7 @@ Respond in this EXACT JSON format:
     try {
       if (!geminiKey && !groqKey) return { error: "No LLM key — add Groq or Gemini key in Settings to enable AI coaching" };
       if (Date.now() - this._lastGenerated < 60000) return this._reports[0] || { error: "Rate limited — wait 1 minute" };
-      if (LLMEngine._backoffUntil > Date.now()) return this._reports[0] || { error: "Quota cooldown — try again in " + Math.ceil((LLMEngine._backoffUntil - Date.now())/1000) + "s" };
+      if (LLMEngine._backoffUntil > Date.now()) return this._reports[0] || { error: "Quota cooldown — try again in " + Math.ceil((LLMEngine._backoffUntil - Date.now()) / 1000) + "s" };
 
       const prompt = this.buildReportPrompt(history, stats, balance, startBalance, brainStats);
       if (!prompt) return { error: "Not enough trade data for analysis" };
@@ -1562,7 +1651,7 @@ Respond in this EXACT JSON format:
           if (res.ok) { const d = await res.json(); text = d?.choices?.[0]?.message?.content || ""; }
           else if (res.status === 401 || res.status === 403) { LLMEngine._keyInvalid.groq = true; console.error("Groq key invalid in report"); }
           else if (res.status === 429) LLMEngine._backoffUntil = Date.now() + 90000;
-        } catch {}
+        } catch { }
       }
       // Fallback to Gemini
       if (!text && geminiKey) {
@@ -1575,7 +1664,7 @@ Respond in this EXACT JSON format:
           if (res.ok) { const d = await res.json(); text = d?.candidates?.[0]?.content?.parts?.[0]?.text || ""; }
           else if (res.status === 429) { LLMEngine._backoffUntil = Date.now() + 90000; return this._reports[0] || { error: "Quota cooldown — auto-retry in 90s" }; }
           else return { error: "API " + res.status };
-        } catch {}
+        } catch { }
       }
 
       if (!text) return this._reports[0] || { error: "No response from LLM providers" };
@@ -1593,7 +1682,7 @@ Respond in this EXACT JSON format:
       this._save();
       this._lastGenerated = Date.now();
       return report;
-    } catch(e) { return { error: "Journal generation failed: " + (e?.message || "unknown") }; }
+    } catch (e) { return { error: "Journal generation failed: " + (e?.message || "unknown") }; }
   },
 
   getReports() { return this._reports; },
@@ -1606,9 +1695,9 @@ Respond in this EXACT JSON format:
 // ╚══════════════════════════════════════════════════════════════════╝
 const MLEngine = {
   // Network architecture: 24 inputs → 16 hidden → 8 hidden → 1 output (v8: +4 IQ features)
-  FEATURES: ["rsi","rsi7","macdHist","atrPct","bbWidth","volRatio","trendStr","mom5","mom20",
-    "stochRSI","greenStreak","redStreak","sentiment","newsScore","fgIndex","redditScore",
-    "macroScore","onChainScore","obvTrend","regime_enc","fundingRate","obImbalance","btcDom","liqMagnet"],
+  FEATURES: ["rsi", "rsi7", "macdHist", "atrPct", "bbWidth", "volRatio", "trendStr", "mom5", "mom20",
+    "stochRSI", "greenStreak", "redStreak", "sentiment", "newsScore", "fgIndex", "redditScore",
+    "macroScore", "onChainScore", "obvTrend", "regime_enc", "fundingRate", "obImbalance", "btcDom", "liqMagnet"],
   LEARN_RATE: 0.03,
   MIN_SAMPLES: 30,
   RETRAIN_EVERY: 20,
@@ -1667,7 +1756,7 @@ const MLEngine = {
         trainingLog: this._trainingLog.slice(-50),
         epoch: this._epoch,
       });
-    } catch {}
+    } catch { }
   },
 
   // Activation functions
@@ -2026,17 +2115,17 @@ const K = {
 const fx = (n, d = 2) => { try { return Number(n || 0).toFixed(d); } catch { return "0.00"; } };
 const fMoney = n => { try { return (n >= 0 ? "+$" : "-$") + fx(Math.abs(n)); } catch { return "$0.00"; } };
 const fPct = n => { try { return (n >= 0 ? "+" : "") + fx(n) + "%"; } catch { return "0.00%"; } };
-const fShort = n => { try { const a = Math.abs(n); return a >= 1e6 ? (n/1e6).toFixed(1)+"M" : a >= 1e3 ? (n/1e3).toFixed(1)+"K" : n >= 1 ? fx(n) : fx(n, 4); } catch { return "0"; } };
+const fShort = n => { try { const a = Math.abs(n); return a >= 1e6 ? (n / 1e6).toFixed(1) + "M" : a >= 1e3 ? (n / 1e3).toFixed(1) + "K" : n >= 1 ? fx(n) : fx(n, 4); } catch { return "0"; } };
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-const timeAgo = ts => { try { const s = (Date.now() - new Date(ts).getTime()) / 1000; return s < 60 ? Math.floor(s)+"s" : s < 3600 ? Math.floor(s/60)+"m" : s < 86400 ? Math.floor(s/3600)+"h" : Math.floor(s/86400)+"d"; } catch { return "?"; } };
+const timeAgo = ts => { try { const s = (Date.now() - new Date(ts).getTime()) / 1000; return s < 60 ? Math.floor(s) + "s" : s < 3600 ? Math.floor(s / 60) + "m" : s < 86400 ? Math.floor(s / 3600) + "h" : Math.floor(s / 86400) + "d"; } catch { return "?"; } };
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 // ═══ PERSISTENT STORAGE (safe, never crashes) ═══
 const DB = {
   _dirty: new Set(),
   get(k, fallback) { try { const v = JSON.parse(localStorage.getItem("nxv7_" + k)); return v !== null && v !== undefined ? v : fallback; } catch { return fallback; } },
-  set(k, v) { try { localStorage.setItem("nxv7_" + k, JSON.stringify(v)); this._dirty.add(k); } catch(e) { console.warn("DB save failed:", k, e); } },
-  remove(k) { try { localStorage.removeItem("nxv7_" + k); this._dirty.add(k); } catch {} },
+  set(k, v) { try { localStorage.setItem("nxv7_" + k, JSON.stringify(v)); this._dirty.add(k); } catch (e) { console.warn("DB save failed:", k, e); } },
+  remove(k) { try { localStorage.removeItem("nxv7_" + k); this._dirty.add(k); } catch { } },
 };
 
 // ╔══════════════════════════════════════════════════════════════════╗
@@ -2193,7 +2282,7 @@ const CloudSync = {
       );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
-    } catch(e) { this._lastError = e.message; return []; }
+    } catch (e) { this._lastError = e.message; return []; }
   },
 
   // Sync only dirty (changed) keys to cloud — called periodically
@@ -2214,7 +2303,7 @@ const CloudSync = {
       try {
         const journal = JSON.parse(localStorage.getItem("nexus7_journal") || "[]");
         if (journal.length > 0 && await this._push("journal", journal)) { DB._dirty.delete("journal"); pushed++; }
-      } catch {}
+      } catch { }
     }
 
     this._status = pushed > 0 ? "synced" : "error";
@@ -2241,7 +2330,7 @@ const CloudSync = {
     try {
       const journal = JSON.parse(localStorage.getItem("nexus7_journal") || "[]");
       if (journal.length > 0) { if (await this._push("journal", journal)) pushed++; else failed++; }
-    } catch {}
+    } catch { }
 
     DB._dirty.clear();
     this._status = failed === 0 ? "synced" : "error";
@@ -2267,7 +2356,7 @@ const CloudSync = {
           localStorage.setItem("nxv7_" + row.data_key, JSON.stringify(row.data_value));
         }
         restored++;
-      } catch {}
+      } catch { }
     }
 
     this._status = "restored";
@@ -2312,10 +2401,10 @@ function genDemoCandles(base, count, volatility) {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 const Sessions = {
   zones: [
-    { name: "Sydney", emoji: "AU", color: K.sydney, utcOpen: 21, utcClose: 6, traits: "AUD pairs, lower vol, early Asian tone", bestPairs: ["BTCUSDT","ETHUSDT"], volProfile: "low", bias: "continuation" },
-    { name: "Tokyo", emoji: "JP", color: K.tokyo, utcOpen: 0, utcClose: 9, traits: "JPY pairs, moderate vol, Asian sentiment", bestPairs: ["BTCUSDT","ETHUSDT","XRPUSDT"], volProfile: "moderate", bias: "breakout" },
-    { name: "London", emoji: "GB", color: K.london, utcOpen: 7, utcClose: 16, traits: "Highest volume, institutional flow, major breakouts", bestPairs: ["BTCUSDT","ETHUSDT","SOLUSDT"], volProfile: "high", bias: "trend" },
-    { name: "New York", emoji: "US", color: K.nyc, utcOpen: 13, utcClose: 22, traits: "USD dominance, highest crypto vol, whale moves", bestPairs: ["BTCUSDT","ETHUSDT","SOLUSDT","AVAXUSDT"], volProfile: "highest", bias: "reversal" },
+    { name: "Sydney", emoji: "AU", color: K.sydney, utcOpen: 21, utcClose: 6, traits: "AUD pairs, lower vol, early Asian tone", bestPairs: ["BTCUSDT", "ETHUSDT"], volProfile: "low", bias: "continuation" },
+    { name: "Tokyo", emoji: "JP", color: K.tokyo, utcOpen: 0, utcClose: 9, traits: "JPY pairs, moderate vol, Asian sentiment", bestPairs: ["BTCUSDT", "ETHUSDT", "XRPUSDT"], volProfile: "moderate", bias: "breakout" },
+    { name: "London", emoji: "GB", color: K.london, utcOpen: 7, utcClose: 16, traits: "Highest volume, institutional flow, major breakouts", bestPairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT"], volProfile: "high", bias: "trend" },
+    { name: "New York", emoji: "US", color: K.nyc, utcOpen: 13, utcClose: 22, traits: "USD dominance, highest crypto vol, whale moves", bestPairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "AVAXUSDT"], volProfile: "highest", bias: "reversal" },
   ],
   getCurrent() {
     try {
@@ -2336,7 +2425,7 @@ const Sessions = {
   },
   getAdvice(s, isOverlap) {
     if (isOverlap) return "Session overlap = max liquidity. Best time to trade.";
-    switch(s.name) {
+    switch (s.name) {
       case "Tokyo": return "Asian session. Watch for breakouts.";
       case "London": return "London open = institutional flow. Follow the trend.";
       case "New York": return "NYSE correlation high. Watch for reversals.";
@@ -2398,7 +2487,7 @@ const NewsEngine = {
             });
           });
         }
-      } catch {}
+      } catch { }
       if (allNews.length === 0) allNews.push(...this.generateMarketNews());
       this.cache = allNews.slice(0, 30);
       this.lastFetch = Date.now();
@@ -2409,9 +2498,9 @@ const NewsEngine = {
     try {
       if (!title) return { score: 0, label: "neutral", isFake: false };
       const t = title.toLowerCase();
-      const bullWords = ["surge","rally","bull","pump","breakout","all-time high","ath","soar","moon","buying","accumulate","institutional","adopt","etf approved","upgrade","partnership","milestone","record","billion","growth","profit","halving","approval","bullish","outperform","inflow","whale buy","support"];
-      const bearWords = ["crash","dump","bear","plunge","collapse","hack","exploit","sec","lawsuit","ban","regulation","crackdown","sell-off","selloff","fear","liquidation","warning","risk","bubble","fraud","scam","ponzi","rug pull","bankruptcy","default","sanctions","war","bearish","outflow"];
-      const fakeWords = ["guaranteed","100x","1000x","get rich","free money","secret","insider","pump alert","easy profit","last chance","act now","limited time"];
+      const bullWords = ["surge", "rally", "bull", "pump", "breakout", "all-time high", "ath", "soar", "moon", "buying", "accumulate", "institutional", "adopt", "etf approved", "upgrade", "partnership", "milestone", "record", "billion", "growth", "profit", "halving", "approval", "bullish", "outperform", "inflow", "whale buy", "support"];
+      const bearWords = ["crash", "dump", "bear", "plunge", "collapse", "hack", "exploit", "sec", "lawsuit", "ban", "regulation", "crackdown", "sell-off", "selloff", "fear", "liquidation", "warning", "risk", "bubble", "fraud", "scam", "ponzi", "rug pull", "bankruptcy", "default", "sanctions", "war", "bearish", "outflow"];
+      const fakeWords = ["guaranteed", "100x", "1000x", "get rich", "free money", "secret", "insider", "pump alert", "easy profit", "last chance", "act now", "limited time"];
       let score = 0;
       bullWords.forEach(w => { if (t.includes(w)) score += 15; });
       bearWords.forEach(w => { if (t.includes(w)) score -= 15; });
@@ -2425,8 +2514,8 @@ const NewsEngine = {
   scoreCredibility(item) {
     try {
       let cred = 50;
-      const trusted = ["coindesk","cointelegraph","theblock","decrypt","bloomberg","reuters","cnbc","wsj","ft","bbc","binance","coinbase"];
-      const suspicious = ["telegram","unknown","twitter","x.com","reddit user","anonymous"];
+      const trusted = ["coindesk", "cointelegraph", "theblock", "decrypt", "bloomberg", "reuters", "cnbc", "wsj", "ft", "bbc", "binance", "coinbase"];
+      const suspicious = ["telegram", "unknown", "twitter", "x.com", "reddit user", "anonymous"];
       const src = (item.source?.title || "").toLowerCase();
       if (trusted.some(t => src.includes(t))) cred += 30;
       if (suspicious.some(s => src.includes(s))) cred -= 25;
@@ -2493,24 +2582,24 @@ const FakeDetector = {
       const L = candles.length;
       if (L < 30) return { isSuspicious: false, warnings, score: 0, level: "CLEAR" };
       let s = 0;
-      const last = candles[L-1];
+      const last = candles[L - 1];
       const wickR = (last.h - last.l) / (Math.abs(last.c - last.o) || 0.0001);
-      if (wickR > 8 && volumes[L-1] < volumes[L-2] * 0.5) { warnings.push("Long wick + low volume = stop hunt"); s += 25; }
+      if (wickR > 8 && volumes[L - 1] < volumes[L - 2] * 0.5) { warnings.push("Long wick + low volume = stop hunt"); s += 25; }
       const avgVol = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
-      if (volumes[L-1] > avgVol * 4 && Math.abs(last.c - last.o) / last.o < 0.001) { warnings.push("Massive volume but no price move = wash trade"); s += 30; }
+      if (volumes[L - 1] > avgVol * 4 && Math.abs(last.c - last.o) / last.o < 0.001) { warnings.push("Massive volume but no price move = wash trade"); s += 30; }
       if (L >= 4) {
-        const c1 = candles[L-3], c2 = candles[L-2], c3 = candles[L-1];
+        const c1 = candles[L - 3], c2 = candles[L - 2], c3 = candles[L - 1];
         const pump = (c2.h - c1.o) / c1.o * 100;
         const dump = (c2.h - c3.c) / c2.h * 100;
         if (pump > 2 && dump > 1.5) { warnings.push("Pump & dump pattern (3-candle)"); s += 35; }
       }
       const bullVol = candles.slice(-5).filter(c => c.c > c.o).reduce((a, c) => a + c.v, 0);
       const bearVol = candles.slice(-5).filter(c => c.c <= c.o).reduce((a, c) => a + c.v, 0);
-      const pd = candles[L-1].c - (candles[L-5]?.c || candles[L-1].c);
+      const pd = candles[L - 1].c - (candles[L - 5]?.c || candles[L - 1].c);
       if (bullVol > bearVol * 2 && pd < 0) { warnings.push("Bullish vol but price falling = divergence"); s += 20; }
       if (bearVol > bullVol * 2 && pd > 0) { warnings.push("Bearish vol but price rising = divergence"); s += 20; }
       if (L >= 2) {
-        const gap = Math.abs(candles[L-1].o - candles[L-2].c) / candles[L-2].c * 100;
+        const gap = Math.abs(candles[L - 1].o - candles[L - 2].c) / candles[L - 2].c * 100;
         if (gap > 0.5) { warnings.push(`Unusual gap ${fx(gap)}% between candles`); s += 15; }
       }
       return { isSuspicious: s > 30, warnings, score: Math.min(100, s), level: s > 60 ? "DANGER" : s > 30 ? "CAUTION" : "CLEAR" };
@@ -2544,7 +2633,7 @@ const Brain = {
       DB.set("brain_cool", this.coolUntil);
       this._pruneOldSessions();
       DB.set("brain_sessions", this.sessionTrades);
-    } catch {}
+    } catch { }
   },
   _pruneOldSessions() {
     try {
@@ -2557,7 +2646,7 @@ const Brain = {
         const ts = new Date(dateStr + ":00:00Z").getTime();
         if (!isNaN(ts) && now - ts > MAX_AGE) delete this.sessionTrades[key];
       }
-    } catch {}
+    } catch { }
   },
   // ═══ v7.5 FINGERPRINT: 13-dim exact (unchanged for backward compat) ═══
   fingerprint(indicators, action, symbol) {
@@ -2637,10 +2726,10 @@ const Brain = {
       const severityMult = lossDollar > 0.20 ? 3.0 : lossDollar > 0.10 ? 2.0 : lossDollar > 0.05 ? 1.5 : 1.0;
       const coolMs = Math.min(COOL_AFTER_LOSS_MAX, COOL_AFTER_LOSS_BASE * severityMult);
       this.coolUntil = Date.now() + coolMs;
-      console.log(`[BRAIN] 🧊 Cooldown ${(coolMs/1000).toFixed(0)}s (loss $${lossDollar.toFixed(3)}, severity ${severityMult}x) | Exit: ${entry.exitReason}`);
+      console.log(`[BRAIN] 🧊 Cooldown ${(coolMs / 1000).toFixed(0)}s (loss $${lossDollar.toFixed(3)}, severity ${severityMult}x) | Exit: ${entry.exitReason}`);
       this.trackSession("loss");
       this.save();
-    } catch {}
+    } catch { }
   },
   recordWin(entry) {
     try {
@@ -2656,7 +2745,7 @@ const Brain = {
       });
       this.trackSession("win");
       this.save();
-    } catch {}
+    } catch { }
   },
   trackSession(result) {
     try {
@@ -2665,7 +2754,7 @@ const Brain = {
       if (!this.sessionTrades[key]) this.sessionTrades[key] = { wins: 0, losses: 0, trades: 0 };
       this.sessionTrades[key].trades++;
       result === "win" ? this.sessionTrades[key].wins++ : this.sessionTrades[key].losses++;
-    } catch {}
+    } catch { }
   },
   // ═══ v7.5 SHOULDBLOCK — MULTI-LAYER BLOCKING with 7 independent checks ═══
   shouldBlock(indicators, action, symbol) {
@@ -2871,7 +2960,8 @@ const Brain = {
         const wins = this.wins.filter(w => w.session === z.name).length;
         const losses = this.losses.filter(l => l.session === z.name).length;
         const total = wins + losses;
-        perf[z.name] = { wins, losses, total, winRate: total > 0 ? (wins / total * 100) : 0,
+        perf[z.name] = {
+          wins, losses, total, winRate: total > 0 ? (wins / total * 100) : 0,
           profit: this.wins.filter(w => w.session === z.name).reduce((a, e) => a + (e.profit || 0), 0),
           loss: this.losses.filter(l => l.session === z.name).reduce((a, e) => a + (e.loss || 0), 0),
         };
@@ -2950,7 +3040,7 @@ const BacktestEngine = {
       Brain.save();
       const total = wins + losses;
       this._results = { wins, losses, total, winRate: total > 0 ? (wins / total * 100) : 0, batches: batches.length };
-      this._progress = `Done: ${total} patterns (${wins}W/${losses}L = ${total > 0 ? (wins/total*100).toFixed(1) : 0}% WR)`;
+      this._progress = `Done: ${total} patterns (${wins}W/${losses}L = ${total > 0 ? (wins / total * 100).toFixed(1) : 0}% WR)`;
       if (onProgress) onProgress(this._progress);
       this._running = false;
       return this._results;
@@ -3011,7 +3101,7 @@ const BacktestEngine = {
             t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5]
           })));
         }
-      } catch {}
+      } catch { }
 
       // Polite delay between API requests
       await new Promise(r => setTimeout(r, 300));
@@ -3206,20 +3296,20 @@ const BacktestEngine = {
 // TECHNICAL ANALYSIS LIBRARY
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 function calcEMA(data, period) { try { if (!data.length) return []; const k = 2 / (period + 1); let val = data[0]; const r = [val]; for (let i = 1; i < data.length; i++) { val = data[i] * k + val * (1 - k); r.push(val); } return r; } catch { return []; } }
-function calcRSI(closes, period = 14) { try { if (closes.length < period + 1) return closes.map(() => 50); const r = Array(period).fill(50); let aG = 0, aL = 0; for (let i = 1; i <= period; i++) { const d = closes[i] - closes[i-1]; d > 0 ? aG += d : aL -= d; } aG /= period; aL /= period; r.push(aL === 0 ? 100 : 100 - 100 / (1 + aG / aL)); for (let i = period + 1; i < closes.length; i++) { const d = closes[i] - closes[i-1]; aG = (aG * (period - 1) + (d > 0 ? d : 0)) / period; aL = (aL * (period - 1) + (d < 0 ? -d : 0)) / period; r.push(aL === 0 ? 100 : 100 - 100 / (1 + aG / aL)); } return r; } catch { return closes.map(() => 50); } }
+function calcRSI(closes, period = 14) { try { if (closes.length < period + 1) return closes.map(() => 50); const r = Array(period).fill(50); let aG = 0, aL = 0; for (let i = 1; i <= period; i++) { const d = closes[i] - closes[i - 1]; d > 0 ? aG += d : aL -= d; } aG /= period; aL /= period; r.push(aL === 0 ? 100 : 100 - 100 / (1 + aG / aL)); for (let i = period + 1; i < closes.length; i++) { const d = closes[i] - closes[i - 1]; aG = (aG * (period - 1) + (d > 0 ? d : 0)) / period; aL = (aL * (period - 1) + (d < 0 ? -d : 0)) / period; r.push(aL === 0 ? 100 : 100 - 100 / (1 + aG / aL)); } return r; } catch { return closes.map(() => 50); } }
 function calcMACD(closes) { try { if (closes.length < 26) return { line: [], signal: [], hist: [] }; const e12 = calcEMA(closes, 12), e26 = calcEMA(closes, 26); const line = e12.map((v, i) => v - e26[i]); const sig = calcEMA(line.slice(26), 9); return { line: line.slice(26), signal: sig, hist: sig.map((v, i) => line[26 + i] - v) }; } catch { return { line: [], signal: [], hist: [] }; } }
 function calcBB(closes, period = 20) { try { const upper = [], middle = [], lower = []; for (let i = 0; i < closes.length; i++) { if (i < period - 1) { upper.push(null); middle.push(null); lower.push(null); continue; } const slice = closes.slice(i - period + 1, i + 1); const avg = slice.reduce((a, b) => a + b, 0) / period; const std = Math.sqrt(slice.reduce((a, b) => a + (b - avg) ** 2, 0) / period); middle.push(avg); upper.push(avg + 2 * std); lower.push(avg - 2 * std); } return { upper, middle, lower }; } catch { return { upper: [], middle: [], lower: [] }; } }
-function calcATR(candles, period = 14) { try { const tr = []; for (let i = 1; i < candles.length; i++) { tr.push(Math.max(candles[i].h - candles[i].l, Math.abs(candles[i].h - candles[i-1].c), Math.abs(candles[i].l - candles[i-1].c))); } if (tr.length < period) return tr.length > 0 ? tr[tr.length - 1] : 0; let atr = tr.slice(0, period).reduce((s, v) => s + v, 0) / period; for (let i = period; i < tr.length; i++) atr = (atr * (period - 1) + tr[i]) / period; return atr; } catch { return 0; } }
+function calcATR(candles, period = 14) { try { const tr = []; for (let i = 1; i < candles.length; i++) { tr.push(Math.max(candles[i].h - candles[i].l, Math.abs(candles[i].h - candles[i - 1].c), Math.abs(candles[i].l - candles[i - 1].c))); } if (tr.length < period) return tr.length > 0 ? tr[tr.length - 1] : 0; let atr = tr.slice(0, period).reduce((s, v) => s + v, 0) / period; for (let i = period; i < tr.length; i++) atr = (atr * (period - 1) + tr[i]) / period; return atr; } catch { return 0; } }
 function calcStochRSI(closes, rP = 14, sP = 14) { try { const rv = calcRSI(closes, rP); const r = []; for (let i = 0; i < rv.length; i++) { if (i < sP - 1) { r.push(50); continue; } const s = rv.slice(i - sP + 1, i + 1); const mn = Math.min(...s), mx = Math.max(...s); r.push(mx === mn ? 50 : ((rv[i] - mn) / (mx - mn)) * 100); } return r; } catch { return closes.map(() => 50); } }
 function calcVWAP(candles) { try { let cpv = 0, cv = 0; return candles.map(c => { const tp = (c.h + c.l + c.c) / 3; cpv += tp * c.v; cv += c.v; return cv > 0 ? cpv / cv : tp; }); } catch { return candles.map(c => c.c); } }
-function calcOBV(candles) { try { let v = 0; const r = [0]; for (let i = 1; i < candles.length; i++) { if (candles[i].c > candles[i-1].c) v += candles[i].v; else if (candles[i].c < candles[i-1].c) v -= candles[i].v; r.push(v); } return r; } catch { return candles.map(() => 0); } }
+function calcOBV(candles) { try { let v = 0; const r = [0]; for (let i = 1; i < candles.length; i++) { if (candles[i].c > candles[i - 1].c) v += candles[i].v; else if (candles[i].c < candles[i - 1].c) v -= candles[i].v; r.push(v); } return r; } catch { return candles.map(() => 0); } }
 
 function detectRegime(candles, atr, bbWidth) {
   try {
     if (candles.length < 30) return "unknown";
     const closes = candles.slice(-30).map(c => c.c);
     const changes = [];
-    for (let i = 1; i < closes.length; i++) changes.push((closes[i] - closes[i-1]) / closes[i-1] * 100);
+    for (let i = 1; i < closes.length; i++) changes.push((closes[i] - closes[i - 1]) / closes[i - 1] * 100);
     const avgChange = changes.reduce((a, b) => a + Math.abs(b), 0) / changes.length;
     const direction = changes.reduce((a, b) => a + (b > 0 ? 1 : -1), 0);
     if (bbWidth < 1.2 && avgChange < 0.3) return "squeeze";
@@ -3313,7 +3403,7 @@ function detectCandlePatterns(candles) {
     if (candles.length < 4) return [];
     const patterns = [];
     const c = candles, L = c.length;
-    const cur = c[L-1], prev = c[L-2], prev2 = c[L-3];
+    const cur = c[L - 1], prev = c[L - 2], prev2 = c[L - 3];
     const bodySize = c2 => Math.abs(c2.c - c2.o);
     const upperWick = c2 => c2.h - Math.max(c2.o, c2.c);
     const lowerWick = c2 => Math.min(c2.o, c2.c) - c2.l;
@@ -3536,7 +3626,7 @@ const MTFEngine = {
 
       console.log(`[NEXUS] MTF: ${combined.trend} ${combined.strength}% (${combined.bullTFs}B/${combined.bearTFs}Bear) aligned=${combined.aligned} | 5m:${tf5m.trend} 15m:${tf15m.trend} 1h:${tf1h.trend} 4h:${tf4h.trend}`);
       return result;
-    } catch(e) {
+    } catch (e) {
       console.warn("[NEXUS] MTF fetch error:", e);
       return this._cache[symbol] || { tf5m: null, tf15m: null, tf1h: null, tf4h: null, combined: { trend: "neutral", strength: 0, aligned: false, valid: false }, live: false };
     }
@@ -3563,35 +3653,35 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     const price = currentPrice;
 
     const rsi14 = calcRSI(closes, 14);
-    const curRSI = rsi14[L-1] || 50, prevRSI = rsi14[L-2] || 50;
+    const curRSI = rsi14[L - 1] || 50, prevRSI = rsi14[L - 2] || 50;
     const rsi7 = calcRSI(closes, 7);
-    const curRSI7 = rsi7[L-1] || 50;
+    const curRSI7 = rsi7[L - 1] || 50;
     const mc = calcMACD(closes);
     const lastHist = mc.hist.length > 0 ? mc.hist[mc.hist.length - 1] : 0;
     const prevHist = mc.hist.length > 1 ? mc.hist[mc.hist.length - 2] : 0;
     const macdDir = lastHist > 0 ? "bull" : "bear";
     const macdCross = (lastHist > 0 && prevHist <= 0) ? "bullCross" : (lastHist < 0 && prevHist >= 0) ? "bearCross" : "none";
     const bands = calcBB(closes, 20);
-    const bbU = bands.upper[L-1], bbL = bands.lower[L-1], bbM = bands.middle[L-1];
+    const bbU = bands.upper[L - 1], bbL = bands.lower[L - 1], bbM = bands.middle[L - 1];
     const bbWidth = bbU && bbL && bbM ? (bbU - bbL) / bbM * 100 : 2;
     const bbZone = bbL && price <= bbL * 1.003 ? "lower" : bbU && price >= bbU * 0.997 ? "upper" : "mid";
     const atrVal = calcATR(candles, 14);
     const atrPct = (atrVal / price) * 100;
     const ema9 = calcEMA(closes, 9), ema21 = calcEMA(closes, 21), ema50 = calcEMA(closes, 50);
-    const curEma9 = ema9[L-1] || price, curEma21 = ema21[L-1] || price, curEma50 = L > 50 ? ema50[L-1] : null;
+    const curEma9 = ema9[L - 1] || price, curEma21 = ema21[L - 1] || price, curEma50 = L > 50 ? ema50[L - 1] : null;
     const srsi = calcStochRSI(closes, 14, 14);
-    const curSRSI = srsi[L-1] || 50;
+    const curSRSI = srsi[L - 1] || 50;
     const vwapData = calcVWAP(candles);
     const curVWAP = vwapData[vwapData.length - 1] || price;
     const obvData = calcOBV(candles);
     const obvTrend = obvData[obvData.length - 1] - obvData[Math.max(0, obvData.length - 15)];
     const avgVol = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
-    const volRatio = (volumes[L-1] || 0) / (avgVol || 1);
-    const shortT = closes.slice(-5).reduce((a, v, i, arr) => i > 0 ? a + (v > arr[i-1] ? 1 : -1) : 0, 0);
-    const medT = closes.slice(-15).reduce((a, v, i, arr) => i > 0 ? a + (v > arr[i-1] ? 1 : -1) : 0, 0);
+    const volRatio = (volumes[L - 1] || 0) / (avgVol || 1);
+    const shortT = closes.slice(-5).reduce((a, v, i, arr) => i > 0 ? a + (v > arr[i - 1] ? 1 : -1) : 0, 0);
+    const medT = closes.slice(-15).reduce((a, v, i, arr) => i > 0 ? a + (v > arr[i - 1] ? 1 : -1) : 0, 0);
     const trendStr = shortT * 1.5 + medT / 2;
-    const mom5 = L > 5 ? (price - closes[L-6]) / closes[L-6] * 100 : 0;
-    const mom20 = L > 20 ? (price - closes[L-21]) / closes[L-21] * 100 : 0;
+    const mom5 = L > 5 ? (price - closes[L - 6]) / closes[L - 6] * 100 : 0;
+    const mom20 = L > 20 ? (price - closes[L - 21]) / closes[L - 21] * 100 : 0;
     const recentHigh = Math.max(...candles.slice(-30).map(c => c.h));
     const recentLow = Math.min(...candles.slice(-30).map(c => c.l));
     const priceInRange = (price - recentLow) / (recentHigh - recentLow || 1);
@@ -3607,8 +3697,8 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     const sessionInfo = session || Sessions.getCurrent();
 
     let greenStreak = 0, redStreak = 0;
-    for (let i = L - 1; i > Math.max(0, L - 10); i--) { if (closes[i] > closes[i-1]) greenStreak++; else break; }
-    for (let i = L - 1; i > Math.max(0, L - 10); i--) { if (closes[i] < closes[i-1]) redStreak++; else break; }
+    for (let i = L - 1; i > Math.max(0, L - 10); i--) { if (closes[i] > closes[i - 1]) greenStreak++; else break; }
+    for (let i = L - 1; i > Math.max(0, L - 10); i--) { if (closes[i] < closes[i - 1]) redStreak++; else break; }
 
     const indicators = {
       rsi: curRSI, rsi7: curRSI7, macdDir, macdHist: lastHist, macdCross, atr: atrVal, atrPct, bbWidth, bbZone,
@@ -3628,15 +3718,15 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     let bull = 0, bear = 0;
     const reasons = [];
 
-    if (curRSI < 18) { bull += 28; reasons.push(`RSI extreme oversold ${fx(curRSI,0)}`); }
-    else if (curRSI < 28) { bull += 20; reasons.push(`RSI oversold ${fx(curRSI,0)}`); }
-    else if (curRSI < 40 && curRSI > prevRSI) { bull += 8; reasons.push(`RSI recovering ${fx(curRSI,0)}`); }
-    else if (curRSI > 88) { bear += 28; reasons.push(`RSI extreme overbought ${fx(curRSI,0)}`); }
-    else if (curRSI > 80) { bear += 20; reasons.push(`RSI overbought ${fx(curRSI,0)}`); }
-    else if (curRSI > 68 && curRSI < prevRSI) { bear += 8; reasons.push(`RSI weakening ${fx(curRSI,0)}`); }
+    if (curRSI < 18) { bull += 28; reasons.push(`RSI extreme oversold ${fx(curRSI, 0)}`); }
+    else if (curRSI < 28) { bull += 20; reasons.push(`RSI oversold ${fx(curRSI, 0)}`); }
+    else if (curRSI < 40 && curRSI > prevRSI) { bull += 8; reasons.push(`RSI recovering ${fx(curRSI, 0)}`); }
+    else if (curRSI > 88) { bear += 28; reasons.push(`RSI extreme overbought ${fx(curRSI, 0)}`); }
+    else if (curRSI > 80) { bear += 20; reasons.push(`RSI overbought ${fx(curRSI, 0)}`); }
+    else if (curRSI > 68 && curRSI < prevRSI) { bear += 8; reasons.push(`RSI weakening ${fx(curRSI, 0)}`); }
 
-    if (curRSI < 35 && curRSI > prevRSI && closes[L-1] < closes[L-2]) { bull += 16; reasons.push("Bullish RSI divergence"); }
-    if (curRSI > 65 && curRSI < prevRSI && closes[L-1] > closes[L-2]) { bear += 16; reasons.push("Bearish RSI divergence"); }
+    if (curRSI < 35 && curRSI > prevRSI && closes[L - 1] < closes[L - 2]) { bull += 16; reasons.push("Bullish RSI divergence"); }
+    if (curRSI > 65 && curRSI < prevRSI && closes[L - 1] > closes[L - 2]) { bear += 16; reasons.push("Bearish RSI divergence"); }
 
     if (macdCross === "bullCross") { bull += 22; reasons.push("MACD bullish crossover"); }
     else if (macdCross === "bearCross") { bear += 22; reasons.push("MACD bearish crossover"); }
@@ -3655,11 +3745,11 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
 
     if (price > curVWAP * 1.004) { bull += 5; reasons.push("Above VWAP"); } else if (price < curVWAP * 0.996) { bear += 5; reasons.push("Below VWAP"); }
 
-    if (volRatio > 2.5) { const vDir = closes[L-1] > closes[L-2]; if (vDir) { bull += 14; reasons.push(`Vol spike ${fx(volRatio,1)}x bullish`); } else { bear += 14; reasons.push(`Vol spike ${fx(volRatio,1)}x bearish`); } }
-    else if (volRatio > 1.5) { closes[L-1] > closes[L-2] ? bull += 6 : bear += 6; }
+    if (volRatio > 2.5) { const vDir = closes[L - 1] > closes[L - 2]; if (vDir) { bull += 14; reasons.push(`Vol spike ${fx(volRatio, 1)}x bullish`); } else { bear += 14; reasons.push(`Vol spike ${fx(volRatio, 1)}x bearish`); } }
+    else if (volRatio > 1.5) { closes[L - 1] > closes[L - 2] ? bull += 6 : bear += 6; }
 
-    if (obvTrend > 0 && closes[L-1] > closes[L-6]) { bull += 7; reasons.push("OBV confirms uptrend"); }
-    else if (obvTrend < 0 && closes[L-1] < closes[L-6]) { bear += 7; reasons.push("OBV confirms downtrend"); }
+    if (obvTrend > 0 && closes[L - 1] > closes[L - 6]) { bull += 7; reasons.push("OBV confirms uptrend"); }
+    else if (obvTrend < 0 && closes[L - 1] < closes[L - 6]) { bear += 7; reasons.push("OBV confirms downtrend"); }
 
     if (nearSupport) { bull += 10; reasons.push("Near support level"); }
     if (nearResistance) { bear += 10; reasons.push("Near resistance level"); }
@@ -3851,7 +3941,7 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       const blockCheck = Brain.shouldBlock(indicators, "LONG", symbol);
       if (blockCheck.blocked) { action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason); }
       const wr = Brain.getWinRate(indicators, "LONG", symbol);
-      if (wr.total >= 3 && wr.rate < 42) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate,0)}% (${wr.wins}W/${wr.losses}L) [${wr.layer}] — too low`); }
+      if (wr.total >= 3 && wr.rate < 42) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate, 0)}% (${wr.wins}W/${wr.losses}L) [${wr.layer}] — too low`); }
       finalConf += Brain.getConfidenceModifier(indicators, "LONG", symbol);
     } else if (bearPct > pctThreshold && rawConf > confThreshold) {
       action = "SHORT";
@@ -3863,13 +3953,13 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       const blockCheck = Brain.shouldBlock(indicators, "SHORT", symbol);
       if (blockCheck.blocked) { action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason); }
       const wr = Brain.getWinRate(indicators, "SHORT", symbol);
-      if (wr.total >= 3 && wr.rate < 42) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate,0)}% (${wr.wins}W/${wr.losses}L) [${wr.layer}] — too low`); }
+      if (wr.total >= 3 && wr.rate < 42) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate, 0)}% (${wr.wins}W/${wr.losses}L) [${wr.layer}] — too low`); }
       finalConf += Brain.getConfidenceModifier(indicators, "SHORT", symbol);
     }
 
     // Log signal decision details
     if (action === "WAIT" && rawConf > 20) {
-      console.log(`[NEXUS] 🔍 Signal check: bull=${fx(bullPct,0)}% bear=${fx(bearPct,0)}% need>${pctThreshold}% | rawConf=${fx(rawConf,0)}% need>${confThreshold} | risk=${riskLevel}`);
+      console.log(`[NEXUS] 🔍 Signal check: bull=${fx(bullPct, 0)}% bear=${fx(bearPct, 0)}% need>${pctThreshold}% | rawConf=${fx(rawConf, 0)}% need>${confThreshold} | risk=${riskLevel}`);
     }
 
     // ML Engine prediction
@@ -3904,7 +3994,7 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       const netSL = slPct + feeDrag;
       if (netTP > 0 && netSL > 0 && netTP / netSL < 2.0) {
         action = "WAIT";
-        reasons.unshift(`R:R ${(netTP/netSL).toFixed(1)}:1 after fees < 2.0:1 min`);
+        reasons.unshift(`R:R ${(netTP / netSL).toFixed(1)}:1 after fees < 2.0:1 min`);
       }
     }
 
@@ -3913,11 +4003,11 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     // ═══ IQ v8: VOLATILITY FILTER — Don't trade in unfavorable conditions ═══
     if (action !== "WAIT" && atrPct < VOL_FILTER_MIN_ATR) {
       action = "WAIT";
-      reasons.unshift(`ATR ${fx(atrPct,2)}% < ${VOL_FILTER_MIN_ATR}% — too quiet, fees will eat profit`);
+      reasons.unshift(`ATR ${fx(atrPct, 2)}% < ${VOL_FILTER_MIN_ATR}% — too quiet, fees will eat profit`);
     }
     if (action !== "WAIT" && atrPct > VOL_FILTER_MAX_ATR) {
       action = "WAIT";
-      reasons.unshift(`ATR ${fx(atrPct,2)}% > ${VOL_FILTER_MAX_ATR}% — too volatile, SL will get hunted`);
+      reasons.unshift(`ATR ${fx(atrPct, 2)}% > ${VOL_FILTER_MAX_ATR}% — too volatile, SL will get hunted`);
     }
     // Stack-awareness: note when adding to existing position
     const samePairOpen = positions.filter(p => p.pair === symbol);
@@ -3926,7 +4016,7 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       if (nearest < MIN_STACK_DISTANCE_PCT) { action = "WAIT"; reasons.unshift(`Stack too close (${nearest.toFixed(2)}% < ${MIN_STACK_DISTANCE_PCT}%)`); }
       else { reasons.unshift(`Stacking #${samePairOpen.length + 1} (${nearest.toFixed(1)}% from last)`); }
     }
-    if (action !== "WAIT" && finalConf < MIN_CONF_TO_TRADE) { reasons.unshift(`Confidence ${fx(finalConf,0)}% < ${MIN_CONF_TO_TRADE}%`); action = "WAIT"; }
+    if (action !== "WAIT" && finalConf < MIN_CONF_TO_TRADE) { reasons.unshift(`Confidence ${fx(finalConf, 0)}% < ${MIN_CONF_TO_TRADE}%`); action = "WAIT"; }
 
     let phase = action === "WAIT" ? "SCANNING" : "SIGNAL";
     if (isSessionPaused) { action = "PAUSE"; finalConf = 100; sl = 0; tp = 0; riskLevel = "CRITICAL"; phase = "SESSION_PAUSE"; reasons.unshift(`Session loss: ${fx(sessionLossPct, 1)}%`, "Pausing until new session or recovery"); }
@@ -3939,13 +4029,13 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       sentiment, patterns: candlePatterns, newsImpact, fakeAlert, session: sessionInfo,
       socialFG: fg, socialReddit: rd, macroSignal, macroData: macro, onChainSignal, onChainData: onChain, mlPrediction,
     };
-  } catch(err) { return WAIT(["AI engine error: " + (err?.message || "unknown")], {}, { phase: "ERROR" }); }
+  } catch (err) { return WAIT(["AI engine error: " + (err?.message || "unknown")], {}, { phase: "ERROR" }); }
 }
 
 // ═══ CANDLESTICK CHART (SVG) ═══
 function CandleChart({ candles, w = 900, h = 380 }) {
   try {
-    if (!candles || candles.length < 5) return <div style={{ height: h, display: "flex", alignItems: "center", justifyContent: "center", color: K.txM, fontSize: 12 }}><div style={{ width: 18, height: 18, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite", marginRight: 8 }}/>Loading chart...</div>;
+    if (!candles || candles.length < 5) return <div style={{ height: h, display: "flex", alignItems: "center", justifyContent: "center", color: K.txM, fontSize: 12 }}><div style={{ width: 18, height: 18, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite", marginRight: 8 }} />Loading chart...</div>;
     const visible = candles.slice(-100);
     const pr = 54, pl = 2, pt = 6, pb = 18;
     const cw = (w - pl - pr) / visible.length;
@@ -3959,16 +4049,16 @@ function CandleChart({ candles, w = 900, h = 380 }) {
     return (
       <svg viewBox={`0 0 ${w} ${h}`} style={{ width: "100%", height: "auto", display: "block" }}>
         <defs>
-          <linearGradient id="vG7" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor={K.up} stopOpacity=".12"/><stop offset="1" stopColor={K.up} stopOpacity=".01"/></linearGradient>
-          <linearGradient id="vR7" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor={K.dn} stopOpacity=".12"/><stop offset="1" stopColor={K.dn} stopOpacity=".01"/></linearGradient>
+          <linearGradient id="vG7" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor={K.up} stopOpacity=".12" /><stop offset="1" stopColor={K.up} stopOpacity=".01" /></linearGradient>
+          <linearGradient id="vR7" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor={K.dn} stopOpacity=".12" /><stop offset="1" stopColor={K.dn} stopOpacity=".01" /></linearGradient>
         </defs>
-        {[0,.25,.5,.75,1].map((frac, i) => { const p = min + range * (1 - frac); return <g key={i}><line x1={pl} y1={yPos(p)} x2={w-pr} y2={yPos(p)} stroke={K.bd} strokeWidth=".4" strokeDasharray="2,4"/><text x={w-pr+4} y={yPos(p)+3} fill={K.txM} fontSize="6.5" fontFamily="monospace">{fShort(p)}</text></g>; })}
-        {visible.map((c, i) => { const g = c.c >= c.o; const cx = pl + i * cw + cw / 2; return <rect key={"v"+i} x={cx - cw * .38} y={h - pb - (c.v / maxVol) * 26} width={cw * .76} height={(c.v / maxVol) * 26} fill={g ? "url(#vG7)" : "url(#vR7)"}/>; })}
-        {e9.length > 1 && <polyline fill="none" stroke={K.blue} strokeWidth=".7" opacity=".5" points={e9.map((v, i) => `${pl + i * cw + cw/2},${yPos(v)}`).join(" ")}/>}
-        {e21.length > 1 && <polyline fill="none" stroke={K.purple} strokeWidth=".7" opacity=".5" points={e21.map((v, i) => `${pl + i * cw + cw/2},${yPos(v)}`).join(" ")}/>}
-        {visible.map((c, i) => { const g = c.c >= c.o; const col = g ? K.up : K.dn; const bt = yPos(Math.max(c.o, c.c)); const bb = yPos(Math.min(c.o, c.c)); const cx = pl + i * cw + cw / 2; return <g key={i}><line x1={cx} y1={yPos(c.h)} x2={cx} y2={yPos(c.l)} stroke={col} strokeWidth=".6" opacity=".8"/><rect x={cx - cw * .32} y={bt} width={cw * .64} height={Math.max(.7, bb - bt)} fill={col} rx=".3" opacity=".9"/></g>; })}
-        {visible.length > 0 && (() => { const lp = visible[visible.length - 1].c; const y = yPos(lp); const up = visible.length > 1 && lp >= visible[visible.length - 2].c; return <g><line x1={pl} y1={y} x2={w-pr} y2={y} stroke={up ? K.up : K.dn} strokeWidth=".5" strokeDasharray="3,3" opacity=".5"/><rect x={w-pr} y={y-6} width={50} height={12} rx={2} fill={up ? K.up : K.dn} opacity=".9"/><text x={w-pr+4} y={y+3} fill={up ? "#000" : "#fff"} fontSize="7" fontWeight="700" fontFamily="monospace">{fShort(lp)}</text></g>; })()}
-        <text x={pl+2} y={h-3} fill={K.txM} fontSize="5.5" fontFamily="monospace"><tspan fill={K.blue}>- EMA9</tspan>{"  "}<tspan fill={K.purple}>- EMA21</tspan></text>
+        {[0, .25, .5, .75, 1].map((frac, i) => { const p = min + range * (1 - frac); return <g key={i}><line x1={pl} y1={yPos(p)} x2={w - pr} y2={yPos(p)} stroke={K.bd} strokeWidth=".4" strokeDasharray="2,4" /><text x={w - pr + 4} y={yPos(p) + 3} fill={K.txM} fontSize="6.5" fontFamily="monospace">{fShort(p)}</text></g>; })}
+        {visible.map((c, i) => { const g = c.c >= c.o; const cx = pl + i * cw + cw / 2; return <rect key={"v" + i} x={cx - cw * .38} y={h - pb - (c.v / maxVol) * 26} width={cw * .76} height={(c.v / maxVol) * 26} fill={g ? "url(#vG7)" : "url(#vR7)"} />; })}
+        {e9.length > 1 && <polyline fill="none" stroke={K.blue} strokeWidth=".7" opacity=".5" points={e9.map((v, i) => `${pl + i * cw + cw / 2},${yPos(v)}`).join(" ")} />}
+        {e21.length > 1 && <polyline fill="none" stroke={K.purple} strokeWidth=".7" opacity=".5" points={e21.map((v, i) => `${pl + i * cw + cw / 2},${yPos(v)}`).join(" ")} />}
+        {visible.map((c, i) => { const g = c.c >= c.o; const col = g ? K.up : K.dn; const bt = yPos(Math.max(c.o, c.c)); const bb = yPos(Math.min(c.o, c.c)); const cx = pl + i * cw + cw / 2; return <g key={i}><line x1={cx} y1={yPos(c.h)} x2={cx} y2={yPos(c.l)} stroke={col} strokeWidth=".6" opacity=".8" /><rect x={cx - cw * .32} y={bt} width={cw * .64} height={Math.max(.7, bb - bt)} fill={col} rx=".3" opacity=".9" /></g>; })}
+        {visible.length > 0 && (() => { const lp = visible[visible.length - 1].c; const y = yPos(lp); const up = visible.length > 1 && lp >= visible[visible.length - 2].c; return <g><line x1={pl} y1={y} x2={w - pr} y2={y} stroke={up ? K.up : K.dn} strokeWidth=".5" strokeDasharray="3,3" opacity=".5" /><rect x={w - pr} y={y - 6} width={50} height={12} rx={2} fill={up ? K.up : K.dn} opacity=".9" /><text x={w - pr + 4} y={y + 3} fill={up ? "#000" : "#fff"} fontSize="7" fontWeight="700" fontFamily="monospace">{fShort(lp)}</text></g>; })()}
+        <text x={pl + 2} y={h - 3} fill={K.txM} fontSize="5.5" fontFamily="monospace"><tspan fill={K.blue}>- EMA9</tspan>{"  "}<tspan fill={K.purple}>- EMA21</tspan></text>
       </svg>
     );
   } catch { return <div style={{ height: h, display: "flex", alignItems: "center", justifyContent: "center", color: K.dn, fontSize: 11 }}>Chart error</div>; }
@@ -3976,7 +4066,7 @@ function CandleChart({ candles, w = 900, h = 380 }) {
 
 function SentimentGauge({ score, label }) {
   const col = score > 70 ? K.up : score > 55 ? "#8bc34a" : score > 45 ? K.gold : score > 30 ? K.warn : K.dn;
-  return (<div style={{ textAlign: "center" }}><svg viewBox="0 0 100 55" width="100" height="55"><path d="M10 50 A40 40 0 0 1 90 50" fill="none" stroke={K.bd} strokeWidth="6" strokeLinecap="round"/><path d="M10 50 A40 40 0 0 1 90 50" fill="none" stroke={col} strokeWidth="6" strokeLinecap="round" strokeDasharray={`${(score / 100) * 126} 126`} style={{ transition: "all .6s" }}/><text x="50" y="40" textAnchor="middle" fill={col} fontSize="16" fontWeight="800" fontFamily="monospace">{score}</text><text x="50" y="52" textAnchor="middle" fill={K.txD} fontSize="6" fontFamily="monospace">{label}</text></svg></div>);
+  return (<div style={{ textAlign: "center" }}><svg viewBox="0 0 100 55" width="100" height="55"><path d="M10 50 A40 40 0 0 1 90 50" fill="none" stroke={K.bd} strokeWidth="6" strokeLinecap="round" /><path d="M10 50 A40 40 0 0 1 90 50" fill="none" stroke={col} strokeWidth="6" strokeLinecap="round" strokeDasharray={`${(score / 100) * 126} 126`} style={{ transition: "all .6s" }} /><text x="50" y="40" textAnchor="middle" fill={col} fontSize="16" fontWeight="800" fontFamily="monospace">{score}</text><text x="50" y="52" textAnchor="middle" fill={K.txD} fontSize="6" fontFamily="monospace">{label}</text></svg></div>);
 }
 
 function SessionClock({ session }) {
@@ -4211,7 +4301,7 @@ export default function NexusV7() {
       if (!validation.valid) addLog("WARN", "Stability: " + validation.issues.length + " state issue(s) auto-repaired on startup");
       if (cooldownUntil > Date.now()) addLog("WARN", "Cooldown restored: " + Math.ceil((cooldownUntil - Date.now()) / 60000) + "min remaining from last session");
       addLog("AI", "Stability layer active: exec-lock + signal-dedup + crash-recovery + trade-throttle");
-    } catch(e) { console.error("Init error:", e); setReady(true); }
+    } catch (e) { console.error("Init error:", e); setReady(true); }
   }, []);
 
   // Save state on every change
@@ -4258,14 +4348,14 @@ export default function NexusV7() {
           DB.set("currentSession", sess.primary.name);
           addLog("AI", `Session change: ${sess.primary.emoji} ${sess.primary.name} - fresh targets`);
         }
-      } catch {}
+      } catch { }
     }, 300000);
     return () => clearInterval(i);
   }, [currentSession, balance]);
 
   // Fetch news (2min)
   useEffect(() => {
-    const fn = async () => { try { const n = await NewsEngine.fetchNews(); setNews(n); } catch {} };
+    const fn = async () => { try { const n = await NewsEngine.fetchNews(); setNews(n); } catch { } };
     fn(); const i = setInterval(fn, 120000); return () => clearInterval(i);
   }, []);
 
@@ -4277,7 +4367,7 @@ export default function NexusV7() {
         setFgData(fg);
         if (fg.live && fg.isExtremeFear) addLog("SOCIAL", `F&G EXTREME FEAR: ${fg.value} — monitoring for signals`);
         if (fg.live && fg.isExtremeGreed) addLog("SOCIAL", `F&G EXTREME GREED: ${fg.value} — monitoring for signals`);
-      } catch {}
+      } catch { }
     };
     fn(); const i = setInterval(fn, 300000); return () => clearInterval(i);
   }, []);
@@ -4288,7 +4378,7 @@ export default function NexusV7() {
       try {
         const rd = await SocialEngine.fetchRedditSentiment();
         setRedditData(rd);
-      } catch {}
+      } catch { }
     };
     fn(); const i = setInterval(fn, 600000); return () => clearInterval(i); // 10min — Reddit rate-limits aggressively
   }, []);
@@ -4301,7 +4391,7 @@ export default function NexusV7() {
         setMacroData(macro);
         if (macro.live && macro.regime === "RISK-OFF") addLog("MACRO", `RISK-OFF detected: S&P weak, DXY strong — BTC headwind`);
         if (macro.live && macro.regime === "RISK-ON") addLog("MACRO", `RISK-ON: S&P strong, DXY weak — BTC tailwind`);
-      } catch {}
+      } catch { }
     };
     fn(); const i = setInterval(fn, 600000); return () => clearInterval(i);
   }, []);
@@ -4314,7 +4404,7 @@ export default function NexusV7() {
         setOnChainData(oc);
         if (oc.live && oc.mempool?.stress === "EXTREME") addLog("CHAIN", `Mempool EXTREME: ${oc.mempool.fastestFee} sat/vB — expect volatility`);
         if (oc.live && oc.whales?.activity === "VERY HIGH") addLog("CHAIN", `Whale activity VERY HIGH: ${oc.whales.txCount} txs in latest block`);
-      } catch {}
+      } catch { }
     };
     fn(); const i = setInterval(fn, 120000); return () => clearInterval(i);
   }, []);
@@ -4336,8 +4426,8 @@ export default function NexusV7() {
         setLiqData(liq);
         if (fr.live && fundingSig?.crowded === "longs" && fundingSig.score < -10) addLog("IQ", `FUNDING: Longs overcrowded — reversal risk`);
         if (fr.live && fundingSig?.crowded === "shorts" && fundingSig.score > 10) addLog("IQ", `FUNDING: Shorts overcrowded — squeeze likely`);
-        if (ob.live && Math.abs(ob.imbalance) > 0.3) addLog("IQ", `BOOK: ${ob.pressure} pressure (${(ob.imbalance*100).toFixed(0)}% imbalance)`);
-      } catch {}
+        if (ob.live && Math.abs(ob.imbalance) > 0.3) addLog("IQ", `BOOK: ${ob.pressure} pressure (${(ob.imbalance * 100).toFixed(0)}% imbalance)`);
+      } catch { }
     };
     fn(); const i = setInterval(fn, 120000); return () => clearInterval(i);
   }, [isLive, pair, price]);
@@ -4353,7 +4443,7 @@ export default function NexusV7() {
         if (result.live && result.combined.aligned) {
           addLog("MTF", `${result.combined.trend.toUpperCase()} aligned across ${result.combined.bullTFs + result.combined.bearTFs}/${result.combined.totalTFs} timeframes (${result.combined.strength}%)`);
         }
-      } catch {}
+      } catch { }
     };
     fn(); const i = setInterval(fn, 60000); return () => clearInterval(i);
   }, [isLive, pair, endpointIdx]);
@@ -4410,7 +4500,7 @@ export default function NexusV7() {
           return fails;
         });
       }
-    } catch {}
+    } catch { }
   }, [pair, timeframe, isLive, endpointIdx]);
 
   useEffect(() => { fetchMarketData(); }, [pair, timeframe]);
@@ -4430,22 +4520,22 @@ export default function NexusV7() {
           last.h = Math.max(last.h, last.c); last.l = Math.min(last.l, last.c); last.v += Math.random() * 30;
           return [...prev.slice(0, -1), last];
         });
-      } catch {}
+      } catch { }
     }, 2000);
     return () => clearInterval(i);
   }, [pair, isLive]);
 
   // ═══ AI ANALYSIS ═══
   useEffect(() => {
-    try { 
+    try {
       if (candles.length > 60 && price > 0) {
         const result = aiDecision(candles, price, pair.sym, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, fgData, redditData, macroData, onChainData, mtfData, fundingData, orderBookData, correlationData, liqData);
         setAiResult(result);
         if (result && result.action !== "WAIT") {
-          console.log(`[NEXUS] 🤖 AI DECISION: ${result.action} ${pair.name} | Conf:${result.confidence}% | SL:${result.sl||'none'} TP:${result.tp||'none'} | Bias:${result.indicators?.marketBias||'?'} ${result.indicators?.marketBiasStrength||0}%`);
+          console.log(`[NEXUS] 🤖 AI DECISION: ${result.action} ${pair.name} | Conf:${result.confidence}% | SL:${result.sl || 'none'} TP:${result.tp || 'none'} | Bias:${result.indicators?.marketBias || '?'} ${result.indicators?.marketBiasStrength || 0}%`);
         }
       }
-    } catch {}
+    } catch { }
   }, [candles, price, pair, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, onChainData, mtfData]);
 
   // ═══ AUTO-TRADING (AI FREE HAND) ═══
@@ -4460,7 +4550,7 @@ export default function NexusV7() {
     llmStartRef.current = Date.now();
     setLlmCountdown(15);
     let intervalId = null;
-    
+
     const runLLM = async () => {
       const d = llmDataRef.current;
       if (!d.aiResult || !d.candles.length || d.price <= 0) return;
@@ -4485,7 +4575,7 @@ export default function NexusV7() {
         const next = LLMEngine.getNextInterval(d.aiResult);
         if (intervalId) clearInterval(intervalId);
         intervalId = setInterval(runLLM, next);
-      } catch(e) { addLog("LLM", "Call failed: " + (e?.message || "unknown")); }
+      } catch (e) { addLog("LLM", "Call failed: " + (e?.message || "unknown")); }
     };
     const t = setTimeout(runLLM, 15000); // First call after 15s
     intervalId = setInterval(runLLM, 90000); // Initial 90s, then adaptive
@@ -4517,7 +4607,7 @@ export default function NexusV7() {
       // ═══ DEMO GUARD: Never auto-trade on fake/offline data ═══
       if (!isLive) { console.log("[NEXUS] ⏸ Trade skip: not live"); return; }
       if (!hasLivePrice) { console.log("[NEXUS] ⏸ Trade skip: no live price confirmed"); return; }
-      if (aiResult.action === "WAIT" || aiResult.action === "PAUSE") { console.log(`[NEXUS] ⏸ AI says ${aiResult.action} (conf: ${Number(aiResult.confidence).toFixed(1)}%) | Reasons: ${(aiResult.reasons||[]).slice(0,3).join('; ')}`); return; }
+      if (aiResult.action === "WAIT" || aiResult.action === "PAUSE") { console.log(`[NEXUS] ⏸ AI says ${aiResult.action} (conf: ${Number(aiResult.confidence).toFixed(1)}%) | Reasons: ${(aiResult.reasons || []).slice(0, 3).join('; ')}`); return; }
       if ((geminiKey || groqKey) && llmResult?.live && llmResult.override && llmResult.action === "WAIT") { console.log("[NEXUS] ⏸ LLM override: WAIT"); return; }
       // ═══ POSITION STACKING GUARDS ═══
       const samePairPositions = positions.filter(p => p.pair === pair.sym);
@@ -4554,14 +4644,14 @@ export default function NexusV7() {
       // ═══ DATA INTEGRITY SHIELD — Block trades on stale data ═══
       const dataAge = Date.now() - lastDataUpdate;
       if (dataAge > STALE_TRADE_BLOCK) {
-        console.log(`[NEXUS] ⏸ Stale data: ${Math.round(dataAge/1000)}s old > ${STALE_TRADE_BLOCK/1000}s limit`);
+        console.log(`[NEXUS] ⏸ Stale data: ${Math.round(dataAge / 1000)}s old > ${STALE_TRADE_BLOCK / 1000}s limit`);
         return; // silently block — data too old for safe entry
       }
       // Validate candle freshness — latest candle should be recent
       if (candles.length > 0 && candles[candles.length - 1].t) {
         const candleAge = Date.now() - candles[candles.length - 1].t;
         if (candleAge > MAX_CANDLE_AGE) {
-          console.log(`[NEXUS] ⏸ Stale candle: ${Math.round(candleAge/1000)}s old`);
+          console.log(`[NEXUS] ⏸ Stale candle: ${Math.round(candleAge / 1000)}s old`);
           return; // candle data too old — API may be returning cached/stale klines
         }
       }
@@ -4692,7 +4782,7 @@ export default function NexusV7() {
         const conviction = llmResult.conviction || "LOW";
         const convMult = CONVICTION_MULT[conviction] || 0.45;
         stackedAmount = Math.max(5, stackedAmount * convMult);
-        console.log(`[NEXUS] IQ SIZE: Conviction=${conviction} -> ${(convMult*100).toFixed(0)}% size ($${stackedAmount.toFixed(2)})`);
+        console.log(`[NEXUS] IQ SIZE: Conviction=${conviction} -> ${(convMult * 100).toFixed(0)}% size ($${stackedAmount.toFixed(2)})`);
       }
       // Win/loss streak adjustment
       if (consecutiveWins >= 2) {
@@ -4712,7 +4802,7 @@ export default function NexusV7() {
 
       if (stackedAmount < 5) return;
 
-      console.log(`[NEXUS] ✅ ALL GATES PASSED — EXECUTING: ${aiResult.action} ${pair.name} | Conf:${tradeConf.toFixed(0)}% | Amount:$${stackedAmount.toFixed(2)} | Stack:${stackLevel+1}/${MAX_POSITIONS} | SL:${aiResult.sl||'none'} TP:${aiResult.tp||'none'}`);
+      console.log(`[NEXUS] ✅ ALL GATES PASSED — EXECUTING: ${aiResult.action} ${pair.name} | Conf:${tradeConf.toFixed(0)}% | Amount:$${stackedAmount.toFixed(2)} | Stack:${stackLevel + 1}/${MAX_POSITIONS} | SL:${aiResult.sl || 'none'} TP:${aiResult.tp || 'none'}`);
 
       // ═══ STABILITY: Lock execution, record signal, execute ═══
       executionLockRef.current = true;
@@ -4723,7 +4813,7 @@ export default function NexusV7() {
       } finally {
         executionLockRef.current = false;
       }
-    } catch {}
+    } catch { }
   }, [aiResult, aiActive, llmResult, drawdownState, cooldownUntil, lastDataUpdate, candles, isLive, mtfData, hasLivePrice]);
 
   // ═══ SL/TP MONITOR + MTF-AWARE SMART EXITS (v7.3 — Price Sanity + Stale Winner) ═══
@@ -4740,7 +4830,7 @@ export default function NexusV7() {
       // ═══ DATA INTEGRITY: Don't trigger SL/TP on stale prices ═══
       const dataAge = Date.now() - lastDataUpdate;
       if (dataAge > STALE_SL_BLOCK) {
-        console.log(`[NEXUS] ⛔ SL/TP BLOCKED: Data stale (${Math.round(dataAge/1000)}s old > ${STALE_SL_BLOCK/1000}s limit)`);
+        console.log(`[NEXUS] ⛔ SL/TP BLOCKED: Data stale (${Math.round(dataAge / 1000)}s old > ${STALE_SL_BLOCK / 1000}s limit)`);
         return;
       }
 
@@ -4762,7 +4852,7 @@ export default function NexusV7() {
           const holdMins = (Date.now() - new Date(p.entryTime).getTime()) / 60000;
 
           // ═══ PERIODIC POSITION LOG (every price tick for open positions) ═══
-          console.log(`[NEXUS] 📊 POS: ${p.side} ${p.pairName} | Entry:$${p.entry.toFixed(2)} Now:$${price.toFixed(2)} | PnL:${pnlPct.toFixed(2)}% ($${pnl.toFixed(2)}) | Hold:${holdMins.toFixed(0)}min | SL:$${(p.sl||0).toFixed(2)} TP:$${(p.tp||0).toFixed(2)}`);
+          console.log(`[NEXUS] 📊 POS: ${p.side} ${p.pairName} | Entry:$${p.entry.toFixed(2)} Now:$${price.toFixed(2)} | PnL:${pnlPct.toFixed(2)}% ($${pnl.toFixed(2)}) | Hold:${holdMins.toFixed(0)}min | SL:$${(p.sl || 0).toFixed(2)} TP:$${(p.tp || 0).toFixed(2)}`);
 
           // ═══ MTF-AWARE TRAILING STOPS ═══
           const mtfConfirms = mtfCombined?.valid && (
@@ -4788,8 +4878,8 @@ export default function NexusV7() {
           const trailKeep = mtfConfirms ? 0.3 : mtfAgainst ? 0.55 : 0.4;
           if (pnlPct > trailThreshold && p.sl) {
             const trail = p.side === "LONG" ? price - (price - p.entry) * trailKeep : price + (p.entry - price) * trailKeep;
-            if (p.side === "LONG" && trail > p.sl) { p.sl = trail; console.log(`[NEXUS] 🔄 PROFIT TRAIL: ${p.pairName} SL→$${trail.toFixed(2)} (keeping ${(trailKeep*100).toFixed(0)}%)`); }
-            if (p.side === "SHORT" && trail < p.sl) { p.sl = trail; console.log(`[NEXUS] 🔄 PROFIT TRAIL: ${p.pairName} SL→$${trail.toFixed(2)} (keeping ${(trailKeep*100).toFixed(0)}%)`); }
+            if (p.side === "LONG" && trail > p.sl) { p.sl = trail; console.log(`[NEXUS] 🔄 PROFIT TRAIL: ${p.pairName} SL→$${trail.toFixed(2)} (keeping ${(trailKeep * 100).toFixed(0)}%)`); }
+            if (p.side === "SHORT" && trail < p.sl) { p.sl = trail; console.log(`[NEXUS] 🔄 PROFIT TRAIL: ${p.pairName} SL→$${trail.toFixed(2)} (keeping ${(trailKeep * 100).toFixed(0)}%)`); }
           }
 
           // ╔══════════════════════════════════════════════════════════════╗
@@ -4801,46 +4891,46 @@ export default function NexusV7() {
           if (!p._partialTaken && pnlPct >= PARTIAL_PROFIT_PCT && p.qty > 0) {
             const partialQty = p.qty * PARTIAL_PROFIT_RATIO;
             const remainQty = p.qty - partialQty;
-            const partialPnl = p.side === "LONG" 
-              ? (price - p.entry) * partialQty 
+            const partialPnl = p.side === "LONG"
+              ? (price - p.entry) * partialQty
               : (p.entry - price) * partialQty;
             const partialFee = price * partialQty * FEE_RATE;
             const netPartial = partialPnl - partialFee;
-            
+
             // Book the partial profit
             const partialCost = p.cost * PARTIAL_PROFIT_RATIO;
             setBalance(b => b + partialCost + netPartial);
-            
+
             // Update position to reflect remaining qty
             p.qty = remainQty;
             p.cost = p.cost - partialCost;
             p._partialTaken = true;
             p._partialPnl = netPartial;
             p._partialPrice = price;
-            
+
             // ═══ CRITICAL: Move SL to breakeven — NOW YOU CANNOT LOSE ═══
             if (BREAKEVEN_AFTER_PARTIAL) {
               const beFee = p.entry * FEE_RATE * 2; // account for entry+exit fees
-              const beSL = p.side === "LONG" 
+              const beSL = p.side === "LONG"
                 ? p.entry + beFee / remainQty + 0.01  // tiny buffer above breakeven
                 : p.entry - beFee / remainQty - 0.01;
               p.sl = beSL;
-              console.log(`[NEXUS] 🧠 IQ PARTIAL: ${p.side} ${p.pairName} — Took ${(PARTIAL_PROFIT_RATIO*100).toFixed(0)}% profit +$${netPartial.toFixed(2)} at $${price.toFixed(2)} | SL→BREAKEVEN $${beSL.toFixed(2)} | REMAINING ${remainQty.toFixed(6)} RISK-FREE`);
-              addLog("WIN", `IQ PARTIAL: ${p.pairName} +$${netPartial.toFixed(2)} (${(PARTIAL_PROFIT_RATIO*100).toFixed(0)}%) — remainder now RISK-FREE`);
+              console.log(`[NEXUS] 🧠 IQ PARTIAL: ${p.side} ${p.pairName} — Took ${(PARTIAL_PROFIT_RATIO * 100).toFixed(0)}% profit +$${netPartial.toFixed(2)} at $${price.toFixed(2)} | SL→BREAKEVEN $${beSL.toFixed(2)} | REMAINING ${remainQty.toFixed(6)} RISK-FREE`);
+              addLog("WIN", `IQ PARTIAL: ${p.pairName} +$${netPartial.toFixed(2)} (${(PARTIAL_PROFIT_RATIO * 100).toFixed(0)}%) — remainder now RISK-FREE`);
             }
-            
+
             // Record partial as a win in brain (it IS a win)
             if (!p.isDemo) {
               Brain.recordWin({ symbol: p.pair, action: p.side, indicators: p.indicators, profit: netPartial, exitReason: "Partial Profit", holdMins: holdMins });
             }
-            
+
             // Log to history as partial
-            const partialRecord = { 
-              ...p, exit: price, exitTime: new Date().toISOString(), 
-              gross: partialPnl, exitFee: partialFee, net: netPartial, 
+            const partialRecord = {
+              ...p, exit: price, exitTime: new Date().toISOString(),
+              gross: partialPnl, exitFee: partialFee, net: netPartial,
               pct: (netPartial / partialCost) * 100, totalFees: p.fee * PARTIAL_PROFIT_RATIO + partialFee,
               totalSlippage: (p.slippage || 0) * PARTIAL_PROFIT_RATIO,
-              reason: "Partial Profit (IQ)", isPartial: true 
+              reason: "Partial Profit (IQ)", isPartial: true
             };
             setHistory(prev => [partialRecord, ...prev]);
             setSessionPnl(d => d + netPartial);
@@ -4853,16 +4943,16 @@ export default function NexusV7() {
           // ═══ IQ v8: MULTI-STAGE TRAILING — Tighter trail as profit grows ═══
           if (p._partialTaken && pnlPct > 3.0 && p.sl) {
             // After partial taken, trail aggressively to lock more profit
-            const aggressiveTrail = p.side === "LONG" 
+            const aggressiveTrail = p.side === "LONG"
               ? price - (price - p.entry) * 0.25  // Keep 75% of remaining profit
               : price + (p.entry - price) * 0.25;
-            if (p.side === "LONG" && aggressiveTrail > p.sl) { 
-              p.sl = aggressiveTrail; 
-              console.log(`[NEXUS] 🧠 IQ TRAIL: ${p.pairName} aggressive trail SL→$${aggressiveTrail.toFixed(2)} (post-partial, keeping 75%)`); 
+            if (p.side === "LONG" && aggressiveTrail > p.sl) {
+              p.sl = aggressiveTrail;
+              console.log(`[NEXUS] 🧠 IQ TRAIL: ${p.pairName} aggressive trail SL→$${aggressiveTrail.toFixed(2)} (post-partial, keeping 75%)`);
             }
-            if (p.side === "SHORT" && aggressiveTrail < p.sl) { 
-              p.sl = aggressiveTrail; 
-              console.log(`[NEXUS] 🧠 IQ TRAIL: ${p.pairName} aggressive trail SL→$${aggressiveTrail.toFixed(2)} (post-partial, keeping 75%)`); 
+            if (p.side === "SHORT" && aggressiveTrail < p.sl) {
+              p.sl = aggressiveTrail;
+              console.log(`[NEXUS] 🧠 IQ TRAIL: ${p.pairName} aggressive trail SL→$${aggressiveTrail.toFixed(2)} (post-partial, keeping 75%)`);
             }
           }
 
@@ -4901,8 +4991,8 @@ export default function NexusV7() {
           }
           // Ultra-stale fallback: if held 12+ hours and still red, close regardless of MTF
           if (holdMins > 720 && pnlPct < -0.5) {
-            addLog("AI", `TIME EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% after ${Math.round(holdMins/60)}h — too stale, cutting`);
-            console.log(`[NEXUS] ⏰ ULTRA-STALE EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% held ${Math.round(holdMins/60)}h`);
+            addLog("AI", `TIME EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% after ${Math.round(holdMins / 60)}h — too stale, cutting`);
+            console.log(`[NEXUS] ⏰ ULTRA-STALE EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(1)}% held ${Math.round(holdMins / 60)}h`);
             closeTrade(p, price, "Time Exit (stale)");
             changed = true;
             return false;
@@ -4947,7 +5037,7 @@ export default function NexusV7() {
         });
         return changed ? updated : prev;
       });
-    } catch {}
+    } catch { }
   }, [price, lastDataUpdate, mtfData, hasLivePrice]);
 
   // ═══ TRADE EXECUTION ═══
@@ -4961,7 +5051,7 @@ export default function NexusV7() {
       }
       if (amount > balance) { addLog("ERR", "Insufficient balance"); return; }
       if (balance < MIN_BALANCE) { addLog("ERR", `Min $${MIN_BALANCE} required`); return; }
-      console.log(`[NEXUS] 🔔 OPENING: ${side} ${pair.name} | Amount:$${amount.toFixed(2)} | Price:$${price.toFixed(2)} | SL:${sl||'none'} TP:${tp||'none'}`);
+      console.log(`[NEXUS] 🔔 OPENING: ${side} ${pair.name} | Amount:$${amount.toFixed(2)} | Price:$${price.toFixed(2)} | SL:${sl || 'none'} TP:${tp || 'none'}`);
       // ═══ REALISTIC EXECUTION: apply slippage on entry ═══
       const atrPct = aiResult?.indicators?.atrPct || 1;
       const fillPrice = simulateSlippage(price, side, atrPct);
@@ -4980,8 +5070,8 @@ export default function NexusV7() {
       setBalance(b => b - amount);
       setPositions(prev => [...prev, trade]);
       setSessionTradeCount(d => d + 1);
-      addLog(isAI ? "AI" : "TRADE", `${side} ${qty.toFixed(6)} ${pair.name} @ $${fillPrice.toFixed(pair.dp)} (slip: $${fx(slippageCost,4)}) | $${fx(amount)}${sl ? ` SL:$${fx(sl, pair.dp)}` : ""}${tp ? ` TP:$${fx(tp, pair.dp)}` : ""}${!isLive ? " [DEMO]" : ""}`);
-    } catch(e) { addLog("ERR", "Trade failed: " + (e?.message || "unknown")); }
+      addLog(isAI ? "AI" : "TRADE", `${side} ${qty.toFixed(6)} ${pair.name} @ $${fillPrice.toFixed(pair.dp)} (slip: $${fx(slippageCost, 4)}) | $${fx(amount)}${sl ? ` SL:$${fx(sl, pair.dp)}` : ""}${tp ? ` TP:$${fx(tp, pair.dp)}` : ""}${!isLive ? " [DEMO]" : ""}`);
+    } catch (e) { addLog("ERR", "Trade failed: " + (e?.message || "unknown")); }
   }
 
   function closeTrade(p, exitPrice, reason) {
@@ -5042,7 +5132,7 @@ export default function NexusV7() {
         const result = MLEngine.train(150);
         if (result.success) { addLog("ML", `Auto-retrained: ${result.accuracy.toFixed(1)}% accuracy on ${result.samples} trades`); setMlStats(MLEngine.getStats()); }
       }
-    } catch(e) { addLog("ERR", "Close failed: " + (e?.message || "unknown")); }
+    } catch (e) { addLog("ERR", "Close failed: " + (e?.message || "unknown")); }
   }
 
   function manualClose(p) { closeTrade(p, price, "Manual Close"); setPositions(prev => prev.filter(x => x.id !== p.id)); }
@@ -5068,7 +5158,7 @@ export default function NexusV7() {
     try { const cp = p.pair === pair.sym ? price : p.entry; return a + p.cost + (p.side === "LONG" ? (cp - p.entry) * p.qty : (p.entry - cp) * p.qty); } catch { return a; }
   }, 0);
 
-  const uptimeStr = `${Math.floor(uptime/3600)}h ${Math.floor((uptime%3600)/60)}m ${uptime%60}s`;
+  const uptimeStr = `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${uptime % 60}s`;
 
   // ═══ DRAWDOWN ESCALATION ═══
   useEffect(() => {
@@ -5081,7 +5171,7 @@ export default function NexusV7() {
       else if (dd.tier.name === "RECOVERY" && drawdownState?.tier?.name !== "RECOVERY") addLog("WARN", `RECOVERY MODE: ${dd.drawdownPct.toFixed(1)}% drawdown — risk reduced 75%`);
       else if (dd.tier.name === "CAUTIOUS" && drawdownState?.tier?.name !== "CAUTIOUS") addLog("WARN", `CAUTIOUS MODE: ${dd.drawdownPct.toFixed(1)}% drawdown — risk reduced 50%`);
       else if (dd.tier.name === "NORMAL" && drawdownState?.tier?.name !== "NORMAL" && drawdownState?.tier?.name) addLog("AI", `Drawdown recovered — back to NORMAL trading`);
-    } catch {}
+    } catch { }
   }, [balance]);
 
   // ═══ STYLES ═══
@@ -5098,7 +5188,7 @@ export default function NexusV7() {
     <div style={{ background: K.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 14, fontFamily: "'SF Mono',monospace" }}>
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
-      <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }}/>
+      <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }} />
       <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v8 | 140 IQ ENGINE | LOADING</div>
     </div>
   );
@@ -5143,7 +5233,7 @@ export default function NexusV7() {
 
       {/* SESSION BAR */}
       <div style={{ padding: "6px 20px", borderBottom: `1px solid ${K.bd}`, background: K.s1 }}>
-        <SessionClock session={session}/>
+        <SessionClock session={session} />
       </div>
 
       {/* ═══ DEMO MODE BANNER — Honest visibility when offline ═══ */}
@@ -5189,8 +5279,8 @@ export default function NexusV7() {
 
         {/* CHART */}
         {tab === "chart" && <div style={S.card}>
-          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 1.5, marginBottom: 8 }}>{pair.name}/USDT | {timeframe} | {candles.length} candles {isLive ? "| LIVE FEED" : "| OFFLINE"}{isLive && candles.length > 0 && candles[candles.length-1].t ? ` | Last candle: ${Math.floor((Date.now() - candles[candles.length-1].t)/1000)}s ago` : ""}</div>
-          <CandleChart candles={candles}/>
+          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 1.5, marginBottom: 8 }}>{pair.name}/USDT | {timeframe} | {candles.length} candles {isLive ? "| LIVE FEED" : "| OFFLINE"}{isLive && candles.length > 0 && candles[candles.length - 1].t ? ` | Last candle: ${Math.floor((Date.now() - candles[candles.length - 1].t) / 1000)}s ago` : ""}</div>
+          <CandleChart candles={candles} />
         </div>}
 
         {/* AI ENGINE */}
@@ -5224,8 +5314,8 @@ export default function NexusV7() {
             <div style={{ textAlign: "center" }}><div style={{ fontSize: 28, fontWeight: 800, color: K.dn }}>{aiResult.bearScore}%</div><div style={{ fontSize: 9, color: K.txM }}>BEAR</div></div>
           </div>
           <div style={{ display: "flex", justifyContent: "center", gap: 24, marginBottom: 14, flexWrap: "wrap" }}>
-            <div><div style={{ fontSize: 8, color: K.txM, textAlign: "center", marginBottom: 2 }}>TECH MOMENTUM</div><SentimentGauge score={aiResult.sentiment.score} label={aiResult.sentiment.label}/></div>
-            <div><div style={{ fontSize: 8, color: K.txM, textAlign: "center", marginBottom: 2 }}>NEWS</div><SentimentGauge score={clamp(50 + (aiResult.newsImpact?.score || 0), 0, 100)} label={aiResult.newsImpact?.score > 20 ? "Bullish" : aiResult.newsImpact?.score < -20 ? "Bearish" : "Neutral"}/></div>
+            <div><div style={{ fontSize: 8, color: K.txM, textAlign: "center", marginBottom: 2 }}>TECH MOMENTUM</div><SentimentGauge score={aiResult.sentiment.score} label={aiResult.sentiment.label} /></div>
+            <div><div style={{ fontSize: 8, color: K.txM, textAlign: "center", marginBottom: 2 }}>NEWS</div><SentimentGauge score={clamp(50 + (aiResult.newsImpact?.score || 0), 0, 100)} label={aiResult.newsImpact?.score > 20 ? "Bullish" : aiResult.newsImpact?.score < -20 ? "Bearish" : "Neutral"} /></div>
           </div>
           <div style={{ padding: 12, background: K.s2, borderRadius: 8, marginBottom: 14 }}>
             <div style={{ fontSize: 8, color: K.txM, letterSpacing: 1.5, marginBottom: 4 }}>ANALYSIS (28 FACTORS + MTF + CHAIN{MLEngine._trained ? " + ML" : ""})</div>
@@ -5246,7 +5336,7 @@ export default function NexusV7() {
               {aiActive ? "⏸ STOP AI" : "▶ START AI (AUTO-TRADE)"}
             </button>
             <div style={{ fontSize: 9, color: K.txM }}>Risk:</div>
-            <input type="range" min="2" max="25" step="1" value={riskPct} onChange={e => setRiskPct(+e.target.value)}/>
+            <input type="range" min="2" max="25" step="1" value={riskPct} onChange={e => setRiskPct(+e.target.value)} />
             <span style={{ fontSize: 10, color: K.gold, fontWeight: 700 }}>{riskPct}%</span>
           </div>
           {aiResult.sl > 0 && <div style={{ display: "flex", gap: 12, marginTop: 12, flexWrap: "wrap" }}>
@@ -5441,10 +5531,10 @@ export default function NexusV7() {
         {/* TRADE */}
         {tab === "trade" && <div style={S.card}>
           <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 14 }}>MANUAL TRADE | {pair.name}/USDT</div>
-          <div style={{ marginBottom: 10 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>Amount ($)</div><input type="number" value={manualAmt} onChange={e => setManualAmt(e.target.value)} style={S.input}/></div>
+          <div style={{ marginBottom: 10 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>Amount ($)</div><input type="number" value={manualAmt} onChange={e => setManualAmt(e.target.value)} style={S.input} /></div>
           <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
-            <div style={{ flex: 1 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>Stop Loss</div><input type="number" value={manualSL} onChange={e => setManualSL(e.target.value)} placeholder="Optional" style={S.input}/></div>
-            <div style={{ flex: 1 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>Take Profit</div><input type="number" value={manualTP} onChange={e => setManualTP(e.target.value)} placeholder="Optional" style={S.input}/></div>
+            <div style={{ flex: 1 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>Stop Loss</div><input type="number" value={manualSL} onChange={e => setManualSL(e.target.value)} placeholder="Optional" style={S.input} /></div>
+            <div style={{ flex: 1 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>Take Profit</div><input type="number" value={manualTP} onChange={e => setManualTP(e.target.value)} placeholder="Optional" style={S.input} /></div>
           </div>
           {aiResult && aiResult.sl > 0 && <button onClick={() => { setManualSL(fx(aiResult.sl, pair.dp)); setManualTP(fx(aiResult.tp, pair.dp)); }} style={{ ...S.btn(false, K.purple), marginBottom: 10, fontSize: 9 }}>Use AI SL/TP</button>}
           <div style={{ display: "flex", gap: 8 }}>
@@ -5483,7 +5573,7 @@ export default function NexusV7() {
         {tab === "hist" && <div style={S.card}>
           <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 14 }}>TRADE HISTORY | LAST {Math.min(60, history.length)}</div>
           {history.slice(0, 60).map((h, i) => (
-            <div key={h.id || i} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: `1px solid ${K.bd}`, fontSize: 10, animation: `slideIn .1s ${i*.02}s both` }}>
+            <div key={h.id || i} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: `1px solid ${K.bd}`, fontSize: 10, animation: `slideIn .1s ${i * .02}s both` }}>
               <div><span style={{ color: h.side === "LONG" ? K.up : K.dn, fontWeight: 700 }}>{h.side}</span> {h.pairName} {h.isAI && <span style={{ color: K.blue, fontSize: 8 }}>AI</span>}</div>
               <div style={{ color: h.net >= 0 ? K.up : K.dn, fontWeight: 700 }}>{fMoney(h.net)} ({fPct(h.pct)})</div>
               <div style={{ color: K.txM, fontSize: 8 }}>{h.reason} | {timeAgo(h.exitTime)}</div>
@@ -5495,7 +5585,7 @@ export default function NexusV7() {
         {tab === "stats" && <div style={S.card}>
           <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 14 }}>PERFORMANCE ANALYTICS</div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: 8, marginBottom: 14 }}>
-            {[["Trades", stats.total, K.tx], ["Win Rate", fx(stats.winRate,1)+"%", stats.winRate > 50 ? K.up : K.dn], ["Total P&L", fMoney(stats.totalPnl), stats.totalPnl >= 0 ? K.up : K.dn], ["Avg Win", fMoney(stats.avgWin), K.up], ["Avg Loss", "-$"+fx(stats.avgLoss), K.dn], ["Profit Factor", fx(stats.profitFactor,2), stats.profitFactor > 1 ? K.up : K.dn], ["Fees Paid", "$"+fx(stats.totalFees), K.warn], ["Slippage Cost", "$"+fx(stats.totalSlippage), K.warn], ["Total Costs", "$"+fx(stats.totalFees + stats.totalSlippage), "#ff4444"], ["Brain Size", brainStats.brainSize, K.purple], ["Session P&L", fMoney(sessionPnl), sessionPnl >= 0 ? K.up : K.dn], ["Uptime", uptimeStr, K.cyan]].map(([label, val, col]) => (
+            {[["Trades", stats.total, K.tx], ["Win Rate", fx(stats.winRate, 1) + "%", stats.winRate > 50 ? K.up : K.dn], ["Total P&L", fMoney(stats.totalPnl), stats.totalPnl >= 0 ? K.up : K.dn], ["Avg Win", fMoney(stats.avgWin), K.up], ["Avg Loss", "-$" + fx(stats.avgLoss), K.dn], ["Profit Factor", fx(stats.profitFactor, 2), stats.profitFactor > 1 ? K.up : K.dn], ["Fees Paid", "$" + fx(stats.totalFees), K.warn], ["Slippage Cost", "$" + fx(stats.totalSlippage), K.warn], ["Total Costs", "$" + fx(stats.totalFees + stats.totalSlippage), "#ff4444"], ["Brain Size", brainStats.brainSize, K.purple], ["Session P&L", fMoney(sessionPnl), sessionPnl >= 0 ? K.up : K.dn], ["Uptime", uptimeStr, K.cyan]].map(([label, val, col]) => (
               <div key={label} style={S.metric}><div style={{ fontSize: 8, color: K.txM }}>{label}</div><div style={{ fontSize: 14, fontWeight: 800, color: col }}>{val}</div></div>
             ))}
           </div>
@@ -5526,7 +5616,7 @@ export default function NexusV7() {
 
               // Build SVG path
               const linePath = points.map((p, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(p.bal).toFixed(1)}`).join(" ");
-              const areaPath = linePath + ` L${x(points.length-1).toFixed(1)},${(PAD.t+cH).toFixed(1)} L${PAD.l},${(PAD.t+cH).toFixed(1)} Z`;
+              const areaPath = linePath + ` L${x(points.length - 1).toFixed(1)},${(PAD.t + cH).toFixed(1)} L${PAD.l},${(PAD.t + cH).toFixed(1)} Z`;
 
               // Peak & trough for annotations
               let peakIdx = 0, troughIdx = 0, peakVal = 0, troughVal = Infinity;
@@ -5560,55 +5650,55 @@ export default function NexusV7() {
                   <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, fontWeight: 700 }}>📈 EQUITY CURVE</div>
                   <div style={{ display: "flex", gap: 12 }}>
                     <div style={{ fontSize: 9, color: K.txM }}>Peak: <span style={{ color: K.up, fontWeight: 700 }}>${fx(peakVal)}</span></div>
-                    <div style={{ fontSize: 9, color: K.txM }}>DD: <span style={{ color: K.dn, fontWeight: 700 }}>{fx(maxDD,1)}%</span></div>
-                    <div style={{ fontSize: 9, color: K.txM }}>Return: <span style={{ color: curveColor, fontWeight: 700 }}>{totalReturn >= 0 ? "+" : ""}{fx(totalReturn,1)}%</span></div>
+                    <div style={{ fontSize: 9, color: K.txM }}>DD: <span style={{ color: K.dn, fontWeight: 700 }}>{fx(maxDD, 1)}%</span></div>
+                    <div style={{ fontSize: 9, color: K.txM }}>Return: <span style={{ color: curveColor, fontWeight: 700 }}>{totalReturn >= 0 ? "+" : ""}{fx(totalReturn, 1)}%</span></div>
                   </div>
                 </div>
                 <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
                   <defs>
                     <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor={curveColor} stopOpacity="0.25"/>
-                      <stop offset="100%" stopColor={curveColor} stopOpacity="0.02"/>
+                      <stop offset="0%" stopColor={curveColor} stopOpacity="0.25" />
+                      <stop offset="100%" stopColor={curveColor} stopOpacity="0.02" />
                     </linearGradient>
                   </defs>
                   {/* Grid lines */}
                   {yLabels.map((lb, i) => <g key={i}>
-                    <line x1={PAD.l} y1={lb.y} x2={W-PAD.r} y2={lb.y} stroke={K.bd} strokeWidth="0.5" strokeDasharray="3,3"/>
-                    <text x={PAD.l-4} y={lb.y+3} textAnchor="end" fill={K.txD} fontSize="7" fontFamily="'SF Mono',monospace">${fx(lb.val,0)}</text>
+                    <line x1={PAD.l} y1={lb.y} x2={W - PAD.r} y2={lb.y} stroke={K.bd} strokeWidth="0.5" strokeDasharray="3,3" />
+                    <text x={PAD.l - 4} y={lb.y + 3} textAnchor="end" fill={K.txD} fontSize="7" fontFamily="'SF Mono',monospace">${fx(lb.val, 0)}</text>
                   </g>)}
                   {/* Baseline $100 */}
-                  {baseY >= PAD.t && baseY <= PAD.t+cH && <line x1={PAD.l} y1={baseY} x2={W-PAD.r} y2={baseY} stroke={K.txD} strokeWidth="0.7" strokeDasharray="5,3" opacity="0.5"/>}
+                  {baseY >= PAD.t && baseY <= PAD.t + cH && <line x1={PAD.l} y1={baseY} x2={W - PAD.r} y2={baseY} stroke={K.txD} strokeWidth="0.7" strokeDasharray="5,3" opacity="0.5" />}
                   {/* Area fill */}
-                  <path d={areaPath} fill="url(#eqGrad)"/>
+                  <path d={areaPath} fill="url(#eqGrad)" />
                   {/* Main line */}
-                  <path d={linePath} fill="none" stroke={curveColor} strokeWidth="1.8" strokeLinejoin="round" strokeLinecap="round"/>
+                  <path d={linePath} fill="none" stroke={curveColor} strokeWidth="1.8" strokeLinejoin="round" strokeLinecap="round" />
                   {/* Trade dots */}
-                  {points.slice(1).map((p, i) => <circle key={i} cx={x(i+1)} cy={y(p.bal)} r={p.net >= 0 ? 2.5 : 2} fill={p.net >= 0 ? K.up : K.dn} opacity="0.8" stroke={K.s1} strokeWidth="0.5"/>)}
+                  {points.slice(1).map((p, i) => <circle key={i} cx={x(i + 1)} cy={y(p.bal)} r={p.net >= 0 ? 2.5 : 2} fill={p.net >= 0 ? K.up : K.dn} opacity="0.8" stroke={K.s1} strokeWidth="0.5" />)}
                   {/* Peak marker */}
-                  <circle cx={x(peakIdx)} cy={y(peakVal)} r="3.5" fill="none" stroke={K.up} strokeWidth="1.2"/>
-                  <text x={x(peakIdx)} y={y(peakVal)-6} textAnchor="middle" fill={K.up} fontSize="7" fontWeight="700" fontFamily="'SF Mono',monospace">ATH</text>
+                  <circle cx={x(peakIdx)} cy={y(peakVal)} r="3.5" fill="none" stroke={K.up} strokeWidth="1.2" />
+                  <text x={x(peakIdx)} y={y(peakVal) - 6} textAnchor="middle" fill={K.up} fontSize="7" fontWeight="700" fontFamily="'SF Mono',monospace">ATH</text>
                   {/* Max drawdown marker */}
                   {maxDD > 2 && <g>
-                    <circle cx={x(maxDDIdx)} cy={y(points[maxDDIdx].bal)} r="3.5" fill="none" stroke={K.dn} strokeWidth="1.2"/>
-                    <text x={x(maxDDIdx)} y={y(points[maxDDIdx].bal)+11} textAnchor="middle" fill={K.dn} fontSize="6" fontWeight="700" fontFamily="'SF Mono',monospace">-{fx(maxDD,1)}%</text>
+                    <circle cx={x(maxDDIdx)} cy={y(points[maxDDIdx].bal)} r="3.5" fill="none" stroke={K.dn} strokeWidth="1.2" />
+                    <text x={x(maxDDIdx)} y={y(points[maxDDIdx].bal) + 11} textAnchor="middle" fill={K.dn} fontSize="6" fontWeight="700" fontFamily="'SF Mono',monospace">-{fx(maxDD, 1)}%</text>
                   </g>}
                   {/* X-axis: first and last date */}
-                  <text x={PAD.l} y={H-4} fill={K.txD} fontSize="6.5" fontFamily="'SF Mono',monospace">{new Date(points[0].time).toLocaleDateString("en",{month:"short",day:"numeric"})}</text>
-                  <text x={W-PAD.r} y={H-4} textAnchor="end" fill={K.txD} fontSize="6.5" fontFamily="'SF Mono',monospace">{new Date(points[points.length-1].time).toLocaleDateString("en",{month:"short",day:"numeric"})}</text>
+                  <text x={PAD.l} y={H - 4} fill={K.txD} fontSize="6.5" fontFamily="'SF Mono',monospace">{new Date(points[0].time).toLocaleDateString("en", { month: "short", day: "numeric" })}</text>
+                  <text x={W - PAD.r} y={H - 4} textAnchor="end" fill={K.txD} fontSize="6.5" fontFamily="'SF Mono',monospace">{new Date(points[points.length - 1].time).toLocaleDateString("en", { month: "short", day: "numeric" })}</text>
                   {/* Current equity endpoint */}
-                  <circle cx={x(points.length-1)} cy={y(finalBal)} r="3" fill={curveColor}/>
-                  <text x={x(points.length-1)-4} y={y(finalBal)-6} textAnchor="end" fill={curveColor} fontSize="7" fontWeight="700" fontFamily="'SF Mono',monospace">${fx(finalBal)}</text>
+                  <circle cx={x(points.length - 1)} cy={y(finalBal)} r="3" fill={curveColor} />
+                  <text x={x(points.length - 1) - 4} y={y(finalBal) - 6} textAnchor="end" fill={curveColor} fontSize="7" fontWeight="700" fontFamily="'SF Mono',monospace">${fx(finalBal)}</text>
                 </svg>
                 {/* Legend */}
                 <div style={{ display: "flex", justifyContent: "center", gap: 16, marginTop: 6 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 8, color: K.txD }}>
-                    <div style={{ width: 6, height: 6, borderRadius: "50%", background: K.up }}/>Win
+                    <div style={{ width: 6, height: 6, borderRadius: "50%", background: K.up }} />Win
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 8, color: K.txD }}>
-                    <div style={{ width: 5, height: 5, borderRadius: "50%", background: K.dn }}/>Loss
+                    <div style={{ width: 5, height: 5, borderRadius: "50%", background: K.dn }} />Loss
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 8, color: K.txD }}>
-                    <div style={{ width: 8, height: 1, background: K.txD }}/>$100 baseline
+                    <div style={{ width: 8, height: 1, background: K.txD }} />$100 baseline
                   </div>
                 </div>
               </div>;
@@ -5629,7 +5719,7 @@ export default function NexusV7() {
                 buckets[key] = (buckets[key] || 0) + 1;
               });
               const sorted = Object.entries(buckets).sort((a, b) => parseFloat(a[0]) - parseFloat(b[0]));
-              const maxCount = Math.max(...sorted.map(([,c]) => c), 1);
+              const maxCount = Math.max(...sorted.map(([, c]) => c), 1);
               return <div style={{ background: K.s2, borderRadius: 10, padding: 14 }}>
                 <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, fontWeight: 700, marginBottom: 10 }}>📊 P&L DISTRIBUTION</div>
                 <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 60 }}>
@@ -5639,8 +5729,8 @@ export default function NexusV7() {
                     const col = bVal >= 0 ? K.up : K.dn;
                     return <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center" }}>
                       <div style={{ fontSize: 7, color: K.txD, marginBottom: 2 }}>{count}</div>
-                      <div style={{ width: "100%", height: `${Math.max(pct, 8)}%`, background: col, borderRadius: "3px 3px 0 0", opacity: 0.7, minHeight: 3 }}/>
-                      <div style={{ fontSize: 6, color: K.txD, marginTop: 2 }}>${bVal >= 0 ? "+" : ""}{fx(bVal,0)}</div>
+                      <div style={{ width: "100%", height: `${Math.max(pct, 8)}%`, background: col, borderRadius: "3px 3px 0 0", opacity: 0.7, minHeight: 3 }} />
+                      <div style={{ fontSize: 6, color: K.txD, marginTop: 2 }}>${bVal >= 0 ? "+" : ""}{fx(bVal, 0)}</div>
                     </div>;
                   })}
                 </div>
@@ -5655,7 +5745,7 @@ export default function NexusV7() {
         {tab === "brain" && <div style={S.card}>
           <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 14 }}>SELF-LEARNING BRAIN | {brainStats.brainSize} PATTERNS</div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: 8, marginBottom: 14 }}>
-            {[["Losses Rec", brainStats.totalLosses, K.dn], ["Wins Rec", brainStats.totalWins, K.up], ["This Week", brainStats.weekLosses + " losses", K.warn], ["Loss Blocked", "$"+fx(brainStats.totalLossPrevented), K.dn], ["Win Value", "$"+fx(brainStats.totalWinValue), K.up]].map(([label, val, col]) => (
+            {[["Losses Rec", brainStats.totalLosses, K.dn], ["Wins Rec", brainStats.totalWins, K.up], ["This Week", brainStats.weekLosses + " losses", K.warn], ["Loss Blocked", "$" + fx(brainStats.totalLossPrevented), K.dn], ["Win Value", "$" + fx(brainStats.totalWinValue), K.up]].map(([label, val, col]) => (
               <div key={label} style={S.metric}><div style={{ fontSize: 8, color: K.txM }}>{label}</div><div style={{ fontSize: 13, fontWeight: 700, color: col }}>{val}</div></div>
             ))}
           </div>
@@ -5677,7 +5767,7 @@ export default function NexusV7() {
           {/* Exit Reason Stats v7.5 */}
           {brainStats.exitReasonStats && Object.keys(brainStats.exitReasonStats).length > 0 && <div style={{ padding: 10, background: K.s2, borderRadius: 8, marginBottom: 12 }}>
             <div style={{ fontSize: 8, color: K.txM, marginBottom: 4 }}>EXIT REASON ANALYSIS (This Week)</div>
-            {Object.entries(brainStats.exitReasonStats).sort((a,b) => b[1] - a[1]).map(([reason, count], i) => (
+            {Object.entries(brainStats.exitReasonStats).sort((a, b) => b[1] - a[1]).map(([reason, count], i) => (
               <div key={i} style={{ fontSize: 9, color: count >= 3 ? K.dn : K.warn, padding: "3px 0", borderBottom: `1px solid ${K.bd}` }}>
                 {reason}: <span style={{ fontWeight: 700 }}>{count}x</span> {count >= 3 ? " ⚠️ BLOCKING" : ""}
               </div>
@@ -5727,7 +5817,7 @@ export default function NexusV7() {
                 setJournalReports(TradeJournal.getReports());
                 if (report.error) addLog("WARN", "Journal: " + report.error);
                 else addLog("AI", `Journal report generated: Grade ${report.grade}`);
-              } catch(e) { addLog("ERR", "Journal failed"); }
+              } catch (e) { addLog("ERR", "Journal failed"); }
               finally { setJournalLoading(false); }
             }} disabled={journalLoading} style={{ padding: "6px 16px", borderRadius: 6, background: (geminiKey || groqKey) ? K.cyan + "20" : K.s3, border: `1px solid ${(geminiKey || groqKey) ? K.cyan + "40" : K.bd}`, color: (geminiKey || groqKey) ? K.cyan : K.txD, fontSize: 9, fontWeight: 700, cursor: (geminiKey || groqKey) ? "pointer" : "not-allowed", fontFamily: "inherit" }}>
               {journalLoading ? "ANALYZING..." : "GENERATE REPORT"}
@@ -5825,7 +5915,7 @@ export default function NexusV7() {
                   addLog("ML", `Training failed: ${result.reason}`);
                 }
                 setMlStats(MLEngine.getStats());
-              } catch(e) { addLog("ML", "Training error: " + (e?.message || "unknown")); } finally { setMlTraining(false); }
+              } catch (e) { addLog("ML", "Training error: " + (e?.message || "unknown")); } finally { setMlTraining(false); }
             }} style={{ padding: "8px 20px", borderRadius: 6, background: (mlStats?.totalSamples || 0) >= (mlStats?.minSamples || 30) ? K.cyan + "20" : K.s3, border: `1px solid ${(mlStats?.totalSamples || 0) >= (mlStats?.minSamples || 30) ? K.cyan + "40" : K.bd}`, color: (mlStats?.totalSamples || 0) >= (mlStats?.minSamples || 30) ? K.cyan : K.txD, fontSize: 9, fontWeight: 700, cursor: (mlStats?.totalSamples || 0) >= (mlStats?.minSamples || 30) ? "pointer" : "not-allowed", fontFamily: "inherit" }}>
               {mlTraining ? "TRAINING..." : "TRAIN MODEL"}
             </button>
@@ -5835,13 +5925,13 @@ export default function NexusV7() {
               const blob = new Blob([csv], { type: "text/csv" });
               const url = URL.createObjectURL(blob);
               const a = document.createElement("a");
-              a.href = url; a.download = `nexus-ml-data-${new Date().toISOString().slice(0,10)}.csv`;
+              a.href = url; a.download = `nexus-ml-data-${new Date().toISOString().slice(0, 10)}.csv`;
               a.click(); URL.revokeObjectURL(url);
               addLog("ML", `Exported ${mlStats?.totalSamples || 0} samples as CSV`);
             }} disabled={(mlStats?.totalSamples || 0) === 0} style={{ padding: "8px 16px", borderRadius: 6, background: K.s3, border: `1px solid ${K.bd}`, color: K.tx, fontSize: 9, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
               EXPORT CSV (COLAB)
             </button>
-            <button onClick={() => { if (window.confirm("Reset ML model? Training data preserved.")) { MLEngine.reset(); setMlStats(MLEngine.getStats()); addLog("ML", "Model reset"); }}} style={{ padding: "8px 16px", borderRadius: 6, background: K.s3, border: `1px solid ${K.dn}30`, color: K.dn, fontSize: 9, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
+            <button onClick={() => { if (window.confirm("Reset ML model? Training data preserved.")) { MLEngine.reset(); setMlStats(MLEngine.getStats()); addLog("ML", "Model reset"); } }} style={{ padding: "8px 16px", borderRadius: 6, background: K.s3, border: `1px solid ${K.dn}30`, color: K.dn, fontSize: 9, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
               RESET MODEL
             </button>
           </div>
@@ -5889,10 +5979,10 @@ export default function NexusV7() {
           <div style={{ marginTop: 16, padding: 12, background: K.s2, borderRadius: 8, border: `1px solid ${K.bd}` }}>
             <div style={{ fontSize: 9, color: K.cyan, fontWeight: 700, marginBottom: 6 }}>ADVANCED: GOOGLE COLAB TRAINING</div>
             <div style={{ fontSize: 9, color: K.txD, lineHeight: 1.6 }}>
-              1. Export CSV above with your trade data<br/>
-              2. Upload to Google Colab notebook<br/>
-              3. Train XGBoost/RandomForest with: <span style={{ fontFamily: "monospace", color: K.txM }}>pip install xgboost scikit-learn</span><br/>
-              4. Export model as ONNX: <span style={{ fontFamily: "monospace", color: K.txM }}>pip install skl2onnx onnxruntime</span><br/>
+              1. Export CSV above with your trade data<br />
+              2. Upload to Google Colab notebook<br />
+              3. Train XGBoost/RandomForest with: <span style={{ fontFamily: "monospace", color: K.txM }}>pip install xgboost scikit-learn</span><br />
+              4. Export model as ONNX: <span style={{ fontFamily: "monospace", color: K.txM }}>pip install skl2onnx onnxruntime</span><br />
               5. The in-browser neural net auto-trains and improves as you collect more data
             </div>
           </div>
@@ -5913,7 +6003,7 @@ export default function NexusV7() {
                 <div style={{ fontSize: 10, color: K.txD, marginBottom: 6 }}>{z.traits}</div>
                 <div style={{ display: "flex", gap: 10, fontSize: 9 }}>
                   <span style={{ color: K.up }}>W: {perf.wins}</span><span style={{ color: K.dn }}>L: {perf.losses}</span>
-                  <span style={{ color: perf.winRate > 50 ? K.up : K.dn }}>WR: {fx(perf.winRate,0)}%</span>
+                  <span style={{ color: perf.winRate > 50 ? K.up : K.dn }}>WR: {fx(perf.winRate, 0)}%</span>
                   <span style={{ color: K.gold }}>Vol: {z.volProfile}</span><span style={{ color: K.txM }}>Bias: {z.bias}</span>
                 </div>
               </div>
@@ -5937,12 +6027,12 @@ export default function NexusV7() {
 
             <div style={{ fontSize: 12, fontWeight: 700, color: K.cyan, marginBottom: 8, marginTop: 16 }}>LLM Brain (Groq AI — Recommended)</div>
             <div style={{ fontSize: 9, color: K.txD, marginBottom: 8 }}>Primary AI provider. 30 req/min, 14,400/day free. Get key from <span style={{ color: K.cyan }}>console.groq.com</span></div>
-            <div style={{ marginBottom: 8 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>Groq API Key</div><input type="password" value={groqKey} onChange={e => setGroqKey(e.target.value.trim())} placeholder="Enter Groq API Key (free — recommended)" style={S.input}/></div>
+            <div style={{ marginBottom: 8 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>Groq API Key</div><input type="password" value={groqKey} onChange={e => setGroqKey(e.target.value.trim())} placeholder="Enter Groq API Key (free — recommended)" style={S.input} /></div>
 
             <div style={{ fontSize: 12, fontWeight: 700, color: K.txM, marginBottom: 8, marginTop: 12 }}>LLM Fallback (Gemini AI)</div>
             <div style={{ fontSize: 9, color: K.txD, marginBottom: 8 }}>Backup provider if Groq hits limits. 15 req/min, 1,500/day. Get key from <span style={{ color: K.cyan }}>aistudio.google.com/apikey</span></div>
-            <div style={{ marginBottom: 8 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>Gemini API Key</div><input type="password" value={geminiKey} onChange={e => setGeminiKey(e.target.value.trim())} placeholder="Enter Gemini API Key (free — fallback)" style={S.input}/></div>
-            <button onClick={() => { const gk = groqKey.trim(); const gmk = geminiKey.trim(); if (gk && !gk.startsWith("gsk_")) { addLog("WARN", "Groq key should start with gsk_ - check your key"); } DB.set("api_settings", { apiKey, tradingMode, geminiKey: gmk, groqKey: gk }); setGroqKey(gk); setGeminiKey(gmk); LLMEngine._consecutiveErrors = 0; LLMEngine._lastError = ""; LLMEngine._backoffUntil = 0; LLMEngine._lastCall = 0; LLMEngine._quotaHits = { groq: 0, gemini: 0 }; LLMEngine._keyInvalid = { groq: false, gemini: false }; setLlmRefresh(r => r + 1); console.log("LLM Keys saved - Groq:", gk ? gk.substring(0,8) + "..." + gk.substring(gk.length-4) : "none", "Gemini:", gmk ? gmk.substring(0,8) + "..." : "none"); addLog("AI", (gk ? "Groq" : "") + (gk && gmk ? " + " : "") + (gmk ? "Gemini" : "") + (gk || gmk ? " key(s) saved" : "LLM Brain disconnected")); }} style={{ ...S.btn(true, K.cyan), marginBottom: 10, fontSize: 10 }}>Save LLM Keys</button>
+            <div style={{ marginBottom: 8 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>Gemini API Key</div><input type="password" value={geminiKey} onChange={e => setGeminiKey(e.target.value.trim())} placeholder="Enter Gemini API Key (free — fallback)" style={S.input} /></div>
+            <button onClick={() => { const gk = groqKey.trim(); const gmk = geminiKey.trim(); if (gk && !gk.startsWith("gsk_")) { addLog("WARN", "Groq key should start with gsk_ - check your key"); } DB.set("api_settings", { apiKey, tradingMode, geminiKey: gmk, groqKey: gk }); setGroqKey(gk); setGeminiKey(gmk); LLMEngine._consecutiveErrors = 0; LLMEngine._lastError = ""; LLMEngine._backoffUntil = 0; LLMEngine._lastCall = 0; LLMEngine._quotaHits = { groq: 0, gemini: 0 }; LLMEngine._keyInvalid = { groq: false, gemini: false }; setLlmRefresh(r => r + 1); console.log("LLM Keys saved - Groq:", gk ? gk.substring(0, 8) + "..." + gk.substring(gk.length - 4) : "none", "Gemini:", gmk ? gmk.substring(0, 8) + "..." : "none"); addLog("AI", (gk ? "Groq" : "") + (gk && gmk ? " + " : "") + (gmk ? "Gemini" : "") + (gk || gmk ? " key(s) saved" : "LLM Brain disconnected")); }} style={{ ...S.btn(true, K.cyan), marginBottom: 10, fontSize: 10 }}>Save LLM Keys</button>
             {(groqKey || geminiKey) && <div style={{ fontSize: 8, color: K.cyan, padding: 8, background: K.cyan + "08", borderRadius: 6, marginBottom: 8 }}>
               LLM ACTIVE: {groqKey ? "Groq (primary)" : ""}{groqKey && geminiKey ? " + " : ""}{geminiKey ? "Gemini (fallback)" : ""} — Smart change detection saves 60-80% of API calls. Adaptive intervals: 45s volatile → 180s ranging. {LLMEngine._callCount} analyses this session.
             </div>}
@@ -5955,9 +6045,9 @@ export default function NexusV7() {
               Backup brain data, trades, and settings to the cloud. Survives browser clears and works across devices. Free 500MB on <span style={{ color: K.cyan }}>supabase.com</span>
             </div>
 
-            <div style={{ marginBottom: 8 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>Supabase Project URL</div><input type="text" value={cloudUrl} onChange={e => setCloudUrl(e.target.value)} placeholder="https://your-project.supabase.co" style={S.input}/></div>
-            <div style={{ marginBottom: 8 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>Supabase Anon Key</div><input type="password" value={cloudKey} onChange={e => setCloudKey(e.target.value)} placeholder="eyJhbGciOi... (from Project Settings → API)" style={S.input}/></div>
-            <div style={{ marginBottom: 10 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>Your Sync ID (any unique name — same across devices)</div><input type="text" value={cloudUserId} onChange={e => setCloudUserId(e.target.value)} placeholder="e.g. mohammed-nexus or any-unique-id" style={S.input}/></div>
+            <div style={{ marginBottom: 8 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>Supabase Project URL</div><input type="text" value={cloudUrl} onChange={e => setCloudUrl(e.target.value)} placeholder="https://your-project.supabase.co" style={S.input} /></div>
+            <div style={{ marginBottom: 8 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>Supabase Anon Key</div><input type="password" value={cloudKey} onChange={e => setCloudKey(e.target.value)} placeholder="eyJhbGciOi... (from Project Settings → API)" style={S.input} /></div>
+            <div style={{ marginBottom: 10 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>Your Sync ID (any unique name — same across devices)</div><input type="text" value={cloudUserId} onChange={e => setCloudUserId(e.target.value)} placeholder="e.g. mohammed-nexus or any-unique-id" style={S.input} /></div>
 
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
               <button onClick={() => {
@@ -6025,8 +6115,8 @@ CREATE POLICY "Allow all operations" ON nexus_data
           <div style={{ padding: 14, background: K.s2, borderRadius: 8, marginBottom: 14 }}>
             <div style={{ fontSize: 12, fontWeight: 700, color: K.warn, marginBottom: 8, marginTop: 0 }}>Binance API Keys</div>
             <div style={{ fontSize: 9, color: K.txD, marginBottom: 8 }}>Connect your Binance account for live trading. Only enable when AI is profitable over 50+ trades.</div>
-            <div style={{ marginBottom: 8 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>API Key</div><input type="text" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="Enter Binance API Key" style={S.input}/></div>
-            <div style={{ marginBottom: 8 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>API Secret</div><input type="password" value={apiSecret} onChange={e => setApiSecret(e.target.value)} placeholder="Enter Binance API Secret" style={S.input}/></div>
+            <div style={{ marginBottom: 8 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>API Key</div><input type="text" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="Enter Binance API Key" style={S.input} /></div>
+            <div style={{ marginBottom: 8 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>API Secret</div><input type="password" value={apiSecret} onChange={e => setApiSecret(e.target.value)} placeholder="Enter Binance API Secret" style={S.input} /></div>
             <button onClick={() => { DB.set("api_settings", { apiKey, tradingMode, geminiKey, groqKey }); LLMEngine._consecutiveErrors = 0; LLMEngine._lastError = ""; LLMEngine._backoffUntil = 0; LLMEngine._lastCall = 0; setLlmRefresh(r => r + 1); addLog("AI", "API settings saved"); }} style={{ ...S.btn(true, K.up), marginBottom: 10, fontSize: 10 }}>Save API Keys</button>
             <div style={{ fontSize: 8, color: K.dn, padding: 8, background: K.dn + "08", borderRadius: 6 }}>
               WARNING: Live trading uses real money. Only enable when your AI brain has 50+ patterns and win rate above 55%.
@@ -6037,8 +6127,8 @@ CREATE POLICY "Allow all operations" ON nexus_data
           <div style={{ padding: 14, background: K.s2, borderRadius: 8, marginBottom: 14 }}>
             <div style={{ fontSize: 12, fontWeight: 700, color: K.warn, marginBottom: 8 }}>Account</div>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              <button onClick={() => { if (window.confirm("Reset balance to $100?")) { setBalance(INITIAL_BALANCE); setPositions([]); setHistory([]); setSessionPnl(0); setSessionTradeCount(0); setSessionProfit(0); addLog("AI", "Account reset to $100"); }}} style={{ ...S.btn(false, K.warn), fontSize: 10 }}>Reset Balance to $100</button>
-              <button onClick={() => { if (window.confirm("Delete ALL data including brain?")) { Brain.reset(); setBrainStats(Brain.getStats()); MLEngine.reset(); setMlStats(MLEngine.getStats()); setBalance(INITIAL_BALANCE); setPositions([]); setHistory([]); setSessionPnl(0); setSessionTradeCount(0); setSessionProfit(0); DB.remove("state7"); addLog("AI", "Full reset complete"); }}} style={{ ...S.btn(false, K.dn), fontSize: 10 }}>Full Reset (Delete Everything)</button>
+              <button onClick={() => { if (window.confirm("Reset balance to $100?")) { setBalance(INITIAL_BALANCE); setPositions([]); setHistory([]); setSessionPnl(0); setSessionTradeCount(0); setSessionProfit(0); addLog("AI", "Account reset to $100"); } }} style={{ ...S.btn(false, K.warn), fontSize: 10 }}>Reset Balance to $100</button>
+              <button onClick={() => { if (window.confirm("Delete ALL data including brain?")) { Brain.reset(); setBrainStats(Brain.getStats()); MLEngine.reset(); setMlStats(MLEngine.getStats()); setBalance(INITIAL_BALANCE); setPositions([]); setHistory([]); setSessionPnl(0); setSessionTradeCount(0); setSessionProfit(0); DB.remove("state7"); addLog("AI", "Full reset complete"); } }} style={{ ...S.btn(false, K.dn), fontSize: 10 }}>Full Reset (Delete Everything)</button>
             </div>
           </div>
         </div>}
@@ -6048,7 +6138,7 @@ CREATE POLICY "Allow all operations" ON nexus_data
           <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 10 }}>ACTIVITY LOG | 24/7 | {logs.length} ENTRIES</div>
           <div style={{ maxHeight: 500, overflowY: "auto" }}>
             {logs.map((l, i) => (
-              <div key={l.id} style={{ display: "flex", gap: 8, padding: "4px 0", borderBottom: `1px solid ${K.bd}`, fontSize: 10, animation: `slideIn .1s ${i*.01}s both` }}>
+              <div key={l.id} style={{ display: "flex", gap: 8, padding: "4px 0", borderBottom: `1px solid ${K.bd}`, fontSize: 10, animation: `slideIn .1s ${i * .01}s both` }}>
                 <span style={{ color: K.txM, fontSize: 8, minWidth: 60 }}>{l.time}</span>
                 <span style={{ minWidth: 38, fontWeight: 700, fontSize: 8, color: l.type === "WIN" ? K.up : l.type === "LOSS" ? K.dn : l.type === "AI" ? K.cyan : l.type === "LLM" ? K.purple : l.type === "CHAIN" ? K.gold : l.type === "CLOUD" ? "#4caf50" : l.type === "TRADE" ? K.gold : l.type === "WARN" ? K.warn : l.type === "ERR" ? K.dn : K.txD }}>{l.type}</span>
                 <span style={{ color: K.txD }}>{l.msg}</span>
