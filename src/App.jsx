@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v8.0 — 140 IQ TRADING INTELLIGENCE (PRODUCTION GRADE)
+// NEXUS v9.0 — DYNAMIC IQ TRADING INTELLIGENCE (PRODUCTION GRADE)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // ✦ IQ ENGINE — Partial profit, conviction sizing, multi-stage trailing
 // ✦ FULL PERSISTENCE — Balance, positions, brain survive page refresh
@@ -40,8 +40,8 @@ const MIN_STACK_DISTANCE_PCT = 0.25; // Min 0.25% price distance between stacked
 const STACK_SIZE_DECAY = [1, 0.8, 0.6, 0.45, 0.3]; // Position size multiplier: 1st=100%, 2nd=80%, 3rd=60%, 4th=45%, 5th=30%
 const COOL_AFTER_LOSS_BASE = 60000;   // 1min base cooldown (v8: faster recovery)
 const COOL_AFTER_LOSS_MAX = 300000;   // 5min max cooldown (v8: less time wasted)
-const MAX_TRADES_PER_SESSION = 20;
-const MIN_CONF_TO_TRADE = 42;
+const MAX_TRADES_PER_SESSION = 8;
+const MIN_CONF_TO_TRADE = 58;
 // ═══ PRICE SANITY — Prevent fake PnL from stale/fallback prices ═══
 const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real
 const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real
@@ -99,7 +99,7 @@ function detectStopHunt(candles) {
 // ║  IQ ENGINE v8 — SMART MONEY CONSTANTS                       ║
 // ║  Partial Profits + Conviction Sizing + Volatility Filter     ║
 // ╚══════════════════════════════════════════════════════════════╝
-const PARTIAL_PROFIT_PCT = 1.8;       // Take 50% off at 1.8% profit (clears fees with margin)
+const PARTIAL_PROFIT_PCT = 2.5;       // Take 50% off at 2.5% profit (v9: raised to match wider SL/TP structure)
 const PARTIAL_PROFIT_RATIO = 0.5;     // Close 50% of position at first target
 const BREAKEVEN_AFTER_PARTIAL = true; // Move SL to breakeven after partial (THE KEY: can't lose after this)
 const CONVICTION_SIZING = true;       // Scale position size with conviction score
@@ -1134,23 +1134,23 @@ const AdaptiveTPSL = {
       const regimeWins = (brainWins || []).filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
       const regimeLosses = (brainLosses || []).filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
 
-      // Default ATR multipliers
-      let slMult = 1.5;
-      let tpMult = 4.0;
+      // Default ATR multipliers — v9: widened to survive 15m noise
+      let slMult = 2.2;
+      let tpMult = 5.5;
 
-      // Adaptive based on regime
+      // Adaptive based on regime — v9: all SL widened, TP scaled to maintain R:R
       if (regime === "trending") {
-        tpMult = 5.5;  // Trending: let winners run far
-        slMult = 1.8;  // Wider SL to avoid noise
+        tpMult = 7.0;  // Trending: let winners run far
+        slMult = 2.5;  // Wide SL to survive pullbacks
       } else if (regime === "volatile") {
-        tpMult = 3.5;  // Take profit faster in chaos
-        slMult = 2.2;  // Wider SL for volatility
+        tpMult = 5.0;  // Take profit faster in chaos
+        slMult = 3.0;  // Wide SL for volatility
       } else if (regime === "ranging") {
-        tpMult = 3.0;  // Tight TP in range
-        slMult = 1.2;  // Tight SL
+        tpMult = 4.5;  // Tighter TP in range but still clears fees
+        slMult = 2.0;  // Wider than before — 1.2x was suicide
       } else if (regime === "squeeze") {
-        tpMult = 6.0;  // Breakout potential: wide TP
-        slMult = 1.5;  // Moderate SL
+        tpMult = 8.0;  // Breakout potential: wide TP
+        slMult = 2.2;  // Moderate SL
       }
 
       // Adjust based on win rate history
@@ -1176,17 +1176,17 @@ const AdaptiveTPSL = {
         tp = price - atrVal * tpMult;
       }
 
-      // Enforce minimum TP of 2%
-      const minTpDist = price * 0.02;
+      // Enforce minimum TP of 2.5% — v9: raised to match wider SL + fee clearance
+      const minTpDist = price * 0.025;
       if (action === "LONG" && tp - price < minTpDist) tp = price + minTpDist;
       if (action === "SHORT" && price - tp < minTpDist) tp = price - minTpDist;
 
       return { sl, tp, slMult, tpMult, regime, adapted: total >= 5, historyCount: total };
     } catch {
-      // Fallback to basic ATR
-      const sl = action === "LONG" ? price - atrVal * 1.5 : price + atrVal * 1.5;
-      const tp = action === "LONG" ? price + atrVal * 4.0 : price - atrVal * 4.0;
-      return { sl, tp, slMult: 1.5, tpMult: 4.0, regime: "unknown", adapted: false, historyCount: 0 };
+      // Fallback to basic ATR — v9: widened
+      const sl = action === "LONG" ? price - atrVal * 2.2 : price + atrVal * 2.2;
+      const tp = action === "LONG" ? price + atrVal * 5.5 : price - atrVal * 5.5;
+      return { sl, tp, slMult: 2.2, tpMult: 5.5, regime: "unknown", adapted: false, historyCount: 0 };
     }
   },
 };
@@ -3592,7 +3592,7 @@ const MTFEngine = {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // AI DECISION ENGINE v7 — 26 FACTORS + NEWS + SESSIONS + FAKE + BRAIN + SOCIAL + MACRO + MTF
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, socialFG, socialReddit, macroInfo, onChainInfo, mtfData, fundingInfo, orderBookInfo, correlationInfo, liqInfo) {
+function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, socialFG, socialReddit, macroInfo, onChainInfo, mtfData, fundingInfo, orderBookInfo, correlationInfo, liqInfo, timeframe, history) {
   const WAIT = (reasons, ind = {}, extra = {}) => ({
     action: "WAIT", confidence: 0, sl: 0, tp: 0, reasons, indicators: ind, bullScore: "50.0", bearScore: "50.0",
     riskLevel: "-", analysis: extra, sentiment: { score: 50, label: "-" }, patterns: [],
@@ -3887,9 +3887,9 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     if (atrPct > 3 || volRatio > 3 || regime === "volatile") riskLevel = "HIGH";
     else if (atrPct > 1.5 || volRatio > 2) riskLevel = "MED";
 
-    // ═══ TUNED THRESHOLDS v7.4 — Quality over quantity, must clear fee drag ═══
-    const confThreshold = riskLevel === "HIGH" ? 42 : riskLevel === "MED" ? 36 : 30;
-    const pctThreshold = riskLevel === "HIGH" ? 58 : riskLevel === "MED" ? 55 : 52;
+    // ═══ TUNED THRESHOLDS v9 — PERMANENT FIX: Only A/B grade setups ═══
+    const confThreshold = riskLevel === "HIGH" ? 58 : riskLevel === "MED" ? 52 : 46;
+    const pctThreshold = riskLevel === "HIGH" ? 63 : riskLevel === "MED" ? 60 : 57;
 
     let action = "WAIT";
     let sl = 0, tp = 0;
@@ -3943,25 +3943,112 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     }
 
     finalConf = clamp(finalConf, 0, 95);
-    // ═══ FEE CLEARANCE GATE v8.0 — Reject trades where TP can't overcome round-trip costs ═══
-    if (action !== "WAIT" && sl > 0 && tp > 0) {
-      const tpPct = Math.abs(tp - price) / price * 100;
-      const slPct = Math.abs(sl - price) / price * 100;
-      const feeDrag = 0.45; // 0.2% entry + 0.2% exit + ~0.05% slippage
-      const minTpPct = feeDrag * 3.5; // v8: TP must be at least 3.5x fee drag (~1.58%) for real profit
-      if (tpPct < minTpPct) {
+
+    // ╔══════════════════════════════════════════════════════════════════╗
+    // ║  PERMANENT FIX v9: STRUCTURAL GATES — 5 layers of protection    ║
+    // ║  These prevent the recurring cycle of fixing one thing and       ║
+    // ║  breaking another. Every trade must pass ALL gates.              ║
+    // ╚══════════════════════════════════════════════════════════════════╝
+
+    // ═══ GATE 1: MULTI-CONFIRMATION QUALITY — Require 3+ independent confirmations ═══
+    if (action !== "WAIT") {
+      let confirmations = 0;
+      const confReasons = [];
+      // 1. MTF alignment
+      if (mtf && ((action === "LONG" && mtf.trend === "bullish") || (action === "SHORT" && mtf.trend === "bearish"))) { confirmations++; confReasons.push("MTF"); }
+      // 2. Regime favorable
+      if ((regime === "trending" && trendStr > 0 && action === "LONG") || (regime === "trending" && trendStr < 0 && action === "SHORT") || regime === "squeeze") { confirmations++; confReasons.push("Regime"); }
+      // 3. Order book support
+      if (obSignal.live && ((action === "LONG" && obSignal.score > 4) || (action === "SHORT" && obSignal.score < -4))) { confirmations++; confReasons.push("OB"); }
+      // 4. Momentum confirmation (MACD + EMA alignment)
+      if ((action === "LONG" && macdDir === "bull" && curEma9 > curEma21) || (action === "SHORT" && macdDir === "bear" && curEma9 < curEma21)) { confirmations++; confReasons.push("Mom"); }
+      // 5. Candle pattern or stop hunt confirmation
+      const sh = detectStopHunt(candles);
+      if (sh.signal === action && sh.strength > 30) { confirmations++; confReasons.push("StopHunt"); }
+      if (candlePatterns.length > 0 && candlePatterns[0].bias === (action === "LONG" ? "bull" : "bear")) { confirmations++; confReasons.push("Pattern"); }
+      // 6. Funding rate supports direction (contrarian)
+      if (fundingSignal.live && ((action === "LONG" && fundingSignal.score > 3) || (action === "SHORT" && fundingSignal.score < -3))) { confirmations++; confReasons.push("Funding"); }
+
+      const minConfirmations = riskLevel === "HIGH" ? 4 : 3;
+      if (confirmations < minConfirmations) {
         action = "WAIT";
-        reasons.unshift(`TP ${tpPct.toFixed(2)}% < ${minTpPct.toFixed(1)}% min (can't clear fees)`);
-      }
-      // Risk:reward must be at least 2:1 after fees (was 1.5:1 — too low)
-      const netTP = tpPct - feeDrag;
-      const netSL = slPct + feeDrag;
-      if (netTP > 0 && netSL > 0 && netTP / netSL < 2.0) {
-        action = "WAIT";
-        reasons.unshift(`R:R ${(netTP / netSL).toFixed(1)}:1 after fees < 2.0:1 min`);
+        reasons.unshift(`Quality gate: ${confirmations}/${minConfirmations} confirmations [${confReasons.join("+")}] — need more alignment`);
+      } else {
+        reasons.push(`Quality: ${confirmations} confirmations [${confReasons.join("+")}]`);
       }
     }
 
+    // ═══ GATE 2: STRUCTURE-BASED SL — Place at real invalidation levels, not ATR math ═══
+    if (action !== "WAIT" && sl > 0) {
+      const swings = candles.slice(-30);
+      if (action === "LONG") {
+        // Find the lowest swing low in last 30 candles
+        const swingLows = [];
+        for (let i = 2; i < swings.length - 2; i++) {
+          if (swings[i].l <= swings[i-1].l && swings[i].l <= swings[i-2].l && swings[i].l <= swings[i+1].l && swings[i].l <= swings[i+2].l) {
+            swingLows.push(swings[i].l);
+          }
+        }
+        if (swingLows.length > 0) {
+          const nearestSwingLow = Math.max(...swingLows.filter(s => s < price)); // Nearest swing low BELOW price
+          if (nearestSwingLow > 0) {
+            const structureSL = nearestSwingLow - atrVal * 0.3; // Small buffer below swing low
+            // Use structure SL if it's wider than ATR-based SL (gives more room)
+            if (structureSL < sl && structureSL > price * 0.95) { // But cap at 5% max distance
+              sl = structureSL;
+              reasons.push(`SL→structure: below swing low $${fShort(nearestSwingLow)}`);
+            }
+          }
+        }
+      } else {
+        const swingHighs = [];
+        for (let i = 2; i < swings.length - 2; i++) {
+          if (swings[i].h >= swings[i-1].h && swings[i].h >= swings[i-2].h && swings[i].h >= swings[i+1].h && swings[i].h >= swings[i+2].h) {
+            swingHighs.push(swings[i].h);
+          }
+        }
+        if (swingHighs.length > 0) {
+          const nearestSwingHigh = Math.min(...swingHighs.filter(s => s > price));
+          if (nearestSwingHigh > 0 && nearestSwingHigh < Infinity) {
+            const structureSL = nearestSwingHigh + atrVal * 0.3;
+            if (structureSL > sl && structureSL < price * 1.05) {
+              sl = structureSL;
+              reasons.push(`SL→structure: above swing high $${fShort(nearestSwingHigh)}`);
+            }
+          }
+        }
+      }
+    }
+
+    // ═══ GATE 3: R:R ENFORCER — Minimum 2.5:1 reward:risk AFTER fees ═══
+    if (action !== "WAIT" && sl > 0 && tp > 0) {
+      const tpDist = Math.abs(tp - price);
+      const slDist = Math.abs(sl - price);
+      const roundTripFee = price * 0.0045; // 0.2% entry + 0.2% exit + ~0.05% slippage
+      const netReward = tpDist - roundTripFee;
+      const netRisk = slDist + roundTripFee;
+      const rr = netRisk > 0 ? netReward / netRisk : 0;
+      
+      if (rr < 2.5) {
+        action = "WAIT";
+        reasons.unshift(`R:R ${rr.toFixed(1)}:1 after fees < 2.5:1 min (TP:${(tpDist/price*100).toFixed(2)}% SL:${(slDist/price*100).toFixed(2)}% fees:${(roundTripFee/price*100).toFixed(2)}%)`);
+      } else {
+        reasons.push(`R:R ${rr.toFixed(1)}:1 after fees`);
+      }
+    }
+
+    // ═══ GATE 4: TRADE COOLDOWN — Minimum time between trades (prevent overtrading) ═══
+    if (action !== "WAIT") {
+      const lastTradeTime = history.length > 0 ? new Date(history[0].entryTime || history[0].exitTime || 0).getTime() : 0;
+      const timeSinceLastTrade = Date.now() - lastTradeTime;
+      const minCooldownMs = { "1m": 300000, "5m": 600000, "15m": 1800000, "1h": 3600000, "4h": 7200000, "1d": 14400000 }[timeframe] || 1800000;
+      if (timeSinceLastTrade < minCooldownMs && timeSinceLastTrade > 0) {
+        action = "WAIT";
+        reasons.unshift(`Cooldown: ${Math.round((minCooldownMs - timeSinceLastTrade) / 60000)}min until next trade allowed`);
+      }
+    }
+
+    // ═══ GATE 5: EXISTING SAFETY CHECKS ═══
     if (action !== "WAIT" && positions.length >= MAX_POSITIONS) { action = "WAIT"; reasons.unshift(`Max ${MAX_POSITIONS} positions`); }
 
     // ═══ IQ v8: VOLATILITY FILTER — Don't trade in unfavorable conditions ═══
@@ -4364,6 +4451,30 @@ export default function NexusV7() {
   const [tab, setTab] = useState("chart");
   const [chartOverlays, setChartOverlays] = useState({ ob: true, fvg: true, liq: true, sr: true });
   const chartZones = useMemo(() => candles.length > 15 ? ZoneEngine.computeAll(candles) : { orderBlocks: [], fvgs: [], liquidityZones: [], srHeatmap: [] }, [candles]); // recalc when candles update
+
+  // ═══ DYNAMIC IQ SCORE — Calculated from active intelligence sources ═══
+  const iqScore = useMemo(() => {
+    let iq = 70; // Base: core technical analysis (RSI, MACD, BB, EMA, volume)
+    // +points for each active intelligence layer
+    if (isLive) iq += 5;                                                  // Live data feed
+    if (fgData?.live) iq += 3;                                            // Fear & Greed
+    if (redditData?.live) iq += 3;                                        // Reddit sentiment
+    if (macroData?.live) iq += 5;                                         // Macro: S&P500, DXY, Gold
+    if (onChainData?.live) iq += 5;                                       // On-chain: whales, mempool
+    if (fundingData?.live) iq += 5;                                       // Funding rate engine
+    if (orderBookData?.live) iq += 5;                                     // Order book depth
+    if (correlationData?.live) iq += 4;                                   // Cross-pair correlation
+    if (liqData?.live) iq += 4;                                           // Liquidation zones
+    if (mtfData?.combined?.valid) iq += 8;                                // Multi-timeframe alignment
+    if (geminiKey || groqKey) iq += 10;                                   // LLM Brain active
+    if (MLEngine._trained) iq += 8;                                       // Neural network trained
+    const patterns = Brain.losses.length + Brain.wins.length;
+    if (patterns > 50) iq += 5; else if (patterns > 20) iq += 3; else if (patterns > 5) iq += 1;  // Brain pattern depth
+    if (BacktestEngine.countBacktestPatterns() > 100) iq += 5; else if (BacktestEngine.countBacktestPatterns() > 0) iq += 2; // Backtest experience
+    const wr = patterns > 10 ? (Brain.wins.length / patterns) : 0;
+    if (wr > 0.55) iq += 5; else if (wr > 0.45) iq += 2; else if (wr < 0.3 && patterns > 10) iq -= 5; // Win rate quality
+    return Math.min(200, Math.max(60, iq)); // Clamp 60-200
+  }, [isLive, fgData, redditData, macroData, onChainData, fundingData, orderBookData, correlationData, liqData, mtfData, brainStats, mlStats]);
   const [logs, setLogs] = useState([]);
   const [manualAmt, setManualAmt] = useState("5");
   const [manualSL, setManualSL] = useState("");
@@ -4754,7 +4865,7 @@ export default function NexusV7() {
   useEffect(() => {
     try {
       if (candles.length > 60 && price > 0) {
-        const result = aiDecision(candles, price, pair.sym, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, fgData, redditData, macroData, onChainData, mtfData, fundingData, orderBookData, correlationData, liqData);
+        const result = aiDecision(candles, price, pair.sym, sessionPnl, sessionStart, positions, sessionTradeCount, news, session, fgData, redditData, macroData, onChainData, mtfData, fundingData, orderBookData, correlationData, liqData, timeframe, history);
         setAiResult(result);
         if (result && result.action !== "WAIT") {
           console.log(`[NEXUS] 🤖 AI DECISION: ${result.action} ${pair.name} | Conf:${result.confidence}% | SL:${result.sl || 'none'} TP:${result.tp || 'none'} | Bias:${result.indicators?.marketBias || '?'} ${result.indicators?.marketBiasStrength || 0}%`);
@@ -5414,7 +5525,7 @@ export default function NexusV7() {
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
       <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }} />
-      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v8 | 140 IQ ENGINE | LOADING</div>
+      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v9 | IQ ENGINE | LOADING</div>
     </div>
   );
 
@@ -5428,8 +5539,8 @@ export default function NexusV7() {
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v8 IQ</div>
-            <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>140 IQ | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
+            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v9 IQ</div>
+            <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}><span style={{ color: iqScore >= 150 ? K.up : iqScore >= 120 ? K.gold : iqScore >= 90 ? K.warn : K.dn, fontWeight: 800 }}>{iqScore} IQ</span> | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
         <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
@@ -5539,7 +5650,7 @@ export default function NexusV7() {
 
         {/* AI ENGINE */}
         {tab === "ai" && aiResult && <div style={S.card}>
-          <div style={{ fontSize: 8, color: K.txM, letterSpacing: 2, marginBottom: 14 }}>AI ENGINE v7.2 | 28 FACTORS + SOCIAL + MACRO + ON-CHAIN + MTF {(geminiKey || groqKey) ? "+ LLM BRAIN" : ""} | {aiResult.analysis?.brainPatterns || 0} LEARNED | {session?.primary?.name} SESSION</div>
+          <div style={{ fontSize: 8, color: K.txM, letterSpacing: 2, marginBottom: 14 }}>AI ENGINE v9 | {iqScore} IQ | 5 STRUCTURAL GATES + ZONES + MTF {(geminiKey || groqKey) ? "+ LLM BRAIN" : ""} | {aiResult.analysis?.brainPatterns || 0} LEARNED | {session?.primary?.name} SESSION</div>
 
           {/* ═══ DRAWDOWN ESCALATION BAR ═══ */}
           <div style={{ marginBottom: 12, padding: 10, background: K.s2, borderRadius: 8, border: `1px solid ${drawdownState?.tier?.color || K.bd}30` }}>
