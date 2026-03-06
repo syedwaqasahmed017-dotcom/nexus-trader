@@ -4452,29 +4452,6 @@ export default function NexusV7() {
   const [chartOverlays, setChartOverlays] = useState({ ob: true, fvg: true, liq: true, sr: true });
   const chartZones = useMemo(() => candles.length > 15 ? ZoneEngine.computeAll(candles) : { orderBlocks: [], fvgs: [], liquidityZones: [], srHeatmap: [] }, [candles]); // recalc when candles update
 
-  // ═══ DYNAMIC IQ SCORE — Calculated from active intelligence sources ═══
-  const iqScore = useMemo(() => {
-    let iq = 70; // Base: core technical analysis (RSI, MACD, BB, EMA, volume)
-    // +points for each active intelligence layer
-    if (isLive) iq += 5;                                                  // Live data feed
-    if (fgData?.live) iq += 3;                                            // Fear & Greed
-    if (redditData?.live) iq += 3;                                        // Reddit sentiment
-    if (macroData?.live) iq += 5;                                         // Macro: S&P500, DXY, Gold
-    if (onChainData?.live) iq += 5;                                       // On-chain: whales, mempool
-    if (fundingData?.live) iq += 5;                                       // Funding rate engine
-    if (orderBookData?.live) iq += 5;                                     // Order book depth
-    if (correlationData?.live) iq += 4;                                   // Cross-pair correlation
-    if (liqData?.live) iq += 4;                                           // Liquidation zones
-    if (mtfData?.combined?.valid) iq += 8;                                // Multi-timeframe alignment
-    if (geminiKey || groqKey) iq += 10;                                   // LLM Brain active
-    if (MLEngine._trained) iq += 8;                                       // Neural network trained
-    const patterns = Brain.losses.length + Brain.wins.length;
-    if (patterns > 50) iq += 5; else if (patterns > 20) iq += 3; else if (patterns > 5) iq += 1;  // Brain pattern depth
-    if (BacktestEngine.countBacktestPatterns() > 100) iq += 5; else if (BacktestEngine.countBacktestPatterns() > 0) iq += 2; // Backtest experience
-    const wr = patterns > 10 ? (Brain.wins.length / patterns) : 0;
-    if (wr > 0.55) iq += 5; else if (wr > 0.45) iq += 2; else if (wr < 0.3 && patterns > 10) iq -= 5; // Win rate quality
-    return Math.min(200, Math.max(60, iq)); // Clamp 60-200
-  }, [isLive, fgData, redditData, macroData, onChainData, fundingData, orderBookData, correlationData, liqData, mtfData, brainStats, mlStats]);
   const [logs, setLogs] = useState([]);
   const [manualAmt, setManualAmt] = useState("5");
   const [manualSL, setManualSL] = useState("");
@@ -4514,6 +4491,29 @@ export default function NexusV7() {
   const [cloudUserId, setCloudUserId] = useState("");
   const [cloudStatus, setCloudStatus] = useState("disconnected");
   const [lastCloudSync, setLastCloudSync] = useState(0);
+
+  // ═══ DYNAMIC IQ SCORE — Calculated from active intelligence sources ═══
+  const iqScore = useMemo(() => {
+    let iq = 70;
+    if (isLive) iq += 5;
+    if (fgData?.live) iq += 3;
+    if (redditData?.live) iq += 3;
+    if (macroData?.live) iq += 5;
+    if (onChainData?.live) iq += 5;
+    if (fundingData?.live) iq += 5;
+    if (orderBookData?.live) iq += 5;
+    if (correlationData?.live) iq += 4;
+    if (liqData?.live) iq += 4;
+    if (mtfData?.combined?.valid) iq += 8;
+    if (geminiKey || groqKey) iq += 10;
+    if (MLEngine._trained) iq += 8;
+    const patterns = Brain.losses.length + Brain.wins.length;
+    if (patterns > 50) iq += 5; else if (patterns > 20) iq += 3; else if (patterns > 5) iq += 1;
+    if (BacktestEngine.countBacktestPatterns() > 100) iq += 5; else if (BacktestEngine.countBacktestPatterns() > 0) iq += 2;
+    const wr = patterns > 10 ? (Brain.wins.length / patterns) : 0;
+    if (wr > 0.55) iq += 5; else if (wr > 0.45) iq += 2; else if (wr < 0.3 && patterns > 10) iq -= 5;
+    return Math.min(200, Math.max(60, iq));
+  }, [isLive, fgData, redditData, macroData, onChainData, fundingData, orderBookData, correlationData, liqData, mtfData, brainStats, mlStats, geminiKey, groqKey]);
 
   const addLog = useCallback((type, msg) => {
     setLogs(p => [{ id: uid(), type, msg, time: new Date().toLocaleTimeString() }, ...p].slice(0, 500));
