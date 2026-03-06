@@ -53,91 +53,47 @@ const SESSION_MAX_LOSS = 1.5;
 // ADVANCED MARKET INTELLIGENCE
 // =============================
 
-// Detect stop hunts / liquidity grabs
-export function detectLiquidityGrab(candles) {
-  if (!candles || candles.length < 3) return null;
+// Detect stop hunts / liquidity grabs (price action pattern)
+// Wick above prev high that closes back below = bearish stop hunt (trade SHORT)
+// Wick below prev low that closes back above = bullish stop hunt (trade LONG)
+// Uses multi-candle lookback for stronger confirmation
+function detectStopHunt(candles) {
+  if (!candles || candles.length < 5) return { signal: null, strength: 0 };
 
   const last = candles[candles.length - 1];
   const prev = candles[candles.length - 2];
+  const prev2 = candles[candles.length - 3];
 
-  const lastHigh = parseFloat(last[2]);
-  const lastLow = parseFloat(last[3]);
-  const prevHigh = parseFloat(prev[2]);
-  const prevLow = parseFloat(prev[3]);
-  const close = parseFloat(last[4]);
+  // Use 3-candle lookback high/low for stronger signal
+  const lookbackHigh = Math.max(prev.h, prev2.h);
+  const lookbackLow = Math.min(prev.l, prev2.l);
 
-  if (lastHigh > prevHigh && close < prevHigh) {
-    return "SHORT"; // stop hunt above highs
+  const wickAbove = last.h - Math.max(last.o, last.c);
+  const wickBelow = Math.min(last.o, last.c) - last.l;
+  const body = Math.abs(last.c - last.o);
+
+  // Bearish stop hunt: wick above previous highs, close back below
+  if (last.h > lookbackHigh && last.c < lookbackHigh) {
+    const penetration = (last.h - lookbackHigh) / lookbackHigh * 100;
+    const wickDominance = body > 0 ? wickAbove / body : 2;
+    // Stronger when: deeper penetration, longer upper wick vs body, high volume
+    const strength = Math.min(100, Math.round(penetration * 30 + wickDominance * 15));
+    return { signal: "SHORT", strength, desc: `Stop hunt above ${lookbackHigh.toFixed(0)} — wick trap ${penetration.toFixed(2)}%` };
   }
 
-  if (lastLow < prevLow && close > prevLow) {
-    return "LONG"; // stop hunt below lows
+  // Bullish stop hunt: wick below previous lows, close back above
+  if (last.l < lookbackLow && last.c > lookbackLow) {
+    const penetration = (lookbackLow - last.l) / lookbackLow * 100;
+    const wickDominance = body > 0 ? wickBelow / body : 2;
+    const strength = Math.min(100, Math.round(penetration * 30 + wickDominance * 15));
+    return { signal: "LONG", strength, desc: `Stop hunt below ${lookbackLow.toFixed(0)} — wick trap ${penetration.toFixed(2)}%` };
   }
 
-  return null;
-}
-
-
-// Average True Range (volatility measurement)
-export function calculateATR(candles, period = 14) {
-  if (!candles || candles.length < period + 1) return 0;
-
-  let trs = [];
-
-  for (let i = 1; i < candles.length; i++) {
-
-    const high = parseFloat(candles[i][2]);
-    const low = parseFloat(candles[i][3]);
-    const prevClose = parseFloat(candles[i - 1][4]);
-
-    const tr = Math.max(
-      high - low,
-      Math.abs(high - prevClose),
-      Math.abs(low - prevClose)
-    );
-
-    trs.push(tr);
-  }
-
-  const recent = trs.slice(-period);
-  const atr = recent.reduce((a, b) => a + b, 0) / recent.length;
-
-  return atr;
-}
-
-
-// Volatility filter
-export function isLowVolatility(price, atr) {
-
-  if (!atr || !price) return true;
-
-  const volatility = atr / price;
-
-  return volatility < 0.002;
+  return { signal: null, strength: 0 };
 }
 
 
 
-// Dynamic TP/SL calculation
-export function calculateTargets(entryPrice, atr, direction) {
-
-  if (!atr) return null;
-
-  let TP;
-  let SL;
-
-  if (direction === "LONG") {
-    TP = entryPrice + atr * 2.2;
-    SL = entryPrice - atr * 1.1;
-  }
-
-  if (direction === "SHORT") {
-    TP = entryPrice - atr * 2.2;
-    SL = entryPrice + atr * 1.1;
-  }
-
-  return { TP, SL };
-}
 
 // ╔══════════════════════════════════════════════════════════════╗
 // ║  IQ ENGINE v8 — SMART MONEY CONSTANTS                       ║
@@ -3869,6 +3825,14 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       else { bear += Math.min(8, Math.abs(liqSignal.score)); reasons.push(`Liq: ${liqSignal.reasons?.[0] || "long liquidation zone"}`); }
     }
 
+    // ═══ IQ ENGINE: STOP HUNT DETECTION — Wick traps at key levels ═══
+    const stopHunt = detectStopHunt(candles);
+    if (stopHunt.signal && stopHunt.strength > 25) {
+      const shWeight = stopHunt.strength > 70 ? 10 : stopHunt.strength > 45 ? 7 : 4;
+      if (stopHunt.signal === "LONG") { bull += shWeight; reasons.push(`StopHunt: ${stopHunt.desc}`); }
+      else { bear += shWeight; reasons.push(`StopHunt: ${stopHunt.desc}`); }
+    }
+
     // ═══ MULTI-TIMEFRAME ANALYSIS — The Big Picture (v7.2) ═══
     // Higher timeframes override 1-min noise. When 4h+1h agree, trade WITH them.
     const mtf = mtfData && mtfData.combined && mtfData.combined.valid ? mtfData.combined : null;
@@ -4032,11 +3996,193 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
   } catch (err) { return WAIT(["AI engine error: " + (err?.message || "unknown")], {}, { phase: "ERROR" }); }
 }
 
-// ═══ CANDLESTICK CHART (SVG) ═══
-function CandleChart({ candles, w = 900, h = 380 }) {
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  ZONE ENGINE — Professional chart overlays computed by NEXUS    ║
+// ║  1. Order Blocks (OB) — institutional supply/demand zones       ║
+// ║  2. Fair Value Gaps (FVG) — imbalance zones price returns to    ║
+// ║  3. Liquidity Zones — stop clusters at swing highs/lows         ║
+// ║  4. Support/Resistance Heatmap — touch-weighted price levels    ║
+// ╚══════════════════════════════════════════════════════════════════╝
+const ZoneEngine = {
+  // ORDER BLOCKS — Last down candle before a strong up move (bullish OB) or vice versa
+  detectOrderBlocks(candles) {
+    if (!candles || candles.length < 10) return [];
+    const obs = [];
+    const L = candles.length;
+    for (let i = 2; i < L - 2; i++) {
+      const c = candles[i], prev = candles[i - 1], next1 = candles[i + 1], next2 = candles[i + 2];
+      const body = Math.abs(c.c - c.o);
+      const avgBody = candles.slice(Math.max(0, i - 10), i).reduce((s, x) => s + Math.abs(x.c - x.o), 0) / 10;
+      // Bullish OB: bearish candle followed by strong bullish move
+      if (c.c < c.o && next1.c > next1.o && (next1.c - next1.o) > avgBody * 1.5) {
+        const displacement = (next2.c - c.l) / c.l * 100;
+        if (displacement > 0.15) {
+          obs.push({ type: "bull", top: Math.max(c.o, c.c), bottom: Math.min(c.o, c.c), idx: i, strength: Math.min(100, displacement * 20), mitigated: false });
+        }
+      }
+      // Bearish OB: bullish candle followed by strong bearish move
+      if (c.c > c.o && next1.c < next1.o && (next1.o - next1.c) > avgBody * 1.5) {
+        const displacement = (c.h - next2.c) / c.h * 100;
+        if (displacement > 0.15) {
+          obs.push({ type: "bear", top: Math.max(c.o, c.c), bottom: Math.min(c.o, c.c), idx: i, strength: Math.min(100, displacement * 20), mitigated: false });
+        }
+      }
+    }
+    // Mark mitigated OBs (price returned through the zone)
+    const lastPrice = candles[L - 1].c;
+    obs.forEach(ob => {
+      for (let j = ob.idx + 3; j < L; j++) {
+        if (ob.type === "bull" && candles[j].l < ob.bottom) { ob.mitigated = true; break; }
+        if (ob.type === "bear" && candles[j].h > ob.top) { ob.mitigated = true; break; }
+      }
+    });
+    // Return most recent unmitigated + a few mitigated for context
+    const unmitigated = obs.filter(o => !o.mitigated).slice(-6);
+    const mitigated = obs.filter(o => o.mitigated).slice(-3);
+    return [...unmitigated, ...mitigated];
+  },
+
+  // FAIR VALUE GAPS — 3-candle imbalance where middle candle body doesn't overlap prev/next wicks
+  detectFairValueGaps(candles) {
+    if (!candles || candles.length < 5) return [];
+    const fvgs = [];
+    const L = candles.length;
+    for (let i = 1; i < L - 1; i++) {
+      const prev = candles[i - 1], curr = candles[i], next = candles[i + 1];
+      // Bullish FVG: gap up — prev high < next low
+      if (prev.h < next.l) {
+        const gapSize = (next.l - prev.h) / prev.h * 100;
+        if (gapSize > 0.02) {
+          fvgs.push({ type: "bull", top: next.l, bottom: prev.h, idx: i, size: gapSize, filled: false });
+        }
+      }
+      // Bearish FVG: gap down — prev low > next high
+      if (prev.l > next.h) {
+        const gapSize = (prev.l - next.h) / next.h * 100;
+        if (gapSize > 0.02) {
+          fvgs.push({ type: "bear", top: prev.l, bottom: next.h, idx: i, size: gapSize, filled: false });
+        }
+      }
+    }
+    // Mark filled FVGs
+    fvgs.forEach(fvg => {
+      for (let j = fvg.idx + 2; j < L; j++) {
+        if (fvg.type === "bull" && candles[j].l <= fvg.bottom) { fvg.filled = true; break; }
+        if (fvg.type === "bear" && candles[j].h >= fvg.top) { fvg.filled = true; break; }
+      }
+    });
+    return fvgs.filter(f => !f.filled).slice(-8);
+  },
+
+  // LIQUIDITY ZONES — Clusters of equal highs/lows where stops accumulate
+  detectLiquidityZones(candles) {
+    if (!candles || candles.length < 15) return [];
+    const zones = [];
+    const L = candles.length;
+    const tolerance = candles[L - 1].c * 0.0008; // 0.08% price tolerance for "equal" levels
+
+    // Find swing highs and lows
+    const swingHighs = [], swingLows = [];
+    for (let i = 3; i < L - 3; i++) {
+      if (candles[i].h >= candles[i - 1].h && candles[i].h >= candles[i - 2].h && candles[i].h >= candles[i + 1].h && candles[i].h >= candles[i + 2].h) {
+        swingHighs.push({ price: candles[i].h, idx: i });
+      }
+      if (candles[i].l <= candles[i - 1].l && candles[i].l <= candles[i - 2].l && candles[i].l <= candles[i + 1].l && candles[i].l <= candles[i + 2].l) {
+        swingLows.push({ price: candles[i].l, idx: i });
+      }
+    }
+
+    // Cluster equal highs (stops above)
+    const usedH = new Set();
+    for (let i = 0; i < swingHighs.length; i++) {
+      if (usedH.has(i)) continue;
+      const cluster = [swingHighs[i]];
+      for (let j = i + 1; j < swingHighs.length; j++) {
+        if (!usedH.has(j) && Math.abs(swingHighs[j].price - swingHighs[i].price) < tolerance) {
+          cluster.push(swingHighs[j]); usedH.add(j);
+        }
+      }
+      if (cluster.length >= 2) {
+        const avgPrice = cluster.reduce((s, c) => s + c.price, 0) / cluster.length;
+        zones.push({ type: "high", price: avgPrice, touches: cluster.length, lastIdx: Math.max(...cluster.map(c => c.idx)), swept: candles[L - 1].h > avgPrice + tolerance });
+      }
+    }
+    // Cluster equal lows (stops below)
+    const usedL = new Set();
+    for (let i = 0; i < swingLows.length; i++) {
+      if (usedL.has(i)) continue;
+      const cluster = [swingLows[i]];
+      for (let j = i + 1; j < swingLows.length; j++) {
+        if (!usedL.has(j) && Math.abs(swingLows[j].price - swingLows[i].price) < tolerance) {
+          cluster.push(swingLows[j]); usedL.add(j);
+        }
+      }
+      if (cluster.length >= 2) {
+        const avgPrice = cluster.reduce((s, c) => s + c.price, 0) / cluster.length;
+        zones.push({ type: "low", price: avgPrice, touches: cluster.length, lastIdx: Math.max(...cluster.map(c => c.idx)), swept: candles[L - 1].l < avgPrice - tolerance });
+      }
+    }
+    return zones.filter(z => !z.swept).slice(-8);
+  },
+
+  // SUPPORT/RESISTANCE HEATMAP — Price levels weighted by touch frequency + volume
+  detectSRHeatmap(candles) {
+    if (!candles || candles.length < 20) return [];
+    const L = candles.length;
+    const price = candles[L - 1].c;
+    const rangePct = 0.03; // Look within 3% of current price
+    const bucketSize = price * 0.001; // 0.1% buckets
+    const buckets = {};
+
+    for (let i = 0; i < L; i++) {
+      const c = candles[i];
+      // Count touches at open, close, high, low levels
+      [c.o, c.c, c.h, c.l].forEach(p => {
+        if (Math.abs(p - price) / price > rangePct) return;
+        const key = Math.round(p / bucketSize) * bucketSize;
+        if (!buckets[key]) buckets[key] = { price: key, touches: 0, volume: 0, recency: 0 };
+        buckets[key].touches++;
+        buckets[key].volume += c.v || 0;
+        buckets[key].recency = Math.max(buckets[key].recency, i); // Most recent touch
+      });
+    }
+
+    const levels = Object.values(buckets)
+      .filter(b => b.touches >= 3)
+      .map(b => ({
+        ...b,
+        // Weighted score: touches * recency factor * volume factor
+        heat: b.touches * (1 + (b.recency / L) * 0.5) * Math.min(2, (b.volume / (candles.reduce((s, c) => s + (c.v || 0), 0) / L || 1))),
+        isSupport: b.price < price,
+      }))
+      .sort((a, b) => b.heat - a.heat)
+      .slice(0, 12);
+
+    // Normalize heat to 0-1
+    const maxHeat = Math.max(...levels.map(l => l.heat), 1);
+    levels.forEach(l => l.intensity = l.heat / maxHeat);
+    return levels;
+  },
+
+  // Compute all zones at once
+  computeAll(candles) {
+    try {
+      return {
+        orderBlocks: this.detectOrderBlocks(candles),
+        fvgs: this.detectFairValueGaps(candles),
+        liquidityZones: this.detectLiquidityZones(candles),
+        srHeatmap: this.detectSRHeatmap(candles),
+      };
+    } catch (e) { console.warn("[NEXUS] ZoneEngine error:", e); return { orderBlocks: [], fvgs: [], liquidityZones: [], srHeatmap: [] }; }
+  },
+};
+
+// ═══ CANDLESTICK CHART (SVG) with Professional Zone Overlays ═══
+function CandleChart({ candles, w = 900, h = 380, zones, overlays }) {
   try {
     if (!candles || candles.length < 5) return <div style={{ height: h, display: "flex", alignItems: "center", justifyContent: "center", color: K.txM, fontSize: 12 }}><div style={{ width: 18, height: 18, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite", marginRight: 8 }} />Loading chart...</div>;
     const visible = candles.slice(-100);
+    const startIdx = candles.length - visible.length;
     const pr = 54, pl = 2, pt = 6, pb = 18;
     const cw = (w - pl - pr) / visible.length;
     const allPrices = visible.flatMap(c => [c.h, c.l]);
@@ -4046,19 +4192,96 @@ function CandleChart({ candles, w = 900, h = 380 }) {
     const maxVol = Math.max(...visible.map(c => c.v)) || 1;
     const closes = visible.map(c => c.c);
     const e9 = calcEMA(closes, 9), e21 = calcEMA(closes, 21);
+    const ov = overlays || {};
+    const z = zones || {};
     return (
       <svg viewBox={`0 0 ${w} ${h}`} style={{ width: "100%", height: "auto", display: "block" }}>
         <defs>
           <linearGradient id="vG7" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor={K.up} stopOpacity=".12" /><stop offset="1" stopColor={K.up} stopOpacity=".01" /></linearGradient>
           <linearGradient id="vR7" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor={K.dn} stopOpacity=".12" /><stop offset="1" stopColor={K.dn} stopOpacity=".01" /></linearGradient>
         </defs>
+        {/* Grid */}
         {[0, .25, .5, .75, 1].map((frac, i) => { const p = min + range * (1 - frac); return <g key={i}><line x1={pl} y1={yPos(p)} x2={w - pr} y2={yPos(p)} stroke={K.bd} strokeWidth=".4" strokeDasharray="2,4" /><text x={w - pr + 4} y={yPos(p) + 3} fill={K.txM} fontSize="6.5" fontFamily="monospace">{fShort(p)}</text></g>; })}
+
+        {/* ══ ZONE LAYER 1: S/R HEATMAP — subtle background bands ══ */}
+        {ov.sr && z.srHeatmap && z.srHeatmap.map((lvl, i) => {
+          if (lvl.price < min || lvl.price > max) return null;
+          const bh = Math.max(3, (h - pt - pb) * 0.012);
+          const y = yPos(lvl.price) - bh / 2;
+          const col = lvl.isSupport ? K.up : K.dn;
+          return <rect key={"sr" + i} x={pl} y={y} width={w - pl - pr} height={bh} fill={col} opacity={0.04 + lvl.intensity * 0.12} rx="1" />;
+        })}
+
+        {/* ══ ZONE LAYER 2: ORDER BLOCKS — institutional supply/demand zones ══ */}
+        {ov.ob && z.orderBlocks && z.orderBlocks.map((ob, i) => {
+          if (ob.top < min || ob.bottom > max) return null;
+          const y1 = yPos(ob.top), y2 = yPos(ob.bottom);
+          const isBull = ob.type === "bull";
+          const col = isBull ? K.up : K.dn;
+          const xStart = ob.idx >= startIdx ? pl + (ob.idx - startIdx) * cw : pl;
+          return <g key={"ob" + i}>
+            <rect x={xStart} y={y1} width={w - pr - xStart} height={Math.max(1.5, y2 - y1)} fill={col} opacity={ob.mitigated ? 0.04 : 0.08} rx="1" />
+            <line x1={xStart} y1={y1} x2={w - pr} y2={y1} stroke={col} strokeWidth=".5" opacity={ob.mitigated ? 0.12 : 0.3} strokeDasharray={ob.mitigated ? "1,3" : "2,2"} />
+            <line x1={xStart} y1={y2} x2={w - pr} y2={y2} stroke={col} strokeWidth=".5" opacity={ob.mitigated ? 0.12 : 0.3} strokeDasharray={ob.mitigated ? "1,3" : "2,2"} />
+            {!ob.mitigated && <text x={xStart + 2} y={y1 + 7} fill={col} fontSize="5" fontFamily="monospace" opacity=".6">{isBull ? "▲" : "▼"} OB</text>}
+          </g>;
+        })}
+
+        {/* ══ ZONE LAYER 3: FAIR VALUE GAPS — imbalance zones ══ */}
+        {ov.fvg && z.fvgs && z.fvgs.map((fvg, i) => {
+          if (fvg.top < min || fvg.bottom > max) return null;
+          const y1 = yPos(fvg.top), y2 = yPos(fvg.bottom);
+          const isBull = fvg.type === "bull";
+          const col = isBull ? K.cyan : K.pink;
+          const xStart = fvg.idx >= startIdx ? pl + (fvg.idx - startIdx) * cw : pl;
+          return <g key={"fvg" + i}>
+            <rect x={xStart} y={y1} width={w - pr - xStart} height={Math.max(1, y2 - y1)} fill={col} opacity=".07" />
+            <line x1={xStart} y1={(y1 + y2) / 2} x2={w - pr} y2={(y1 + y2) / 2} stroke={col} strokeWidth=".4" opacity=".35" strokeDasharray="1.5,2.5" />
+            <text x={xStart + 2} y={y1 + 6} fill={col} fontSize="4.5" fontFamily="monospace" opacity=".5">FVG</text>
+          </g>;
+        })}
+
+        {/* ══ ZONE LAYER 4: LIQUIDITY ZONES — stop clusters ══ */}
+        {ov.liq && z.liquidityZones && z.liquidityZones.map((lz, i) => {
+          if (lz.price < min || lz.price > max) return null;
+          const y = yPos(lz.price);
+          const isHigh = lz.type === "high";
+          const col = K.gold;
+          const dotSpacing = Math.max(2, 6 - lz.touches);
+          return <g key={"lz" + i}>
+            <line x1={pl} y1={y} x2={w - pr} y2={y} stroke={col} strokeWidth={0.4 + lz.touches * 0.2} opacity=".4" strokeDasharray={`${dotSpacing},${dotSpacing}`} />
+            <text x={w - pr - 36} y={y - 2} fill={col} fontSize="4.5" fontFamily="monospace" opacity=".6">{isHigh ? "$$$ BSL" : "$$$ SSL"} x{lz.touches}</text>
+          </g>;
+        })}
+
+        {/* ══ S/R HEATMAP — right-side intensity bars ══ */}
+        {ov.sr && z.srHeatmap && z.srHeatmap.map((lvl, i) => {
+          if (lvl.price < min || lvl.price > max) return null;
+          const y = yPos(lvl.price);
+          const barW = 4 + lvl.intensity * 18;
+          const col = lvl.isSupport ? K.up : K.dn;
+          return <g key={"srb" + i}>
+            <rect x={w - pr + 1} y={y - 1.5} width={barW} height={3} fill={col} opacity={0.2 + lvl.intensity * 0.5} rx="1" />
+          </g>;
+        })}
+
+        {/* Volume bars */}
         {visible.map((c, i) => { const g = c.c >= c.o; const cx = pl + i * cw + cw / 2; return <rect key={"v" + i} x={cx - cw * .38} y={h - pb - (c.v / maxVol) * 26} width={cw * .76} height={(c.v / maxVol) * 26} fill={g ? "url(#vG7)" : "url(#vR7)"} />; })}
+        {/* EMA lines */}
         {e9.length > 1 && <polyline fill="none" stroke={K.blue} strokeWidth=".7" opacity=".5" points={e9.map((v, i) => `${pl + i * cw + cw / 2},${yPos(v)}`).join(" ")} />}
         {e21.length > 1 && <polyline fill="none" stroke={K.purple} strokeWidth=".7" opacity=".5" points={e21.map((v, i) => `${pl + i * cw + cw / 2},${yPos(v)}`).join(" ")} />}
+        {/* Candles */}
         {visible.map((c, i) => { const g = c.c >= c.o; const col = g ? K.up : K.dn; const bt = yPos(Math.max(c.o, c.c)); const bb = yPos(Math.min(c.o, c.c)); const cx = pl + i * cw + cw / 2; return <g key={i}><line x1={cx} y1={yPos(c.h)} x2={cx} y2={yPos(c.l)} stroke={col} strokeWidth=".6" opacity=".8" /><rect x={cx - cw * .32} y={bt} width={cw * .64} height={Math.max(.7, bb - bt)} fill={col} rx=".3" opacity=".9" /></g>; })}
+        {/* Current price line */}
         {visible.length > 0 && (() => { const lp = visible[visible.length - 1].c; const y = yPos(lp); const up = visible.length > 1 && lp >= visible[visible.length - 2].c; return <g><line x1={pl} y1={y} x2={w - pr} y2={y} stroke={up ? K.up : K.dn} strokeWidth=".5" strokeDasharray="3,3" opacity=".5" /><rect x={w - pr} y={y - 6} width={50} height={12} rx={2} fill={up ? K.up : K.dn} opacity=".9" /><text x={w - pr + 4} y={y + 3} fill={up ? "#000" : "#fff"} fontSize="7" fontWeight="700" fontFamily="monospace">{fShort(lp)}</text></g>; })()}
-        <text x={pl + 2} y={h - 3} fill={K.txM} fontSize="5.5" fontFamily="monospace"><tspan fill={K.blue}>- EMA9</tspan>{"  "}<tspan fill={K.purple}>- EMA21</tspan></text>
+        {/* Legend */}
+        <text x={pl + 2} y={h - 3} fill={K.txM} fontSize="5.5" fontFamily="monospace">
+          <tspan fill={K.blue}>- EMA9</tspan>{"  "}<tspan fill={K.purple}>- EMA21</tspan>
+          {ov.ob && <tspan fill={K.up}>{" "}■ OB</tspan>}
+          {ov.fvg && <tspan fill={K.cyan}>{" "}■ FVG</tspan>}
+          {ov.liq && <tspan fill={K.gold}>{" "}■ LIQ</tspan>}
+          {ov.sr && <tspan fill={K.warn}>{" "}■ S/R</tspan>}
+        </text>
       </svg>
     );
   } catch { return <div style={{ height: h, display: "flex", alignItems: "center", justifyContent: "center", color: K.dn, fontSize: 11 }}>Chart error</div>; }
@@ -4139,6 +4362,8 @@ export default function NexusV7() {
   const [session, setSession] = useState(null);
 
   const [tab, setTab] = useState("chart");
+  const [chartOverlays, setChartOverlays] = useState({ ob: true, fvg: true, liq: true, sr: true });
+  const chartZones = useMemo(() => candles.length > 15 ? ZoneEngine.computeAll(candles) : { orderBlocks: [], fvgs: [], liquidityZones: [], srHeatmap: [] }, [candles]); // recalc when candles update
   const [logs, setLogs] = useState([]);
   const [manualAmt, setManualAmt] = useState("5");
   const [manualSL, setManualSL] = useState("");
@@ -5279,8 +5504,37 @@ export default function NexusV7() {
 
         {/* CHART */}
         {tab === "chart" && <div style={S.card}>
-          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 1.5, marginBottom: 8 }}>{pair.name}/USDT | {timeframe} | {candles.length} candles {isLive ? "| LIVE FEED" : "| OFFLINE"}{isLive && candles.length > 0 && candles[candles.length - 1].t ? ` | Last candle: ${Math.floor((Date.now() - candles[candles.length - 1].t) / 1000)}s ago` : ""}</div>
-          <CandleChart candles={candles} />
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 6 }}>
+            <div style={{ fontSize: 9, color: K.txM, letterSpacing: 1.5 }}>{pair.name}/USDT | {timeframe} | {candles.length} candles {isLive ? "| LIVE FEED" : "| OFFLINE"}{isLive && candles.length > 0 && candles[candles.length - 1].t ? ` | Last candle: ${Math.floor((Date.now() - candles[candles.length - 1].t) / 1000)}s ago` : ""}</div>
+            <div style={{ display: "flex", gap: 3 }}>
+              {[
+                { key: "ob", label: "OB", color: K.up, title: "Order Blocks" },
+                { key: "fvg", label: "FVG", color: K.cyan, title: "Fair Value Gaps" },
+                { key: "liq", label: "LIQ", color: K.gold, title: "Liquidity Zones" },
+                { key: "sr", label: "S/R", color: K.warn, title: "Support/Resistance" },
+              ].map(z => (
+                <button key={z.key} title={z.title} onClick={() => setChartOverlays(p => ({ ...p, [z.key]: !p[z.key] }))}
+                  style={{ padding: "2px 6px", fontSize: 7, fontWeight: 700, fontFamily: "monospace", cursor: "pointer", borderRadius: 3,
+                    background: chartOverlays[z.key] ? z.color + "18" : "transparent",
+                    border: `1px solid ${chartOverlays[z.key] ? z.color + "50" : K.bd}`,
+                    color: chartOverlays[z.key] ? z.color : K.txM, transition: "all .2s",
+                  }}>{z.label}</button>
+              ))}
+            </div>
+          </div>
+          <CandleChart candles={candles} zones={chartZones} overlays={chartOverlays} />
+          {/* Zone summary strip */}
+          {(chartOverlays.ob || chartOverlays.fvg || chartOverlays.liq) && <div style={{ display: "flex", gap: 10, marginTop: 6, flexWrap: "wrap" }}>
+            {chartOverlays.ob && chartZones.orderBlocks.filter(o => !o.mitigated).length > 0 && <div style={{ fontSize: 7, color: K.txD }}>
+              <span style={{ color: K.up }}>OB:</span> {chartZones.orderBlocks.filter(o => !o.mitigated).map(o => `${o.type === "bull" ? "▲" : "▼"}${fShort(o.bottom)}-${fShort(o.top)}`).join(" ")}
+            </div>}
+            {chartOverlays.fvg && chartZones.fvgs.length > 0 && <div style={{ fontSize: 7, color: K.txD }}>
+              <span style={{ color: K.cyan }}>FVG:</span> {chartZones.fvgs.map(f => `${f.type === "bull" ? "▲" : "▼"}${fShort(f.bottom)}-${fShort(f.top)}`).join(" ")}
+            </div>}
+            {chartOverlays.liq && chartZones.liquidityZones.length > 0 && <div style={{ fontSize: 7, color: K.txD }}>
+              <span style={{ color: K.gold }}>LIQ:</span> {chartZones.liquidityZones.map(l => `${l.type === "high" ? "BSL" : "SSL"} ${fShort(l.price)} x${l.touches}`).join(" ")}
+            </div>}
+          </div>}
         </div>}
 
         {/* AI ENGINE */}
