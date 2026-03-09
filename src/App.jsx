@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v9.0 — DYNAMIC IQ TRADING INTELLIGENCE (PRODUCTION GRADE)
+// NEXUS v9.1 — DYNAMIC IQ TRADING INTELLIGENCE (PRODUCTION GRADE)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // ✦ IQ ENGINE — Partial profit, conviction sizing, multi-stage trailing
 // ✦ FULL PERSISTENCE — Balance, positions, brain survive page refresh
@@ -11,7 +11,12 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 // ✦ SMART MONEY — Partial profits lock gains, breakeven SL = risk-free remainder
 // ✦ CONVICTION SIZING — Higher confidence = bigger position
 // ✦ VOLATILITY FILTER — Rejects trades in unfavorable conditions
-// ✦ LESS AGGRESSIVE BRAIN — Requires MORE evidence before self-blocking
+// ✦ v9.1 ANTI-FREEZE — Brain can NEVER lock trading permanently (max 6-12h block)
+// ✦ v9.1 HIGH-CONF OVERRIDE — Very strong signals bypass brain blocks (reduced size)
+// ✦ v9.1 WIDER SL FLOOR — Minimum 0.9% SL distance, prevents 15m stop hunts
+// ✦ v9.1 ANTI-CHOP — Detects alternating LONG/SHORT losses, requires higher confidence
+// ✦ v9.1 CAPPED PENALTIES — Brain confidence penalty capped at -20 (was unlimited)
+// ✦ v9.1 RELAXED THRESHOLDS — All brain blocks require 50-100% more evidence
 // ✦ 2% MIN TP — Ensures every trade clears fee drag with real profit
 // ✦ FULL SCREEN — Uses entire viewport
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -42,6 +47,12 @@ const COOL_AFTER_LOSS_BASE = 60000;   // 1min base cooldown (v8: faster recovery
 const COOL_AFTER_LOSS_MAX = 300000;   // 5min max cooldown (v8: less time wasted)
 const MAX_TRADES_PER_SESSION = 8;
 const MIN_CONF_TO_TRADE = 58;
+// ═══ v9.1 ANTI-FREEZE — Never let brain lock trading permanently ═══
+const MAX_BRAIN_BLOCK_HOURS = 6;     // After 6h of no trades, start relaxing brain blocks
+const FULL_UNBLOCK_HOURS = 12;       // After 12h, fully bypass brain blocking
+const HIGH_CONF_OVERRIDE = 78;       // Signals above 78% confidence can bypass brain blocks (reduced size)
+const MIN_SL_PCT = 0.9;             // v9.1: Minimum SL distance 0.9% from entry — survives 15m noise
+const MAX_CONF_PENALTY = -20;        // v9.1: Cap brain confidence penalty so it never destroys signals completely
 // ═══ PRICE SANITY — Prevent fake PnL from stale/fallback prices ═══
 const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real
 const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real
@@ -1134,23 +1145,23 @@ const AdaptiveTPSL = {
       const regimeWins = (brainWins || []).filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
       const regimeLosses = (brainLosses || []).filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
 
-      // Default ATR multipliers — v9: widened to survive 15m noise
-      let slMult = 2.2;
+      // Default ATR multipliers — v9.1: WIDER SL to survive 15m noise & stop hunts
+      let slMult = 2.8;
       let tpMult = 5.5;
 
-      // Adaptive based on regime — v9: all SL widened, TP scaled to maintain R:R
+      // Adaptive based on regime — v9.1: SL significantly widened to stop getting hunted
       if (regime === "trending") {
         tpMult = 7.0;  // Trending: let winners run far
-        slMult = 2.5;  // Wide SL to survive pullbacks
+        slMult = 3.0;  // v9.1: Wide SL to survive pullbacks (was 2.5)
       } else if (regime === "volatile") {
         tpMult = 5.0;  // Take profit faster in chaos
-        slMult = 3.0;  // Wide SL for volatility
+        slMult = 3.5;  // v9.1: Extra wide for volatility (was 3.0)
       } else if (regime === "ranging") {
         tpMult = 4.5;  // Tighter TP in range but still clears fees
-        slMult = 2.0;  // Wider than before — 1.2x was suicide
+        slMult = 2.5;  // v9.1: Widened from 2.0 — was getting hunted every time
       } else if (regime === "squeeze") {
         tpMult = 8.0;  // Breakout potential: wide TP
-        slMult = 2.2;  // Moderate SL
+        slMult = 2.8;  // v9.1: Wider from 2.2
       }
 
       // Adjust based on win rate history
@@ -1181,12 +1192,18 @@ const AdaptiveTPSL = {
       if (action === "LONG" && tp - price < minTpDist) tp = price + minTpDist;
       if (action === "SHORT" && price - tp < minTpDist) tp = price - minTpDist;
 
+      // ═══ v9.1: ENFORCE MINIMUM SL DISTANCE — Never let SL be tighter than MIN_SL_PCT ═══
+      // This prevents stop hunts on 15m candles where normal noise is 0.3-0.5%
+      const minSlDist = price * (MIN_SL_PCT / 100);
+      if (action === "LONG" && price - sl < minSlDist) sl = price - minSlDist;
+      if (action === "SHORT" && sl - price < minSlDist) sl = price + minSlDist;
+
       return { sl, tp, slMult, tpMult, regime, adapted: total >= 5, historyCount: total };
     } catch {
-      // Fallback to basic ATR — v9: widened
-      const sl = action === "LONG" ? price - atrVal * 2.2 : price + atrVal * 2.2;
+      // Fallback to basic ATR — v9.1: widened
+      const sl = action === "LONG" ? price - Math.max(atrVal * 2.8, price * MIN_SL_PCT / 100) : price + Math.max(atrVal * 2.8, price * MIN_SL_PCT / 100);
       const tp = action === "LONG" ? price + atrVal * 5.5 : price - atrVal * 5.5;
-      return { sl, tp, slMult: 2.2, tpMult: 5.5, regime: "unknown", adapted: false, historyCount: 0 };
+      return { sl, tp, slMult: 2.8, tpMult: 5.5, regime: "unknown", adapted: false, historyCount: 0 };
     }
   },
 };
@@ -2712,7 +2729,9 @@ const Brain = {
       result === "win" ? this.sessionTrades[key].wins++ : this.sessionTrades[key].losses++;
     } catch { }
   },
-  // ═══ v7.5 SHOULDBLOCK — MULTI-LAYER BLOCKING with 7 independent checks ═══
+  // ═══ v9.1 SHOULDBLOCK — ANTI-FREEZE OVERHAUL ═══
+  // KEY CHANGES: Maximum block duration, progressive relaxation, high-conf override
+  // The #1 bug was: losses → brain blocks everything → no trades → no wins → permanent freeze
   shouldBlock(indicators, action, symbol) {
     try {
       const fp = this.fingerprint(indicators, action, symbol);
@@ -2721,77 +2740,104 @@ const Brain = {
       const rk = this.regimeKey(indicators, action);
       const WEEK = 7 * 864e5;
       const TWO_WEEKS = 14 * 864e5;
+      const THREE_DAYS = 3 * 864e5;
       const HOUR = 36e5;
       const now = Date.now();
+
+      // ═══ v9.1 ANTI-FREEZE: Calculate hours since last trade ═══
+      const lastTradeTs = Math.max(
+        ...[...this.wins, ...this.losses].map(e => e.ts || 0).concat([0])
+      );
+      const hoursSinceLastTrade = lastTradeTs > 0 ? (now - lastTradeTs) / HOUR : 0;
+
+      // ═══ v9.1: FULL BYPASS after FULL_UNBLOCK_HOURS of no trading ═══
+      if (hoursSinceLastTrade >= FULL_UNBLOCK_HOURS) {
+        console.log(`[BRAIN] 🔓 ANTI-FREEZE: ${hoursSinceLastTrade.toFixed(1)}h since last trade >= ${FULL_UNBLOCK_HOURS}h — FULL BYPASS`);
+        return { blocked: false, reason: "Anti-freeze: resumed after extended block" };
+      }
+
+      // ═══ v9.1: RELAXED MODE after MAX_BRAIN_BLOCK_HOURS — double all thresholds ═══
+      const relaxed = hoursSinceLastTrade >= MAX_BRAIN_BLOCK_HOURS;
+      const mult = relaxed ? 2.0 : 1.0; // Double the required losses to block
+      if (relaxed) console.log(`[BRAIN] ⚡ RELAXED MODE: ${hoursSinceLastTrade.toFixed(1)}h idle — thresholds doubled`);
 
       // CHECK 1: Cooldown timer (severity-scaled in recordLoss)
       if (now < this.coolUntil) return { blocked: true, reason: `Cooling down (${Math.ceil((this.coolUntil - now) / 1000)}s)`, severity: "COOL" };
 
-      // CHECK 2: Exact fingerprint — v8: needs 4 losses (was 2 — too aggressive)
-      const exactLosses = this.losses.filter(e => e.fp === fp && now - e.ts < TWO_WEEKS);
-      if (exactLosses.length >= 4) return { blocked: true, reason: `Exact pattern lost ${exactLosses.length}x recently`, severity: "HIGH" };
+      // CHECK 2: Exact fingerprint — v9.1: needs 5 losses (was 4), uses 3-day window in relaxed mode
+      const exactWindow = relaxed ? THREE_DAYS : TWO_WEEKS;
+      const exactLosses = this.losses.filter(e => e.fp === fp && now - e.ts < exactWindow);
+      if (exactLosses.length >= Math.ceil(5 * mult)) return { blocked: true, reason: `Exact pattern lost ${exactLosses.length}x recently`, severity: "HIGH" };
 
-      // CHECK 3: Medium fingerprint — v8: needs 4 losses (was 2)
-      const medLosses = this.losses.filter(e => e.mfp === mfp && now - e.ts < WEEK);
-      const medWins = this.wins.filter(e => e.mfp === mfp && now - e.ts < WEEK);
-      if (medLosses.length >= 4 && medWins.length < medLosses.length * 0.4) {
+      // CHECK 3: Medium fingerprint — v9.1: needs 5 losses (was 4), check win recovery
+      const medWindow = relaxed ? THREE_DAYS : WEEK;
+      const medLosses = this.losses.filter(e => e.mfp === mfp && now - e.ts < medWindow);
+      const medWins = this.wins.filter(e => e.mfp === mfp && now - e.ts < medWindow);
+      if (medLosses.length >= Math.ceil(5 * mult) && medWins.length < medLosses.length * 0.4) {
         return { blocked: true, reason: `Medium pattern ${medWins.length}W/${medLosses.length}L this week`, severity: "HIGH" };
       }
 
-      // CHECK 4: Broad pattern — v8: needs 6 losses (was 3)
-      const broadLosses = this.losses.filter(e => e.bfp === bfp && now - e.ts < WEEK);
-      const broadWins = this.wins.filter(e => e.bfp === bfp && now - e.ts < WEEK);
-      if (broadLosses.length >= 6 && broadWins.length < broadLosses.length * 0.35) {
+      // CHECK 4: Broad pattern — v9.1: needs 8 losses (was 6)
+      const broadWindow = relaxed ? THREE_DAYS : WEEK;
+      const broadLosses = this.losses.filter(e => e.bfp === bfp && now - e.ts < broadWindow);
+      const broadWins = this.wins.filter(e => e.bfp === bfp && now - e.ts < broadWindow);
+      if (broadLosses.length >= Math.ceil(8 * mult) && broadWins.length < broadLosses.length * 0.35) {
         return { blocked: true, reason: `Broad pattern ${broadWins.length}W/${broadLosses.length}L this week`, severity: "MED" };
       }
 
-      // CHECK 5: REGIME LEARNING — v8: needs 5 trades min (was 3), 2.5x ratio (was 2x)
+      // CHECK 5: REGIME LEARNING — v9.1: needs 7 trades min (was 5), 3x ratio (was 2.5x)
       const regimeLosses = this.losses.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
       const regimeWins = this.wins.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
       const regimeTotal = regimeLosses.length + regimeWins.length;
-      if (regimeTotal >= 5 && regimeLosses.length > regimeWins.length * 2.5) {
+      if (regimeTotal >= Math.ceil(7 * mult) && regimeLosses.length > regimeWins.length * 3) {
         return { blocked: true, reason: `${action} in this regime: ${regimeWins.length}W/${regimeLosses.length}L — learned to avoid`, severity: "HIGH" };
       }
 
-      // CHECK 6: EXIT-REASON LEARNING
-      const exitReasonBlock = this._checkExitReasonPattern(action, symbol);
-      if (exitReasonBlock) return exitReasonBlock;
+      // CHECK 6: EXIT-REASON LEARNING — v9.1: much less aggressive
+      if (!relaxed) {
+        const exitReasonBlock = this._checkExitReasonPattern(action, symbol);
+        if (exitReasonBlock) return exitReasonBlock;
+      }
 
-      // CHECK 7: CUMULATIVE $ LOSS — v8: needs 4 losses, $0.40 threshold (was 2/$0.15)
+      // CHECK 7: CUMULATIVE $ LOSS — v9.1: needs 6 losses, $0.60 threshold (was 4/$0.40)
       const broadDollarLoss = broadLosses.reduce((a, e) => a + (e.loss || 0), 0);
       const broadDollarWin = broadWins.reduce((a, e) => a + (e.profit || 0), 0);
-      if (broadLosses.length >= 4 && broadDollarLoss > broadDollarWin * 1.5 && broadDollarLoss > 0.40) {
+      if (broadLosses.length >= Math.ceil(6 * mult) && broadDollarLoss > broadDollarWin * 1.5 && broadDollarLoss > 0.60) {
         return { blocked: true, reason: `Pattern net loss $${(broadDollarLoss - broadDollarWin).toFixed(2)} — money drain`, severity: "MED" };
       }
 
-      // CHECK 8: Pair losses in 1 hour — v8: needs 3 (was 2)
+      // CHECK 8: Pair losses in 1 hour — v9.1: needs 4 (was 3)
       const pairLosses = this.losses.filter(e => e.pair === symbol && now - e.ts < HOUR);
-      if (pairLosses.length >= 3) return { blocked: true, reason: `${pairLosses.length} losses on ${symbol} in 1h`, severity: "MED" };
+      if (pairLosses.length >= Math.ceil(4 * mult)) return { blocked: true, reason: `${pairLosses.length} losses on ${symbol} in 1h`, severity: "MED" };
 
-      // CHECK 9: Emergency brake — v8: 6 in 2h (was 4)
-      const allRecent = this.losses.filter(e => now - e.ts < HOUR * 2);
-      if (allRecent.length >= 6) return { blocked: true, reason: `${allRecent.length} losses in 2h — emergency brake`, severity: "CRIT" };
+      // CHECK 9: Emergency brake — v9.1: 8 in 2h (was 6) and NOT in relaxed mode
+      if (!relaxed) {
+        const allRecent = this.losses.filter(e => now - e.ts < HOUR * 2);
+        if (allRecent.length >= 8) return { blocked: true, reason: `${allRecent.length} losses in 2h — emergency brake`, severity: "CRIT" };
+      }
 
-      // CHECK 10: Session-specific pattern failure — v8: needs 3 (was 2)
-      const sessionName = Sessions.getCurrent().primary.name;
-      const simKey = fp.split("|").slice(0, 4).join("|");
-      const sessionLosses = this.losses.filter(e => e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
-      const sessionWins = this.wins.filter(e => e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
-      if (sessionLosses.length >= 3 && sessionWins.length < sessionLosses.length * 0.35) {
-        return { blocked: true, reason: `Pattern fails in ${sessionName} (${sessionWins.length}W/${sessionLosses.length}L)`, severity: "MED" };
+      // CHECK 10: Session-specific pattern failure — v9.1: needs 4 (was 3), skip in relaxed
+      if (!relaxed) {
+        const sessionName = Sessions.getCurrent().primary.name;
+        const simKey = fp.split("|").slice(0, 4).join("|");
+        const sessionLosses = this.losses.filter(e => e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
+        const sessionWins = this.wins.filter(e => e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
+        if (sessionLosses.length >= 4 && sessionWins.length < sessionLosses.length * 0.35) {
+          return { blocked: true, reason: `Pattern fails in ${sessionName} (${sessionWins.length}W/${sessionLosses.length}L)`, severity: "MED" };
+        }
       }
 
       return { blocked: false };
     } catch { return { blocked: false }; }
   },
-  // ═══ v8.0 EXIT-REASON PATTERN ANALYSIS (less aggressive) ═══
+  // ═══ v9.1 EXIT-REASON PATTERN ANALYSIS (significantly less aggressive) ═══
   _checkExitReasonPattern(action, symbol) {
     try {
-      const WEEK = 7 * 864e5;
+      const THREE_DAYS = 3 * 864e5;  // v9.1: Shortened window from 1 week to 3 days
       const now = Date.now();
-      const recentLosses = this.losses.filter(e => e.action === action && now - e.ts < WEEK);
-      const recentWins = this.wins.filter(e => e.action === action && now - e.ts < WEEK);
-      if (recentLosses.length < 3) return null;
+      const recentLosses = this.losses.filter(e => e.action === action && now - e.ts < THREE_DAYS);
+      const recentWins = this.wins.filter(e => e.action === action && now - e.ts < THREE_DAYS);
+      if (recentLosses.length < 5) return null;  // v9.1: needs 5 losses minimum (was 3)
 
       const exitReasons = {};
       recentLosses.forEach(e => {
@@ -2801,19 +2847,19 @@ const Brain = {
         exitReasons[reason].totalLoss += (e.loss || 0);
       });
 
-      // v8: needs 5 losses and $0.40 before blocking (was 3/$0.10)
+      // v9.1: needs 7 losses and $0.60 before blocking (was 5/$0.40)
       for (const [reason, data] of Object.entries(exitReasons)) {
-        if (data.losses >= 5 && data.totalLoss > 0.40) {
-          if (data.losses / recentLosses.length > 0.5) {
+        if (data.losses >= 7 && data.totalLoss > 0.60) {
+          if (data.losses / recentLosses.length > 0.6) {
             return { blocked: true, reason: `"${reason}" caused ${data.losses} losses ($${data.totalLoss.toFixed(2)}) — learned to avoid`, severity: "HIGH" };
           }
         }
       }
 
-      // v8: SL block needs 6 SLs at 65% dominance (was 3 at 50%)
+      // v9.1: SL block needs 8 SLs at 75% dominance (was 6 at 65%) — ONLY within 3 days
       const slCount = (exitReasons["Stop Loss"]?.losses || 0);
-      if (slCount >= 6 && slCount / recentLosses.length > 0.65) {
-        return { blocked: true, reason: `${slCount} stop losses this week for ${action} — entry timing bad`, severity: "HIGH" };
+      if (slCount >= 8 && slCount / recentLosses.length > 0.75) {
+        return { blocked: true, reason: `${slCount} stop losses in 3 days for ${action} — entry timing bad`, severity: "HIGH" };
       }
 
       return null;
@@ -2858,38 +2904,39 @@ const Brain = {
       const rk = this.regimeKey(indicators, action);
       let mod = 0;
 
-      // Win rate based modifier
-      if (wr.total >= 2) {
+      // Win rate based modifier — v9.1: capped penalties
+      if (wr.total >= 3) {  // v9.1: needs 3 (was 2) for penalties
         if (wr.rate > 75) mod += 18;
         else if (wr.rate > 65) mod += 10;
         else if (wr.rate > 55) mod += 4;
-        else if (wr.rate < 20) mod -= 30;   // Terrible: near-block level
-        else if (wr.rate < 30) mod -= 20;   // Very bad (was -25 at <25)
-        else if (wr.rate < 40) mod -= 12;   // Bad
-        else if (wr.rate < 48) mod -= 6;    // Below average
+        else if (wr.rate < 20) mod -= 15;   // v9.1: capped from -30 (was destroying signals)
+        else if (wr.rate < 30) mod -= 10;   // v9.1: reduced from -20
+        else if (wr.rate < 40) mod -= 6;    // v9.1: reduced from -12
+        else if (wr.rate < 48) mod -= 3;    // v9.1: reduced from -6
       }
 
-      // ═══ v8.0: Regime penalty — requires 4+ trades (was 2) before penalizing ═══
+      // ═══ v9.1: Regime penalty — requires 5+ trades (was 4) before penalizing, reduced impact ═══
       const TWO_WEEKS = 14 * 864e5;
       const now = Date.now();
       const regimeLosses = this.losses.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS).length;
       const regimeWins = this.wins.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS).length;
       const regimeTotal = regimeLosses + regimeWins;
-      if (regimeTotal >= 4) {
+      if (regimeTotal >= 5) {
         const regimeWR = (regimeWins / regimeTotal) * 100;
-        if (regimeWR < 30) mod -= 8;  // v8: reduced from -10
-        else if (regimeWR < 40) mod -= 4;  // v8: reduced from -5
+        if (regimeWR < 30) mod -= 5;  // v9.1: reduced from -8
+        else if (regimeWR < 40) mod -= 2;  // v9.1: reduced from -4
       }
 
-      // ═══ v8.0: Exit-reason penalty — needs 5 losses (was 3) ═══
+      // ═══ v9.1: Exit-reason penalty — needs 7 losses (was 5), reduced multiplier ═══
       const WEEK = 7 * 864e5;
       const timeExitLosses = this.losses.filter(e => e.action === action && (e.exitReason || "").includes("Time Exit") && now - e.ts < WEEK).length;
-      if (timeExitLosses >= 5) mod -= (timeExitLosses * 1.5);  // v8: needs 5+ and lower penalty
+      if (timeExitLosses >= 7) mod -= (timeExitLosses * 1.0);  // v9.1: needs 7+ and lower multiplier
 
       const slLosses = this.losses.filter(e => e.action === action && e.exitReason === "Stop Loss" && now - e.ts < WEEK).length;
-      if (slLosses >= 5) mod -= (slLosses * 1.5);  // v8: needs 5+ SLs before penalizing
+      if (slLosses >= 7) mod -= (slLosses * 1.0);  // v9.1: needs 7+ SLs, reduced from 1.5x
 
-      return mod;
+      // ═══ v9.1: HARD CAP — Never let brain penalty destroy signals completely ═══
+      return Math.max(MAX_CONF_PENALTY, mod);
     } catch { return 0; }
   },
   // ═══ v7.5 NEW: MTF CONFIDENCE — Check if this action needs MTF support ═══
@@ -3903,9 +3950,20 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       tp = adapted.tp;
       if (adapted.adapted) reasons.push(`Adaptive TP/SL: ${adapted.regime} (${adapted.historyCount} trades)`);
       const blockCheck = Brain.shouldBlock(indicators, "LONG", symbol);
-      if (blockCheck.blocked) { action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason); }
+      if (blockCheck.blocked) {
+        // ═══ v9.1: HIGH-CONFIDENCE OVERRIDE — Don't freeze when signal is very strong ═══
+        if (rawConf >= HIGH_CONF_OVERRIDE && blockCheck.severity !== "CRIT") {
+          reasons.unshift("BRAIN OVERRIDE: " + blockCheck.reason + " — but signal strong enough");
+          finalConf -= 8; // Small penalty instead of full block
+        } else {
+          action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason);
+        }
+      }
       const wr = Brain.getWinRate(indicators, "LONG", symbol);
-      if (wr.total >= 3 && wr.rate < 42) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate, 0)}% (${wr.wins}W/${wr.losses}L) [${wr.layer}] — too low`); }
+      if (wr.total >= 5 && wr.rate < 30) {
+        if (rawConf < HIGH_CONF_OVERRIDE) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate, 0)}% (${wr.wins}W/${wr.losses}L) [${wr.layer}] — too low`); }
+        else { reasons.unshift(`Pattern WR low but signal strong — override`); finalConf -= 5; }
+      }
       finalConf += Brain.getConfidenceModifier(indicators, "LONG", symbol);
     } else if (bearPct > pctThreshold && rawConf > confThreshold) {
       action = "SHORT";
@@ -3915,9 +3973,20 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       tp = adapted.tp;
       if (adapted.adapted) reasons.push(`Adaptive TP/SL: ${adapted.regime} (${adapted.historyCount} trades)`);
       const blockCheck = Brain.shouldBlock(indicators, "SHORT", symbol);
-      if (blockCheck.blocked) { action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason); }
+      if (blockCheck.blocked) {
+        // ═══ v9.1: HIGH-CONFIDENCE OVERRIDE — Don't freeze when signal is very strong ═══
+        if (rawConf >= HIGH_CONF_OVERRIDE && blockCheck.severity !== "CRIT") {
+          reasons.unshift("BRAIN OVERRIDE: " + blockCheck.reason + " — but signal strong enough");
+          finalConf -= 8;
+        } else {
+          action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason);
+        }
+      }
       const wr = Brain.getWinRate(indicators, "SHORT", symbol);
-      if (wr.total >= 3 && wr.rate < 42) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate, 0)}% (${wr.wins}W/${wr.losses}L) [${wr.layer}] — too low`); }
+      if (wr.total >= 5 && wr.rate < 30) {
+        if (rawConf < HIGH_CONF_OVERRIDE) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate, 0)}% (${wr.wins}W/${wr.losses}L) [${wr.layer}] — too low`); }
+        else { reasons.unshift(`Pattern WR low but signal strong — override`); finalConf -= 5; }
+      }
       finalConf += Brain.getConfidenceModifier(indicators, "SHORT", symbol);
     }
 
@@ -4059,6 +4128,25 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     if (action !== "WAIT" && atrPct > VOL_FILTER_MAX_ATR) {
       action = "WAIT";
       reasons.unshift(`ATR ${fx(atrPct, 2)}% > ${VOL_FILTER_MAX_ATR}% — too volatile, SL will get hunted`);
+    }
+
+    // ═══ v9.1: ANTI-CHOP FILTER — Detect alternating LONG/SHORT losses (market is ranging, bot is chopping) ═══
+    if (action !== "WAIT" && history.length >= 4) {
+      const last4 = history.slice(0, 4);
+      const allLosses = last4.every(h => h.net <= 0);
+      const hasLong = last4.some(h => h.side === "LONG");
+      const hasShort = last4.some(h => h.side === "SHORT");
+      const allSL = last4.every(h => (h.reason || "").includes("Stop Loss"));
+      if (allLosses && hasLong && hasShort && allSL) {
+        // Market is chopping — require very high confidence to trade
+        const chopMinConf = 72;
+        if (finalConf < chopMinConf) {
+          action = "WAIT";
+          reasons.unshift(`Anti-chop: 4+ alternating SL losses, need ${chopMinConf}% conf (have ${fx(finalConf, 0)}%)`);
+        } else {
+          reasons.push("Anti-chop: high conf override on chop detection");
+        }
+      }
     }
     // Stack-awareness: note when adding to existing position
     const samePairOpen = positions.filter(p => p.pair === symbol);
@@ -4972,6 +5060,12 @@ export default function NexusV7() {
 
       // ═══ CONSECUTIVE LOSS COOLDOWN ═══
       if (cooldownUntil > Date.now()) {
+        // v9.1: Cap maximum cooldown at 10 minutes — never let it persist longer
+        const maxCooldown = 10 * 60 * 1000;
+        if (cooldownUntil - Date.now() > maxCooldown) {
+          setCooldownUntil(Date.now() + maxCooldown);
+          console.log(`[NEXUS] ⏸ Cooldown was stale/excessive — capped to 10min`);
+        }
         const remaining = Math.ceil((cooldownUntil - Date.now()) / 60000);
         console.log(`[NEXUS] ⏸ Loss cooldown: ${remaining}min remaining`);
         return; // silently skip — cooldown active
@@ -5525,7 +5619,7 @@ export default function NexusV7() {
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
       <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }} />
-      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v9 | IQ ENGINE | LOADING</div>
+      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v9.1 | IQ ENGINE | LOADING</div>
     </div>
   );
 
@@ -5539,7 +5633,7 @@ export default function NexusV7() {
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v9 IQ</div>
+            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v9.1 IQ</div>
             <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}><span style={{ color: iqScore >= 150 ? K.up : iqScore >= 120 ? K.gold : iqScore >= 90 ? K.warn : K.dn, fontWeight: 800 }}>{iqScore} IQ</span> | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
@@ -5650,7 +5744,7 @@ export default function NexusV7() {
 
         {/* AI ENGINE */}
         {tab === "ai" && aiResult && <div style={S.card}>
-          <div style={{ fontSize: 8, color: K.txM, letterSpacing: 2, marginBottom: 14 }}>AI ENGINE v9 | {iqScore} IQ | 5 STRUCTURAL GATES + ZONES + MTF {(geminiKey || groqKey) ? "+ LLM BRAIN" : ""} | {aiResult.analysis?.brainPatterns || 0} LEARNED | {session?.primary?.name} SESSION</div>
+          <div style={{ fontSize: 8, color: K.txM, letterSpacing: 2, marginBottom: 14 }}>AI ENGINE v9.1 | {iqScore} IQ | 5 STRUCTURAL GATES + ZONES + MTF {(geminiKey || groqKey) ? "+ LLM BRAIN" : ""} | {aiResult.analysis?.brainPatterns || 0} LEARNED | {session?.primary?.name} SESSION</div>
 
           {/* ═══ DRAWDOWN ESCALATION BAR ═══ */}
           <div style={{ marginBottom: 12, padding: 10, background: K.s2, borderRadius: 8, border: `1px solid ${drawdownState?.tier?.color || K.bd}30` }}>
