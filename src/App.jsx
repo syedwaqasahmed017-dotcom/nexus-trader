@@ -724,27 +724,44 @@ const FundingRateEngine = {
       const results = {};
       const proxies = CORS_PROXIES.filter(Boolean);
 
+      // v9.2: fapi.binance.com returns 451 (geo-blocked) on many servers
+      // Use multiple fallback endpoints
+      const fundingEndpoints = [
+        sym => `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${sym}&limit=3`,
+        sym => `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${sym}`,
+        sym => `https://fapi.binance.com/fapi/v2/premiumIndex?symbol=${sym}`,
+      ];
+
       for (const sym of symbols) {
-        const url = `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${sym}&limit=3`;
-        for (const proxy of proxies) {
-          try {
-            const res = await fetch(proxy + encodeURIComponent(url), { signal: AbortSignal.timeout(8000) });
-            if (!res.ok) continue;
-            const data = await res.json();
-            if (!Array.isArray(data) || data.length === 0) continue;
-            const current = parseFloat(data[0].fundingRate);
-            const prev = data.length > 1 ? parseFloat(data[1].fundingRate) : current;
-            results[sym] = {
-              rate: current,
-              prevRate: prev,
-              annualized: current * 3 * 365 * 100, // APR equivalent
-              trend: current > prev ? "rising" : current < prev ? "falling" : "stable",
-              extreme: Math.abs(current) > 0.001, // >0.1% is extreme
-              veryExtreme: Math.abs(current) > 0.003, // >0.3% is very extreme
-              crowded: current > 0.0005 ? "longs" : current < -0.0005 ? "shorts" : "balanced",
-            };
-            break;
-          } catch { continue; }
+        let found = false;
+        for (const epFn of fundingEndpoints) {
+          if (found) break;
+          const url = epFn(sym);
+          for (const proxy of proxies) {
+            try {
+              const res = await fetch(proxy + encodeURIComponent(url), { signal: AbortSignal.timeout(6000) });
+              if (!res.ok) { if (res.status === 451 || res.status === 403) break; continue; }
+              const data = await res.json();
+              // Handle both fundingRate array and premiumIndex object
+              let current, prev;
+              if (Array.isArray(data) && data.length > 0) {
+                current = parseFloat(data[0].fundingRate || data[0].lastFundingRate || 0);
+                prev = data.length > 1 ? parseFloat(data[1].fundingRate || 0) : current;
+              } else if (data?.lastFundingRate) {
+                current = parseFloat(data.lastFundingRate);
+                prev = current;
+              } else continue;
+              results[sym] = {
+                rate: current, prevRate: prev,
+                annualized: current * 3 * 365 * 100,
+                trend: current > prev ? "rising" : current < prev ? "falling" : "stable",
+                extreme: Math.abs(current) > 0.001,
+                veryExtreme: Math.abs(current) > 0.003,
+                crowded: current > 0.0005 ? "longs" : current < -0.0005 ? "shorts" : "balanced",
+              };
+              found = true; break;
+            } catch { continue; }
+          }
         }
       }
 
@@ -3177,12 +3194,12 @@ const Brain = {
         return { blocked: true, reason: `Pattern net loss $${(broadDollarLoss - broadDollarWin).toFixed(2)} — money drain`, severity: "MED" };
       }
 
-      // CHECK 8: Pair losses in 1 hour — v9.2: needs 2 (was 3 — by 3rd we've already lost too much)
-      const pairLosses = this.losses.filter(e => e.pair === symbol && now - e.ts < HOUR);
+      // CHECK 8: Pair losses in 1 hour — v9.2: real trades only (not expert seed)
+      const pairLosses = this.losses.filter(e => e.pair === symbol && e.source !== "expert" && now - e.ts < HOUR);
       if (pairLosses.length >= 2) return { blocked: true, reason: `${pairLosses.length} losses on ${symbol} in 1h`, severity: "MED" };
 
-      // CHECK 9: Emergency brake — v9.2: 4 in 2h (was 6 — too slow)
-      const allRecent = this.losses.filter(e => now - e.ts < HOUR * 2);
+      // CHECK 9: Emergency brake — v9.2: real trades only
+      const allRecent = this.losses.filter(e => e.source !== "expert" && now - e.ts < HOUR * 2);
       if (allRecent.length >= 4) return { blocked: true, reason: `${allRecent.length} losses in 2h — emergency brake`, severity: "CRIT" };
 
       // CHECK 10: Session-specific pattern failure — v8: needs 3 (was 2)
@@ -3202,8 +3219,9 @@ const Brain = {
     try {
       const WEEK = 7 * 864e5;
       const now = Date.now();
-      const recentLosses = this.losses.filter(e => e.action === action && now - e.ts < WEEK);
-      const recentWins = this.wins.filter(e => e.action === action && now - e.ts < WEEK);
+      // v9.2: real trades only — expert seed entries must not trigger blocking
+      const recentLosses = this.losses.filter(e => e.action === action && e.source !== "expert" && now - e.ts < WEEK);
+      const recentWins = this.wins.filter(e => e.action === action && e.source !== "expert" && now - e.ts < WEEK);
       if (recentLosses.length < 3) return null;
 
       const exitReasons = {};
@@ -3241,26 +3259,48 @@ const Brain = {
       const MONTH = 30 * 864e5;
       const now = Date.now();
 
-      // Layer 1: Exact fingerprint
+      // v9.2: Prefer REAL trades for win rate — use expert only as fallback when no real data
+      // Real trades = no source field or source !== 'expert'
+      const isReal = e => e.source !== "expert";
+      const isExpert = e => e.source === "expert";
+
+      // Layer 1: Exact fingerprint — real trades first
       const exactKey = fp.split("|").slice(0, 5).join("|");
-      const exactLoss = this.losses.filter(e => e.fp.startsWith(exactKey) && now - e.ts < MONTH).length;
-      const exactWin = this.wins.filter(e => e.fp.startsWith(exactKey) && now - e.ts < MONTH).length;
-      const exactTotal = exactWin + exactLoss;
+      const exactLossR = this.losses.filter(e => isReal(e) && e.fp.startsWith(exactKey) && now - e.ts < MONTH).length;
+      const exactWinR = this.wins.filter(e => isReal(e) && e.fp.startsWith(exactKey) && now - e.ts < MONTH).length;
+      const exactTotalR = exactWinR + exactLossR;
 
-      // Layer 2: Medium fingerprint (NEW — better overlap than exact)
-      const mLoss = this.losses.filter(e => e.mfp === mfp && now - e.ts < MONTH).length;
-      const mWin = this.wins.filter(e => e.mfp === mfp && now - e.ts < MONTH).length;
-      const medTotal = mWin + mLoss;
+      // Layer 2: Medium fingerprint — real trades
+      const mLossR = this.losses.filter(e => isReal(e) && e.mfp === mfp && now - e.ts < MONTH).length;
+      const mWinR = this.wins.filter(e => isReal(e) && e.mfp === mfp && now - e.ts < MONTH).length;
+      const medTotalR = mWinR + mLossR;
 
-      // Layer 3: Broad fingerprint
-      const bLoss = this.losses.filter(e => e.bfp === bfp && now - e.ts < MONTH).length;
-      const bWin = this.wins.filter(e => e.bfp === bfp && now - e.ts < MONTH).length;
-      const broadTotal = bWin + bLoss;
+      // Layer 3: Broad fingerprint — real trades
+      const bLossR = this.losses.filter(e => isReal(e) && e.bfp === bfp && now - e.ts < MONTH).length;
+      const bWinR = this.wins.filter(e => isReal(e) && e.bfp === bfp && now - e.ts < MONTH).length;
+      const broadTotalR = bWinR + bLossR;
 
-      // Prefer most specific layer that has enough data
-      if (exactTotal >= 3) return { rate: (exactWin / exactTotal) * 100, total: exactTotal, wins: exactWin, losses: exactLoss, layer: "exact" };
-      if (medTotal >= 2) return { rate: (mWin / medTotal) * 100, total: medTotal, wins: mWin, losses: mLoss, layer: "medium" };
-      if (broadTotal >= 2) return { rate: (bWin / broadTotal) * 100, total: broadTotal, wins: bWin, losses: bLoss, layer: "broad" };
+      // Use real trades if enough data
+      if (exactTotalR >= 3) return { rate: (exactWinR / exactTotalR) * 100, total: exactTotalR, wins: exactWinR, losses: exactLossR, layer: "exact" };
+      if (medTotalR >= 2) return { rate: (mWinR / medTotalR) * 100, total: medTotalR, wins: mWinR, losses: mLossR, layer: "medium" };
+      if (broadTotalR >= 2) return { rate: (bWinR / broadTotalR) * 100, total: broadTotalR, wins: bWinR, losses: bLossR, layer: "broad" };
+
+      // Fallback: use expert seed data for guidance when no real trades yet
+      const exactLossE = this.losses.filter(e => isExpert(e) && e.fp.startsWith(exactKey) && now - e.ts < MONTH).length;
+      const exactWinE = this.wins.filter(e => isExpert(e) && e.fp.startsWith(exactKey) && now - e.ts < MONTH).length;
+      const exactTotalE = exactWinE + exactLossE;
+      const mLossE = this.losses.filter(e => isExpert(e) && e.mfp === mfp && now - e.ts < MONTH).length;
+      const mWinE = this.wins.filter(e => isExpert(e) && e.mfp === mfp && now - e.ts < MONTH).length;
+      const medTotalE = mWinE + mLossE;
+      const bLossE = this.losses.filter(e => isExpert(e) && e.bfp === bfp && now - e.ts < MONTH).length;
+      const bWinE = this.wins.filter(e => isExpert(e) && e.bfp === bfp && now - e.ts < MONTH).length;
+      const broadTotalE = bWinE + bLossE;
+
+      // Expert data gives gentler modifier (+/-8 max via halved rate deviation from 50)
+      if (exactTotalE >= 3) { const r = (exactWinE/exactTotalE)*100; return { rate: 50 + (r-50)*0.4, total: exactTotalE, wins: exactWinE, losses: exactLossE, layer: "expert-exact" }; }
+      if (medTotalE >= 2) { const r = (mWinE/medTotalE)*100; return { rate: 50 + (r-50)*0.4, total: medTotalE, wins: mWinE, losses: mLossE, layer: "expert-medium" }; }
+      if (broadTotalE >= 2) { const r = (bWinE/broadTotalE)*100; return { rate: 50 + (r-50)*0.4, total: broadTotalE, wins: bWinE, losses: bLossE, layer: "expert-broad" }; }
+
       return { rate: 50, total: 0, wins: 0, losses: 0, layer: "none" };
     } catch { return { rate: 50, total: 0, wins: 0, losses: 0, layer: "none" }; }
   },
@@ -3296,11 +3336,14 @@ const Brain = {
 
       // ═══ v8.0: Exit-reason penalty — needs 5 losses (was 3) ═══
       const WEEK = 7 * 864e5;
-      const timeExitLosses = this.losses.filter(e => e.action === action && (e.exitReason || "").includes("Time Exit") && now - e.ts < WEEK).length;
-      if (timeExitLosses >= 5) mod -= (timeExitLosses * 1.5);  // v8: needs 5+ and lower penalty
+      // v9.2 FIX: Only real trades count for exit-reason penalties, not expert seed entries
+      const timeExitLosses = this.losses.filter(e => e.action === action && e.source !== "expert" && (e.exitReason || "").includes("Time Exit") && now - e.ts < WEEK).length;
+      if (timeExitLosses >= 5) mod -= (timeExitLosses * 1.5);
 
-      const slLosses = this.losses.filter(e => e.action === action && e.exitReason === "Stop Loss" && now - e.ts < WEEK).length;
-      if (slLosses >= 5) mod -= (slLosses * 1.5);  // v8: needs 5+ SLs before penalizing
+      // v9.2 FIX: Exclude expert-seeded entries from SL penalty — they aren't real trades
+      // Expert entries have source='expert', real trades don't have source field
+      const slLosses = this.losses.filter(e => e.action === action && e.exitReason === "Stop Loss" && e.source !== "expert" && now - e.ts < WEEK).length;
+      if (slLosses >= 5) mod -= (slLosses * 1.5);  // Only real SL trades count
 
       return mod;
     } catch { return 0; }
