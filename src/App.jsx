@@ -43,7 +43,7 @@ const STACK_SIZE_DECAY = [1, 0.8, 0.6, 0.45, 0.3]; // Position size multiplier: 
 const COOL_AFTER_LOSS_BASE = 60000;   // 1min base cooldown (v8: faster recovery)
 const COOL_AFTER_LOSS_MAX = 300000;   // 5min max cooldown (v8: less time wasted)
 const MAX_TRADES_PER_SESSION = 20;
-const MIN_CONF_TO_TRADE = 50; // v9.2: raised from 42 — stop entering on weak signals
+const MIN_CONF_TO_TRADE = 45; // v9.2: lowered from 50 — signals are consistently 46-49% with good setups
 // ═══ PRICE SANITY — Prevent fake PnL from stale/fallback prices ═══
 const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real
 const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real
@@ -107,6 +107,10 @@ const CORS_PROXIES = [
   "https://api.allorigins.win/raw?url=",
   "https://corsproxy.io/?url=",
 ];
+
+// v9.2: Binance spot API (api.binance.com) allows direct browser calls — no proxy needed
+// The Render proxy geo-blocks Binance (451). Try direct first, then fallback proxies.
+const BINANCE_PROXIES = ["", ...CORS_PROXIES]; // "" = direct call, no proxy
 
 // ╔══════════════════════════════════════════════════════════════╗
 // SOCIAL ENGINE — Real Fear & Greed API + Reddit Sentiment
@@ -722,17 +726,15 @@ const FundingRateEngine = {
       if (this._cache && Date.now() - this._cacheTime < this._interval) return this._cache;
       const symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"];
       const results = {};
-      const proxies = CORS_PROXIES.filter(Boolean);
-
-      // v9.2 FIX: fapi.binance.com is geo-blocked (451) from Render servers
-      // Use spot API ticker24h to estimate funding sentiment from price action
+      const proxies = BINANCE_PROXIES; // try direct first — proxy geo-blocks Binance
       // Positive premium (futures > spot) = longs paying = bearish funding
       // We approximate via 24h price change momentum as funding proxy
       for (const sym of symbols) {
-        const url = `https://api.binance.com/api/v3/ticker/24hr?symbol=${sym}`;
-        for (const proxy of proxies) {
+        const binanceUrl = `https://api.binance.com/api/v3/ticker/24hr?symbol=${sym}`;
+        for (const proxy of BINANCE_PROXIES) {
           try {
-            const res = await fetch(proxy + encodeURIComponent(url), { signal: AbortSignal.timeout(5000) });
+            const url = proxy ? proxy + encodeURIComponent(binanceUrl) : binanceUrl;
+            const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
             if (!res.ok) continue;
             const d = await res.json();
             if (!d?.priceChangePercent) continue;
@@ -810,12 +812,12 @@ const OrderBookEngine = {
   async fetchDepth(symbol) {
     try {
       if (this._cache[symbol] && Date.now() - (this._cacheTime[symbol] || 0) < this._interval) return this._cache[symbol];
-      const proxies = CORS_PROXIES.filter(Boolean);
       const url = `https://api.binance.com/api/v3/depth?symbol=${symbol}&limit=50`;
 
-      for (const proxy of proxies) {
+      for (const proxy of BINANCE_PROXIES) {
         try {
-          const res = await fetch(proxy + encodeURIComponent(url), { signal: AbortSignal.timeout(8000) });
+          const fetchUrl = proxy ? proxy + encodeURIComponent(url) : url;
+          const res = await fetch(fetchUrl, { signal: AbortSignal.timeout(6000) });
           if (!res.ok) continue;
           const data = await res.json();
           if (!data?.bids?.length || !data?.asks?.length) continue;
@@ -899,19 +901,15 @@ const LiquidationEngine = {
   async fetchOpenInterest(symbol) {
     try {
       if (this._cache && Date.now() - this._cacheTime < 300000) return this._cache;
-      const proxies = CORS_PROXIES.filter(Boolean);
-
-      // v9.2: fapi.binance.com is geo-blocked (451) on Render
-      // Estimate OI from spot 24h quoteVolume as a proxy
       const url = `https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`;
-      for (const proxy of proxies) {
+      for (const proxy of BINANCE_PROXIES) {
         try {
-          const res = await fetch(proxy + encodeURIComponent(url), { signal: AbortSignal.timeout(5000) });
+          const fetchUrl = proxy ? proxy + encodeURIComponent(url) : url;
+          const res = await fetch(fetchUrl, { signal: AbortSignal.timeout(5000) });
           if (!res.ok) continue;
           const d = await res.json();
           if (!d?.quoteVolume) continue;
-          // quoteVolume in USD / typical price ≈ estimated open interest (rough)
-          const estimatedOI = parseFloat(d.quoteVolume) * 0.15; // ~15% of daily volume stays open
+          const estimatedOI = parseFloat(d.quoteVolume) * 0.15;
           this._cache = { openInterest: estimatedOI, symbol, live: true, estimated: true, timestamp: Date.now() };
           this._cacheTime = Date.now();
           return this._cache;
@@ -1020,11 +1018,12 @@ const CorrelationEngine = {
         } catch { continue; }
       }
 
-      // Fetch ETH/BTC ratio from Binance spot ticker (klines is 451 blocked on Render)
+      // Fetch ETH/BTC ratio — direct call first, proxy blocks Binance
       let ethBtcRatio = null;
-      for (const proxy of proxies) {
+      for (const proxy of BINANCE_PROXIES) {
         try {
-          const url = proxy + encodeURIComponent("https://api.binance.com/api/v3/ticker/24hr?symbol=ETHBTC");
+          const binanceUrl = "https://api.binance.com/api/v3/ticker/24hr?symbol=ETHBTC";
+          const url = proxy ? proxy + encodeURIComponent(binanceUrl) : binanceUrl;
           const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
           if (!res.ok) continue;
           const d = await res.json();
@@ -3341,7 +3340,7 @@ const Brain = {
       // v9.2 FIX: Exclude expert-seeded entries from SL penalty — they aren't real trades
       // Expert entries have source='expert', real trades don't have source field
       const slLosses = this.losses.filter(e => e.action === action && e.exitReason === "Stop Loss" && e.source !== "expert" && now - e.ts < WEEK).length;
-      if (slLosses >= 5) mod -= (slLosses * 1.5);  // Only real SL trades count
+      if (slLosses >= 5) mod -= (slLosses * 1.0); // v9.2: reduced from 1.5 — still penalizes but doesn't kill signal
 
       return mod;
     } catch { return 0; }
