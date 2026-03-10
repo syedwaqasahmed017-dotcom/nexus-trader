@@ -18,8 +18,9 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 // ✦ WIDER TP — 5.0-7.0x ATR (was 4.0-6.0x) — bigger winners when right
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-// ═══ CONSTANTS ═══
-const FEE_RATE = 0.002;
+// v9.2 deploy timestamp — losses BEFORE this date used broken tight SLs and must be ignored for blocking
+// Set to deployment date so brain only learns from trades made with correct parameters
+const V9_DEPLOY_TS = new Date("2025-11-03T00:00:00Z").getTime();
 // ═══ REALISTIC EXECUTION ═══
 // Real Binance fees (0.2%) + market slippage + vol-adjusted friction
 // What you see in training = what you get with real money
@@ -3149,30 +3150,35 @@ const Brain = {
       const HOUR = 36e5;
       const now = Date.now();
 
-      // CHECK 1: Cooldown timer (severity-scaled in recordLoss)
+      // v9.2: Only count losses from AFTER v9.2 deploy — old trades used broken tight SLs
+      // Losses before V9_DEPLOY_TS are from a broken bot and must not block a fixed bot
+      const isValidLoss = e => e.source !== "expert" && e.ts >= V9_DEPLOY_TS;
+      const isValidWin  = e => e.source !== "expert" && e.ts >= V9_DEPLOY_TS;
+
+      // CHECK 1: Cooldown timer
       if (now < this.coolUntil) return { blocked: true, reason: `Cooling down (${Math.ceil((this.coolUntil - now) / 1000)}s)`, severity: "COOL" };
 
-      // CHECK 2: Exact fingerprint — v8: needs 4 losses (was 2 — too aggressive)
-      const exactLosses = this.losses.filter(e => e.fp === fp && now - e.ts < TWO_WEEKS);
+      // CHECK 2: Exact fingerprint
+      const exactLosses = this.losses.filter(e => isValidLoss(e) && e.fp === fp && now - e.ts < TWO_WEEKS);
       if (exactLosses.length >= 4) return { blocked: true, reason: `Exact pattern lost ${exactLosses.length}x recently`, severity: "HIGH" };
 
-      // CHECK 3: Medium fingerprint — v8: needs 4 losses (was 2)
-      const medLosses = this.losses.filter(e => e.mfp === mfp && now - e.ts < WEEK);
-      const medWins = this.wins.filter(e => e.mfp === mfp && now - e.ts < WEEK);
+      // CHECK 3: Medium fingerprint
+      const medLosses = this.losses.filter(e => isValidLoss(e) && e.mfp === mfp && now - e.ts < WEEK);
+      const medWins = this.wins.filter(e => isValidWin(e) && e.mfp === mfp && now - e.ts < WEEK);
       if (medLosses.length >= 4 && medWins.length < medLosses.length * 0.4) {
         return { blocked: true, reason: `Medium pattern ${medWins.length}W/${medLosses.length}L this week`, severity: "HIGH" };
       }
 
-      // CHECK 4: Broad pattern — v8: needs 6 losses (was 3)
-      const broadLosses = this.losses.filter(e => e.bfp === bfp && now - e.ts < WEEK);
-      const broadWins = this.wins.filter(e => e.bfp === bfp && now - e.ts < WEEK);
+      // CHECK 4: Broad pattern
+      const broadLosses = this.losses.filter(e => isValidLoss(e) && e.bfp === bfp && now - e.ts < WEEK);
+      const broadWins = this.wins.filter(e => isValidWin(e) && e.bfp === bfp && now - e.ts < WEEK);
       if (broadLosses.length >= 6 && broadWins.length < broadLosses.length * 0.35) {
         return { blocked: true, reason: `Broad pattern ${broadWins.length}W/${broadLosses.length}L this week`, severity: "MED" };
       }
 
-      // CHECK 5: REGIME LEARNING — v8: needs 5 trades min (was 3), 2.5x ratio (was 2x)
-      const regimeLosses = this.losses.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
-      const regimeWins = this.wins.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
+      // CHECK 5: REGIME LEARNING
+      const regimeLosses = this.losses.filter(e => isValidLoss(e) && e.rk === rk && now - e.ts < TWO_WEEKS);
+      const regimeWins = this.wins.filter(e => isValidWin(e) && e.rk === rk && now - e.ts < TWO_WEEKS);
       const regimeTotal = regimeLosses.length + regimeWins.length;
       if (regimeTotal >= 5 && regimeLosses.length > regimeWins.length * 2.5) {
         return { blocked: true, reason: `${action} in this regime: ${regimeWins.length}W/${regimeLosses.length}L — learned to avoid`, severity: "HIGH" };
@@ -3182,19 +3188,19 @@ const Brain = {
       const exitReasonBlock = this._checkExitReasonPattern(action, symbol);
       if (exitReasonBlock) return exitReasonBlock;
 
-      // CHECK 7: CUMULATIVE $ LOSS — v8: needs 4 losses, $0.40 threshold (was 2/$0.15)
+      // CHECK 7: CUMULATIVE $ LOSS
       const broadDollarLoss = broadLosses.reduce((a, e) => a + (e.loss || 0), 0);
       const broadDollarWin = broadWins.reduce((a, e) => a + (e.profit || 0), 0);
       if (broadLosses.length >= 4 && broadDollarLoss > broadDollarWin * 1.5 && broadDollarLoss > 0.40) {
         return { blocked: true, reason: `Pattern net loss $${(broadDollarLoss - broadDollarWin).toFixed(2)} — money drain`, severity: "MED" };
       }
 
-      // CHECK 8: Pair losses in 1 hour — v9.2: real trades only (not expert seed)
-      const pairLosses = this.losses.filter(e => e.pair === symbol && e.source !== "expert" && now - e.ts < HOUR);
+      // CHECK 8: Pair losses in 1 hour
+      const pairLosses = this.losses.filter(e => isValidLoss(e) && e.pair === symbol && now - e.ts < HOUR);
       if (pairLosses.length >= 2) return { blocked: true, reason: `${pairLosses.length} losses on ${symbol} in 1h`, severity: "MED" };
 
-      // CHECK 9: Emergency brake — v9.2: real trades only
-      const allRecent = this.losses.filter(e => e.source !== "expert" && now - e.ts < HOUR * 2);
+      // CHECK 9: Emergency brake
+      const allRecent = this.losses.filter(e => isValidLoss(e) && now - e.ts < HOUR * 2);
       if (allRecent.length >= 4) return { blocked: true, reason: `${allRecent.length} losses in 2h — emergency brake`, severity: "CRIT" };
 
       // CHECK 10: Session-specific pattern failure — v8: needs 3 (was 2)
@@ -3214,9 +3220,9 @@ const Brain = {
     try {
       const WEEK = 7 * 864e5;
       const now = Date.now();
-      // v9.2: real trades only — expert seed entries must not trigger blocking
-      const recentLosses = this.losses.filter(e => e.action === action && e.source !== "expert" && now - e.ts < WEEK);
-      const recentWins = this.wins.filter(e => e.action === action && e.source !== "expert" && now - e.ts < WEEK);
+      // v9.2: real trades only AND only after v9.2 deploy — old broken-SL trades must not block
+      const recentLosses = this.losses.filter(e => e.source !== "expert" && e.ts >= V9_DEPLOY_TS && e.action === action && now - e.ts < WEEK);
+      const recentWins = this.wins.filter(e => e.source !== "expert" && e.ts >= V9_DEPLOY_TS && e.action === action && now - e.ts < WEEK);
       if (recentLosses.length < 3) return null;
 
       const exitReasons = {};
@@ -3334,13 +3340,13 @@ const Brain = {
       // ═══ v8.0: Exit-reason penalty — needs 5 losses (was 3) ═══
       const WEEK = 7 * 864e5;
       // v9.2 FIX: Only real trades count for exit-reason penalties, not expert seed entries
-      const timeExitLosses = this.losses.filter(e => e.action === action && e.source !== "expert" && (e.exitReason || "").includes("Time Exit") && now - e.ts < WEEK).length;
+      const timeExitLosses = this.losses.filter(e => e.action === action && e.source !== "expert" && e.ts >= V9_DEPLOY_TS && (e.exitReason || "").includes("Time Exit") && now - e.ts < WEEK).length;
       if (timeExitLosses >= 5) mod -= (timeExitLosses * 1.5);
 
       // v9.2 FIX: Exclude expert-seeded entries from SL penalty — they aren't real trades
       // Expert entries have source='expert', real trades don't have source field
-      const slLosses = this.losses.filter(e => e.action === action && e.exitReason === "Stop Loss" && e.source !== "expert" && now - e.ts < WEEK).length;
-      if (slLosses >= 5) mod -= (slLosses * 1.0); // v9.2: reduced from 1.5 — still penalizes but doesn't kill signal
+      const slLosses = this.losses.filter(e => e.action === action && e.exitReason === "Stop Loss" && e.source !== "expert" && e.ts >= V9_DEPLOY_TS && now - e.ts < WEEK).length;
+      if (slLosses >= 5) mod -= (slLosses * 1.0);
 
       return mod;
     } catch { return 0; }
