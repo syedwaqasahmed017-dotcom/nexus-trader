@@ -41,7 +41,7 @@ const STACK_SIZE_DECAY = [1, 0.8, 0.6, 0.45, 0.3]; // Position size multiplier: 
 const COOL_AFTER_LOSS_BASE = 60000;   // 1min base cooldown (v8: faster recovery)
 const COOL_AFTER_LOSS_MAX = 300000;   // 5min max cooldown (v8: less time wasted)
 const MAX_TRADES_PER_SESSION = 20;
-const MIN_CONF_TO_TRADE = 42;
+const MIN_CONF_TO_TRADE = 36;  // v8.1: lowered — 42 was too aggressive
 // ═══ PRICE SANITY — Prevent fake PnL from stale/fallback prices ═══
 const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real
 const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real
@@ -3677,18 +3677,18 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     if (regime === "squeeze") reasons.push("Squeeze - big move coming");
     if (regime === "volatile") reasons.push("High volatility - caution");
 
-    // ═══ TREND CONTINUATION ENGINE — Prevents oversold traps from blocking trend trades ═══
-    // In strong downtrends, RSI 30 + BB lower + near support are TRAPS not buy signals.
-    // Reward trend continuation so bearPct/bullPct can cross threshold despite oversold noise.
-    if (marketBias.bias === "bear" && marketBias.strength > 55) {
-      const trendBonus = Math.round((marketBias.strength - 55) * 0.45); // up to ~20 pts at 100%
+    // ═══ TREND CONTINUATION ENGINE v8.1 ═══
+    // Oversold indicators (RSI 30, BB lower, near support) are TRAPS in downtrends.
+    // Boost the winning side when market bias strongly confirms direction.
+    if (marketBias.bias === "bear" && marketBias.strength > 50) {
+      const trendBonus = Math.round((marketBias.strength - 50) * 0.5); // 0→25 pts at 100%
       bear += trendBonus;
-      if (trendBonus >= 5) reasons.push("Bear trend continuation (bias " + marketBias.strength + "%)");
+      if (trendBonus >= 6) reasons.push("Bear trend continuation (bias " + marketBias.strength + "%)");
     }
-    if (marketBias.bias === "bull" && marketBias.strength > 55) {
-      const trendBonus = Math.round((marketBias.strength - 55) * 0.45);
+    if (marketBias.bias === "bull" && marketBias.strength > 50) {
+      const trendBonus = Math.round((marketBias.strength - 50) * 0.5);
       bull += trendBonus;
-      if (trendBonus >= 5) reasons.push("Bull trend continuation (bias " + marketBias.strength + "%)");
+      if (trendBonus >= 6) reasons.push("Bull trend continuation (bias " + marketBias.strength + "%)");
     }
 
     // Local sentiment — context-aware: fear in bear market confirms trend
@@ -3849,15 +3849,17 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
 
     // ═══ TUNED THRESHOLDS v7.4 — Quality over quantity, must clear fee drag ═══
     const confThreshold = riskLevel === "HIGH" ? 42 : riskLevel === "MED" ? 36 : 30;
-    // In strong trending markets, relax pctThreshold — bias confirms direction
-    const biasThreshBonus = (marketBias.bias !== "neutral" && marketBias.strength > 60) ? 3 : 0;
-    const pctThreshold = (riskLevel === "HIGH" ? 58 : riskLevel === "MED" ? 55 : 52) - biasThreshBonus;
+    // v8.1: In strong trending markets, both thresholds relax — bias IS the confirmation
+    const biasBonus = (marketBias.bias !== "neutral" && marketBias.strength > 55)
+      ? Math.round((marketBias.strength - 55) * 0.35) : 0; // +0 to +16 pts at 100%
+    const effectiveConfThreshold = Math.max(18, confThreshold - biasBonus);
+    const pctThreshold = Math.max(48, (riskLevel === "HIGH" ? 58 : riskLevel === "MED" ? 55 : 52) - biasBonus);
 
     let action = "WAIT";
     let sl = 0, tp = 0;
     let finalConf = rawConf;
 
-    if (bullPct > pctThreshold && rawConf > confThreshold) {
+    if (bullPct > pctThreshold && rawConf > effectiveConfThreshold) {
       action = "LONG";
       // ═══ IQ v8: ADAPTIVE TP/SL — Per-regime historical optimization ═══
       const adapted = AdaptiveTPSL.calculate(indicators, "LONG", atrVal, price, Brain.wins, Brain.losses);
@@ -3869,7 +3871,7 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       const wr = Brain.getWinRate(indicators, "LONG", symbol);
       if (wr.total >= 3 && wr.rate < 42) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate,0)}% (${wr.wins}W/${wr.losses}L) [${wr.layer}] — too low`); }
       finalConf += Brain.getConfidenceModifier(indicators, "LONG", symbol);
-    } else if (bearPct > pctThreshold && rawConf > confThreshold) {
+    } else if (bearPct > pctThreshold && rawConf > effectiveConfThreshold) {
       action = "SHORT";
       // ═══ IQ v8: ADAPTIVE TP/SL — Per-regime historical optimization ═══
       const adapted = AdaptiveTPSL.calculate(indicators, "SHORT", atrVal, price, Brain.wins, Brain.losses);
@@ -3885,7 +3887,7 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
 
     // Log signal decision details
     if (action === "WAIT" && rawConf > 20) {
-      console.log(`[NEXUS] 🔍 Signal check: bull=${fx(bullPct,0)}% bear=${fx(bearPct,0)}% need>${pctThreshold}% | rawConf=${fx(rawConf,0)}% need>${confThreshold} | risk=${riskLevel}`);
+      console.log(`[NEXUS] 🔍 Signal check: bull=${fx(bullPct,0)}% bear=${fx(bearPct,0)}% need>${pctThreshold}% | rawConf=${fx(rawConf,0)}% need>${effectiveConfThreshold}(adj ${biasBonus}) | risk=${riskLevel} | bias=${marketBias.bias}${marketBias.strength}%`);
     }
 
     // ML Engine prediction
