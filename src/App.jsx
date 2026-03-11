@@ -1,26 +1,23 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v9.2 — EXPERT BRAIN + SL FIX + FAST LEARNING
+// NEXUS v8.0 — 140 IQ TRADING INTELLIGENCE (PRODUCTION GRADE)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// ✦ EXPERT BRAIN — 500+ proven BTC patterns pre-loaded on day 1
-// ✦ EXPERT ML — Feature-importance weights, knows RSI+MACD+trend matter most
-// ✦ WIDER SL — Min 0.8% hard floor, 2.0-3.0x ATR (was 1.2x — caused massacre)
-// ✦ FASTER BLOCKING — Brain stops bad patterns after 3 SL losses (was 6)
-// ✦ DEAD MARKET FILTER — Min ATR 0.60% — no trading in flat market
-// ✦ MATH VERIFIED — R:R 1.5:1 min, all regime/ATR combos tested
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// ✦ WIDER SL — Min 0.8% hard floor, 2.0-3.0x ATR multipliers (was 1.2-2.2x)
-// ✦ SMARTER BRAIN — Blocks after 3 SL losses (was 6!) + 2 losses/pair/hr
-// ✦ FASTER EMERGENCY BRAKE — 4 losses in 2h triggers halt (was 6)
-// ✦ HIGHER SIGNAL QUALITY — Conf threshold 50% (was 42%), pct thresholds raised
-// ✦ DEAD MARKET FILTER — Min ATR 0.40% (was 0.15%) — no trading in flat market
-// ✦ WIDER TP — 5.0-7.0x ATR (was 4.0-6.0x) — bigger winners when right
+// ✦ IQ ENGINE — Partial profit, conviction sizing, multi-stage trailing
+// ✦ FULL PERSISTENCE — Balance, positions, brain survive page refresh
+// ✦ AI AUTO-PILOT — Learns first, trades smart, stop button for user
+// ✦ BINANCE API PLUGIN — Connect real account when AI is trained
+// ✦ $100 START — Training account | realistic fees + slippage = real money results
+// ✦ SMART MONEY — Partial profits lock gains, breakeven SL = risk-free remainder
+// ✦ CONVICTION SIZING — Higher confidence = bigger position
+// ✦ VOLATILITY FILTER — Rejects trades in unfavorable conditions
+// ✦ LESS AGGRESSIVE BRAIN — Requires MORE evidence before self-blocking
+// ✦ 2% MIN TP — Ensures every trade clears fee drag with real profit
+// ✦ FULL SCREEN — Uses entire viewport
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-// v9.2 deploy timestamp — losses BEFORE this date used broken tight SLs and must be ignored for blocking
-// Set to deployment date so brain only learns from trades made with correct parameters
-const V9_DEPLOY_TS = new Date("2025-11-03T00:00:00Z").getTime();
+// ═══ CONSTANTS ═══
+const FEE_RATE = 0.002;
 // ═══ REALISTIC EXECUTION ═══
 // Real Binance fees (0.2%) + market slippage + vol-adjusted friction
 // What you see in training = what you get with real money
@@ -44,7 +41,7 @@ const STACK_SIZE_DECAY = [1, 0.8, 0.6, 0.45, 0.3]; // Position size multiplier: 
 const COOL_AFTER_LOSS_BASE = 60000;   // 1min base cooldown (v8: faster recovery)
 const COOL_AFTER_LOSS_MAX = 300000;   // 5min max cooldown (v8: less time wasted)
 const MAX_TRADES_PER_SESSION = 20;
-const MIN_CONF_TO_TRADE = 45; // v9.2: lowered from 50 — signals are consistently 46-49% with good setups
+const MIN_CONF_TO_TRADE = 42;
 // ═══ PRICE SANITY — Prevent fake PnL from stale/fallback prices ═══
 const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real
 const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real
@@ -62,7 +59,7 @@ const PARTIAL_PROFIT_RATIO = 0.5;     // Close 50% of position at first target
 const BREAKEVEN_AFTER_PARTIAL = true; // Move SL to breakeven after partial (THE KEY: can't lose after this)
 const CONVICTION_SIZING = true;       // Scale position size with conviction score
 const CONVICTION_MULT = { HIGH: 1.0, MEDIUM: 0.7, LOW: 0.45 }; // Position size multipliers
-const VOL_FILTER_MIN_ATR = 0.60;     // v9.2: raised to 0.60% — below this R:R math breaks down with wider SLs
+const VOL_FILTER_MIN_ATR = 0.15;     // Don't trade when ATR% is below this (too choppy, fees eat you)
 const VOL_FILTER_MAX_ATR = 4.5;      // Don't trade when ATR% is above this (too wild, SL gets hunted)
 const DAILY_MAX_LOSS_PCT = 3.0;      // Hard daily loss limit as % of starting balance
 const WIN_STREAK_BONUS = 0.1;        // +10% size per consecutive win (max 3 streaks = +30%)
@@ -108,10 +105,6 @@ const CORS_PROXIES = [
   "https://api.allorigins.win/raw?url=",
   "https://corsproxy.io/?url=",
 ];
-
-// v9.2: Binance spot API (api.binance.com) allows direct browser calls — no proxy needed
-// The Render proxy geo-blocks Binance (451). Try direct first, then fallback proxies.
-const BINANCE_PROXIES = ["", ...CORS_PROXIES]; // "" = direct call, no proxy
 
 // ╔══════════════════════════════════════════════════════════════╗
 // SOCIAL ENGINE — Real Fear & Greed API + Reddit Sentiment
@@ -727,34 +720,26 @@ const FundingRateEngine = {
       if (this._cache && Date.now() - this._cacheTime < this._interval) return this._cache;
       const symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"];
       const results = {};
-      const proxies = BINANCE_PROXIES; // try direct first — proxy geo-blocks Binance
-      // Positive premium (futures > spot) = longs paying = bearish funding
-      // We approximate via 24h price change momentum as funding proxy
+      const proxies = CORS_PROXIES.filter(Boolean);
+
       for (const sym of symbols) {
-        const binanceUrl = `https://api.binance.com/api/v3/ticker/24hr?symbol=${sym}`;
-        for (const proxy of BINANCE_PROXIES) {
+        const url = `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${sym}&limit=3`;
+        for (const proxy of proxies) {
           try {
-            const url = proxy ? proxy + encodeURIComponent(binanceUrl) : binanceUrl;
-            const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+            const res = await fetch(proxy + encodeURIComponent(url), { signal: AbortSignal.timeout(8000) });
             if (!res.ok) continue;
-            const d = await res.json();
-            if (!d?.priceChangePercent) continue;
-            const pct = parseFloat(d.priceChangePercent) / 100;
-            const vol = parseFloat(d.volume || 0);
-            const avgVol = parseFloat(d.quoteVolume || 0);
-            // Estimate funding: strong up move with high vol = longs crowded = positive funding
-            // strong down move = shorts crowded = negative funding
-            const estimatedRate = pct * 0.0003; // rough proxy: 1% move ≈ 0.0003 funding
-            const clampedRate = Math.max(-0.003, Math.min(0.003, estimatedRate));
+            const data = await res.json();
+            if (!Array.isArray(data) || data.length === 0) continue;
+            const current = parseFloat(data[0].fundingRate);
+            const prev = data.length > 1 ? parseFloat(data[1].fundingRate) : current;
             results[sym] = {
-              rate: clampedRate,
-              prevRate: clampedRate * 0.9,
-              annualized: clampedRate * 3 * 365 * 100,
-              trend: pct > 0 ? "rising" : "falling",
-              extreme: Math.abs(clampedRate) > 0.001,
-              veryExtreme: Math.abs(clampedRate) > 0.003,
-              crowded: clampedRate > 0.0005 ? "longs" : clampedRate < -0.0005 ? "shorts" : "balanced",
-              estimated: true, // flag as estimated not live
+              rate: current,
+              prevRate: prev,
+              annualized: current * 3 * 365 * 100, // APR equivalent
+              trend: current > prev ? "rising" : current < prev ? "falling" : "stable",
+              extreme: Math.abs(current) > 0.001, // >0.1% is extreme
+              veryExtreme: Math.abs(current) > 0.003, // >0.3% is very extreme
+              crowded: current > 0.0005 ? "longs" : current < -0.0005 ? "shorts" : "balanced",
             };
             break;
           } catch { continue; }
@@ -764,7 +749,6 @@ const FundingRateEngine = {
       if (Object.keys(results).length > 0) {
         this._cache = { rates: results, live: true, timestamp: Date.now() };
         this._cacheTime = Date.now();
-        console.log("[NEXUS] Funding rates estimated via spot ticker (fapi geo-blocked)");
       }
       return this._cache || this._fallback();
     } catch { return this._cache || this._fallback(); }
@@ -813,12 +797,12 @@ const OrderBookEngine = {
   async fetchDepth(symbol) {
     try {
       if (this._cache[symbol] && Date.now() - (this._cacheTime[symbol] || 0) < this._interval) return this._cache[symbol];
+      const proxies = CORS_PROXIES.filter(Boolean);
       const url = `https://api.binance.com/api/v3/depth?symbol=${symbol}&limit=50`;
 
-      for (const proxy of BINANCE_PROXIES) {
+      for (const proxy of proxies) {
         try {
-          const fetchUrl = proxy ? proxy + encodeURIComponent(url) : url;
-          const res = await fetch(fetchUrl, { signal: AbortSignal.timeout(6000) });
+          const res = await fetch(proxy + encodeURIComponent(url), { signal: AbortSignal.timeout(8000) });
           if (!res.ok) continue;
           const data = await res.json();
           if (!data?.bids?.length || !data?.asks?.length) continue;
@@ -902,16 +886,17 @@ const LiquidationEngine = {
   async fetchOpenInterest(symbol) {
     try {
       if (this._cache && Date.now() - this._cacheTime < 300000) return this._cache;
-      const url = `https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`;
-      for (const proxy of BINANCE_PROXIES) {
+      const proxies = CORS_PROXIES.filter(Boolean);
+      const url = `https://fapi.binance.com/fapi/v1/openInterest?symbol=${symbol}`;
+
+      for (const proxy of proxies) {
         try {
-          const fetchUrl = proxy ? proxy + encodeURIComponent(url) : url;
-          const res = await fetch(fetchUrl, { signal: AbortSignal.timeout(5000) });
+          const res = await fetch(proxy + encodeURIComponent(url), { signal: AbortSignal.timeout(8000) });
           if (!res.ok) continue;
-          const d = await res.json();
-          if (!d?.quoteVolume) continue;
-          const estimatedOI = parseFloat(d.quoteVolume) * 0.15;
-          this._cache = { openInterest: estimatedOI, symbol, live: true, estimated: true, timestamp: Date.now() };
+          const data = await res.json();
+          if (!data?.openInterest) continue;
+          const oi = parseFloat(data.openInterest);
+          this._cache = { openInterest: oi, symbol, live: true, timestamp: Date.now() };
           this._cacheTime = Date.now();
           return this._cache;
         } catch { continue; }
@@ -1019,26 +1004,26 @@ const CorrelationEngine = {
         } catch { continue; }
       }
 
-      // Fetch ETH/BTC ratio — direct call first, proxy blocks Binance
+      // Fetch ETH/BTC ratio from Binance
       let ethBtcRatio = null;
-      for (const proxy of BINANCE_PROXIES) {
+      for (const proxy of proxies) {
         try {
-          const binanceUrl = "https://api.binance.com/api/v3/ticker/24hr?symbol=ETHBTC";
-          const url = proxy ? proxy + encodeURIComponent(binanceUrl) : binanceUrl;
-          const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+          const url = proxy + encodeURIComponent("https://api.binance.com/api/v3/klines?symbol=ETHBTC&interval=1d&limit=7");
+          const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
           if (!res.ok) continue;
-          const d = await res.json();
-          if (!d?.lastPrice) continue;
-          const current = parseFloat(d.lastPrice);
-          const pctChange = parseFloat(d.priceChangePercent || 0);
-          ethBtcRatio = {
-            current,
-            prev: current / (1 + pctChange / 100),
-            dayChange: pctChange,
-            weekChange: pctChange * 1.5, // rough estimate
-            trend: pctChange > 0 ? "ETH gaining" : "BTC gaining",
-          };
-          break;
+          const data = await res.json();
+          if (Array.isArray(data) && data.length >= 2) {
+            const current = parseFloat(data[data.length - 1][4]);
+            const prev = parseFloat(data[data.length - 2][4]);
+            const weekAgo = parseFloat(data[0][4]);
+            ethBtcRatio = {
+              current, prev,
+              dayChange: ((current - prev) / prev) * 100,
+              weekChange: ((current - weekAgo) / weekAgo) * 100,
+              trend: current > prev ? "ETH gaining" : "BTC gaining",
+            };
+            break;
+          }
         } catch { continue; }
       }
 
@@ -1104,23 +1089,23 @@ const AdaptiveTPSL = {
       const regimeWins = (brainWins || []).filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
       const regimeLosses = (brainLosses || []).filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
 
-      // Default ATR multipliers — v9.2: wider SL to survive market noise
-      let slMult = 2.2;
-      let tpMult = 5.5; // v9.2: raised from 5.0 to maintain 1.5:1 R:R with wider SL
+      // Default ATR multipliers
+      let slMult = 1.5;
+      let tpMult = 4.0;
 
-      // Adaptive based on regime — tpMult sized to ensure R:R >= 1.5 at min ATR=0.6%
+      // Adaptive based on regime
       if (regime === "trending") {
-        tpMult = 6.5;  // Trending: let winners run far
-        slMult = 2.5;  // Wide SL — trending means bigger swings, don't get shaken out
+        tpMult = 5.5;  // Trending: let winners run far
+        slMult = 1.8;  // Wider SL to avoid noise
       } else if (regime === "volatile") {
-        tpMult = 6.5;  // v9.2: raised from 4.5 — needed to maintain R:R with slMult=3.0
-        slMult = 3.0;  // Very wide SL for volatility — don't get hunted
+        tpMult = 3.5;  // Take profit faster in chaos
+        slMult = 2.2;  // Wider SL for volatility
       } else if (regime === "ranging") {
-        tpMult = 5.5;  // v9.2: raised from 3.5 — needed to maintain R:R with slMult=2.0
-        slMult = 2.0;  // v9.2: WAS 1.2 — caused ALL the stop losses. Must be wider than the chop
+        tpMult = 3.0;  // Tight TP in range
+        slMult = 1.2;  // Tight SL
       } else if (regime === "squeeze") {
-        tpMult = 7.0;  // Breakout potential: wide TP
-        slMult = 2.0;  // Moderate-wide SL
+        tpMult = 6.0;  // Breakout potential: wide TP
+        slMult = 1.5;  // Moderate SL
       }
 
       // Adjust based on win rate history
@@ -1151,18 +1136,12 @@ const AdaptiveTPSL = {
       if (action === "LONG" && tp - price < minTpDist) tp = price + minTpDist;
       if (action === "SHORT" && price - tp < minTpDist) tp = price - minTpDist;
 
-      // ═══ v9.2: ENFORCE MINIMUM SL DISTANCE — No SL closer than 0.8% to entry ═══
-      // This is the #1 cause of stop loss massacres — SL too tight gets hit by normal noise
-      const minSlDist = price * 0.008; // 0.8% minimum
-      if (action === "LONG" && price - sl < minSlDist) { sl = price - minSlDist; }
-      if (action === "SHORT" && sl - price < minSlDist) { sl = price + minSlDist; }
-
       return { sl, tp, slMult, tpMult, regime, adapted: total >= 5, historyCount: total };
     } catch {
       // Fallback to basic ATR
-      const sl = action === "LONG" ? price - atrVal * 2.2 : price + atrVal * 2.2;
-      const tp = action === "LONG" ? price + atrVal * 5.0 : price - atrVal * 5.0;
-      return { sl, tp, slMult: 2.2, tpMult: 5.0, regime: "unknown", adapted: false, historyCount: 0 };
+      const sl = action === "LONG" ? price - atrVal * 1.5 : price + atrVal * 1.5;
+      const tp = action === "LONG" ? price + atrVal * 4.0 : price - atrVal * 4.0;
+      return { sl, tp, slMult: 1.5, tpMult: 4.0, regime: "unknown", adapted: false, historyCount: 0 };
     }
   },
 };
@@ -1382,7 +1361,7 @@ Fee:0.4% RT. Trade ONLY if move>0.6%. Extreme funding = contrarian signal (overc
       const modified = { ...aiResult };
       if (llmResult.adjustConfidence) modified.confidence = clamp(modified.confidence + llmResult.adjustConfidence, 0, 95);
       if (llmResult.override) {
-        if (llmResult.action === "WAIT" && modified.action !== "WAIT") {
+        if (llmResult.action === "WAIT" && modified.action !== "WAIT" && (llmResult.conviction === "HIGH" || llmResult.confidence >= 78)) {
           modified.action = "WAIT";
           modified.reasons = ["LLM VETO: " + llmResult.reasoning, ...modified.reasons];
         } else if (modified.action === "WAIT" && llmResult.action !== "WAIT" && llmResult.confidence >= 75 && llmResult.conviction === "HIGH") {
@@ -2540,456 +2519,6 @@ const FakeDetector = {
 };
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// EXPERT KNOWLEDGE ENGINE v9.2 — PRE-SEEDED BTC TRADING WISDOM
-// Brain starts as an EXPERT on day 1. No learning from scratch.
-// 500+ rules encoded from years of BTC market research.
-// Seeds Brain.wins/losses with proven patterns so blocking/confidence
-// modifiers work immediately from the first trade.
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-const ExpertKnowledge = {
-  SEED_VERSION: "v9.2",
-  SEED_KEY: "expert_seed_v92",
-
-  // Check if seeding needed (only seed once, or if reset)
-  needsSeed(brain) {
-    const seeded = DB.get(this.SEED_KEY, false);
-    return !seeded || brain.wins.length + brain.losses.length < 50;
-  },
-
-  // Generate expert fingerprint matching Brain's format
-  _fp(action, symbol, rsi, macd, vol, atr, bb, trend, regime, srsi, session, news, bias) {
-    return [action, symbol,
-      "rsi" + rsi, "macd" + macd, "vol" + vol, "atr" + atr,
-      "bb" + bb, "trend" + trend, "regime" + regime,
-      "srsi" + srsi, "sess" + session, "news" + news, "bias" + bias
-    ].join("|");
-  },
-  _bfp(action, rsi, vol, trend, regime, bias) {
-    return [action, "rsi" + rsi, "vol" + vol, "trend" + trend, "regime" + regime, "bias" + bias].join("|");
-  },
-  _mfp(action, symbol, rsi, trend, vol, regime, macd, bias) {
-    return [action, symbol, "rsi" + rsi, "trend" + trend, "vol" + vol, "regime" + regime, "macd" + macd, "bias" + bias].join("|");
-  },
-  _rk(action, trend, regime) { return `${action}|${trend}|${regime}`; },
-
-  // Seed Brain with expert win/loss patterns
-  seed(brain) {
-    if (!this.needsSeed(brain)) return 0;
-
-    const now = Date.now();
-    const DAY = 864e5;
-    const wins = [];
-    const losses = [];
-
-    // Helper to build expert entry
-    const W = (fp, bfp, mfp, rk, profit, session, action, pair = "BTCUSDT", daysAgo = 7) => ({
-      fp, bfp, mfp, rk, profit, ts: now - daysAgo * DAY * Math.random(),
-      pair, action, session, liveVerified: true, exitReason: "Take Profit",
-      holdMins: 30 + Math.random() * 120, source: "expert"
-    });
-    const L = (fp, bfp, mfp, rk, loss, session, action, exitReason = "Stop Loss", pair = "BTCUSDT", daysAgo = 7) => ({
-      fp, bfp, mfp, rk, loss, ts: now - daysAgo * DAY * Math.random(),
-      pair, action, session, liveVerified: true, exitReason,
-      holdMins: 5 + Math.random() * 30, source: "expert"
-    });
-
-    // ═══════════════════════════════════════════════════════════
-    // EXPERT RULE SET 1: OVERSOLD BOUNCES (High win rate LONG)
-    // RSI < 30 + bullish MACD + high volume = strong bounce
-    // ═══════════════════════════════════════════════════════════
-    ["Lon", "NY", "Tok"].forEach(sess => {
-      // Deep oversold + MACD bull cross = very high win rate
-      for (let i = 0; i < 8; i++) wins.push(W(
-        this._fp("LONG","BTCUSDT","25","up","H","N","lower","D","trending","10",sess,"N","bullish"),
-        this._bfp("LONG","20","H","D","trending","bullish"),
-        this._mfp("LONG","BTCUSDT","20","D","H","trending","up","bullish"),
-        this._rk("LONG","D","trending"), 0.18 + Math.random()*0.15, sess, "LONG"
-      ));
-      // Oversold in ranging = moderate win rate
-      for (let i = 0; i < 5; i++) wins.push(W(
-        this._fp("LONG","BTCUSDT","25","up","N","N","lower","F","ranging","10",sess,"N","neutral"),
-        this._bfp("LONG","20","N","F","ranging","neutral"),
-        this._mfp("LONG","BTCUSDT","20","F","N","ranging","up","neutral"),
-        this._rk("LONG","F","ranging"), 0.12 + Math.random()*0.10, sess, "LONG"
-      ));
-      // Oversold but downtrend = trap, loses
-      for (let i = 0; i < 5; i++) losses.push(L(
-        this._fp("LONG","BTCUSDT","25","down","H","H","lower","SD","trending","10",sess,"R","bearish"),
-        this._bfp("LONG","20","H","D","trending","bearish"),
-        this._mfp("LONG","BTCUSDT","20","D","H","trending","down","bearish"),
-        this._rk("LONG","D","trending"), 0.08 + Math.random()*0.05, sess, "LONG"
-      ));
-    });
-
-    // ═══════════════════════════════════════════════════════════
-    // EXPERT RULE SET 2: OVERBOUGHT SHORTS (High win rate SHORT)
-    // RSI > 70 + MACD bear cross + greed = strong reversal
-    // ═══════════════════════════════════════════════════════════
-    ["Lon", "NY"].forEach(sess => {
-      for (let i = 0; i < 8; i++) wins.push(W(
-        this._fp("SHORT","BTCUSDT","75","down","H","N","upper","U","trending","90",sess,"B","bearish"),
-        this._bfp("SHORT","80","H","U","trending","bearish"),
-        this._mfp("SHORT","BTCUSDT","80","U","H","trending","down","bearish"),
-        this._rk("SHORT","U","trending"), 0.16 + Math.random()*0.14, sess, "SHORT"
-      ));
-      // Overbought but uptrend = risky SHORT, often loses
-      for (let i = 0; i < 6; i++) losses.push(L(
-        this._fp("SHORT","BTCUSDT","75","up","H","H","upper","SU","trending","90",sess,"B","bullish"),
-        this._bfp("SHORT","80","H","U","trending","bullish"),
-        this._mfp("SHORT","BTCUSDT","80","U","H","trending","up","bullish"),
-        this._rk("SHORT","U","trending"), 0.09 + Math.random()*0.06, sess, "SHORT"
-      ));
-    });
-
-    // ═══════════════════════════════════════════════════════════
-    // EXPERT RULE SET 3: MACD CROSSOVERS (Reliable in trending)
-    // ═══════════════════════════════════════════════════════════
-    ["Lon", "NY", "Tok"].forEach(sess => {
-      // Bull MACD cross + uptrend + neutral RSI = high win
-      for (let i = 0; i < 7; i++) wins.push(W(
-        this._fp("LONG","BTCUSDT","50","up","H","N","m","U","trending","50",sess,"N","bullish"),
-        this._bfp("LONG","50","H","U","trending","bullish"),
-        this._mfp("LONG","BTCUSDT","50","U","H","trending","up","bullish"),
-        this._rk("LONG","U","trending"), 0.20 + Math.random()*0.15, sess, "LONG"
-      ));
-      // Bear MACD cross + downtrend = strong SHORT win
-      for (let i = 0; i < 7; i++) wins.push(W(
-        this._fp("SHORT","BTCUSDT","50","down","H","N","m","D","trending","50",sess,"N","bearish"),
-        this._bfp("SHORT","50","H","D","trending","bearish"),
-        this._mfp("SHORT","BTCUSDT","50","D","H","trending","down","bearish"),
-        this._rk("SHORT","D","trending"), 0.18 + Math.random()*0.14, sess, "SHORT"
-      ));
-      // MACD cross against trend = usually loses
-      for (let i = 0; i < 5; i++) losses.push(L(
-        this._fp("LONG","BTCUSDT","45","up","L","L","m","D","trending","45",sess,"N","bearish"),
-        this._bfp("LONG","40","L","D","trending","bearish"),
-        this._mfp("LONG","BTCUSDT","40","D","L","trending","up","bearish"),
-        this._rk("LONG","D","trending"), 0.05 + Math.random()*0.04, sess, "LONG"
-      ));
-    });
-
-    // ═══════════════════════════════════════════════════════════
-    // EXPERT RULE SET 4: BB SQUEEZE BREAKOUTS
-    // Low BB width + volume spike = explosive move
-    // ═══════════════════════════════════════════════════════════
-    ["Lon", "NY"].forEach(sess => {
-      for (let i = 0; i < 8; i++) wins.push(W(
-        this._fp("LONG","BTCUSDT","50","up","XH","H","lower","U","squeeze","50",sess,"B","bullish"),
-        this._bfp("LONG","50","H","U","squeeze","bullish"),
-        this._mfp("LONG","BTCUSDT","50","U","H","squeeze","up","bullish"),
-        this._rk("LONG","U","squeeze"), 0.28 + Math.random()*0.20, sess, "LONG"
-      ));
-      for (let i = 0; i < 8; i++) wins.push(W(
-        this._fp("SHORT","BTCUSDT","50","down","XH","H","upper","D","squeeze","50",sess,"R","bearish"),
-        this._bfp("SHORT","50","H","D","squeeze","bearish"),
-        this._mfp("SHORT","BTCUSDT","50","D","H","squeeze","down","bearish"),
-        this._rk("SHORT","D","squeeze"), 0.26 + Math.random()*0.18, sess, "SHORT"
-      ));
-      // Squeeze in wrong direction = bad
-      for (let i = 0; i < 3; i++) losses.push(L(
-        this._fp("LONG","BTCUSDT","45","down","XH","H","upper","D","squeeze","40",sess,"R","bearish"),
-        this._bfp("LONG","40","H","D","squeeze","bearish"),
-        this._mfp("LONG","BTCUSDT","40","D","H","squeeze","down","bearish"),
-        this._rk("LONG","D","squeeze"), 0.10 + Math.random()*0.05, sess, "LONG"
-      ));
-    });
-
-    // ═══════════════════════════════════════════════════════════
-    // EXPERT RULE SET 5: VOLATILE MARKET TRAPS (AVOID)
-    // High ATR + low confidence = stop hunted every time
-    // ═══════════════════════════════════════════════════════════
-    ["Lon", "NY", "Tok", "Aus"].forEach(sess => {
-      for (let i = 0; i < 6; i++) losses.push(L(
-        this._fp("LONG","BTCUSDT","50","up","XH","XH","m","F","volatile","50",sess,"N","neutral"),
-        this._bfp("LONG","50","H","F","volatile","neutral"),
-        this._mfp("LONG","BTCUSDT","50","F","H","volatile","up","neutral"),
-        this._rk("LONG","F","volatile"), 0.08 + Math.random()*0.05, sess, "LONG"
-      ));
-      for (let i = 0; i < 6; i++) losses.push(L(
-        this._fp("SHORT","BTCUSDT","50","down","XH","XH","m","F","volatile","50",sess,"N","neutral"),
-        this._bfp("SHORT","50","H","F","volatile","neutral"),
-        this._mfp("SHORT","BTCUSDT","50","F","H","volatile","down","neutral"),
-        this._rk("SHORT","F","volatile"), 0.08 + Math.random()*0.05, sess, "SHORT"
-      ));
-    });
-
-    // ═══════════════════════════════════════════════════════════
-    // EXPERT RULE SET 6: ASIAN SESSION BIAS (Lower win rate)
-    // Asian session = lower liquidity, more choppy, avoid longs
-    // ═══════════════════════════════════════════════════════════
-    for (let i = 0; i < 6; i++) losses.push(L(
-      this._fp("LONG","BTCUSDT","50","up","L","L","m","F","ranging","50","Tok","N","neutral"),
-      this._bfp("LONG","50","L","F","ranging","neutral"),
-      this._mfp("LONG","BTCUSDT","50","F","L","ranging","up","neutral"),
-      this._rk("LONG","F","ranging"), 0.04 + Math.random()*0.03, "Tok", "LONG", "Stop Loss"
-    ));
-    // Asian session shorts in downtrend actually work
-    for (let i = 0; i < 4; i++) wins.push(W(
-      this._fp("SHORT","BTCUSDT","60","down","N","N","m","D","trending","60","Tok","N","bearish"),
-      this._bfp("SHORT","60","N","D","trending","bearish"),
-      this._mfp("SHORT","BTCUSDT","60","D","N","trending","down","bearish"),
-      this._rk("SHORT","D","trending"), 0.10 + Math.random()*0.08, "Tok", "SHORT"
-    ));
-
-    // ═══════════════════════════════════════════════════════════
-    // EXPERT RULE SET 7: LONDON SESSION = BEST (Trend follows)
-    // London open creates the day's trend 70% of the time
-    // ═══════════════════════════════════════════════════════════
-    for (let i = 0; i < 9; i++) wins.push(W(
-      this._fp("LONG","BTCUSDT","45","up","H","N","m","U","trending","45","Lon","B","bullish"),
-      this._bfp("LONG","40","H","U","trending","bullish"),
-      this._mfp("LONG","BTCUSDT","40","U","H","trending","up","bullish"),
-      this._rk("LONG","U","trending"), 0.22 + Math.random()*0.18, "Lon", "LONG"
-    ));
-    for (let i = 0; i < 9; i++) wins.push(W(
-      this._fp("SHORT","BTCUSDT","55","down","H","N","m","D","trending","55","Lon","R","bearish"),
-      this._bfp("SHORT","60","H","D","trending","bearish"),
-      this._mfp("SHORT","BTCUSDT","60","D","H","trending","down","bearish"),
-      this._rk("SHORT","D","trending"), 0.20 + Math.random()*0.16, "Lon", "SHORT"
-    ));
-
-    // ═══════════════════════════════════════════════════════════
-    // EXPERT RULE SET 8: NY SESSION OVERLAPS
-    // NY + London overlap = highest volume, best for breakouts
-    // ═══════════════════════════════════════════════════════════
-    for (let i = 0; i < 8; i++) wins.push(W(
-      this._fp("LONG","BTCUSDT","50","up","XH","H","m","SU","trending","50","NY","B","bullish"),
-      this._bfp("LONG","50","H","U","trending","bullish"),
-      this._mfp("LONG","BTCUSDT","50","U","H","trending","up","bullish"),
-      this._rk("LONG","U","trending"), 0.25 + Math.random()*0.20, "NY", "LONG"
-    ));
-
-    // ═══════════════════════════════════════════════════════════
-    // EXPERT RULE SET 9: RANGING MARKET RULES
-    // Range = trade BB extremes, not midpoints
-    // ═══════════════════════════════════════════════════════════
-    ["Lon", "NY"].forEach(sess => {
-      // BB lower in range = buy the dip (works)
-      for (let i = 0; i < 6; i++) wins.push(W(
-        this._fp("LONG","BTCUSDT","35","up","N","N","lower","F","ranging","20",sess,"N","neutral"),
-        this._bfp("LONG","30","N","F","ranging","neutral"),
-        this._mfp("LONG","BTCUSDT","30","F","N","ranging","up","neutral"),
-        this._rk("LONG","F","ranging"), 0.10 + Math.random()*0.08, sess, "LONG"
-      ));
-      // BB upper in range = sell the top (works)
-      for (let i = 0; i < 6; i++) wins.push(W(
-        this._fp("SHORT","BTCUSDT","65","down","N","N","upper","F","ranging","80",sess,"N","neutral"),
-        this._bfp("SHORT","70","N","F","ranging","neutral"),
-        this._mfp("SHORT","BTCUSDT","70","F","N","ranging","down","neutral"),
-        this._rk("SHORT","F","ranging"), 0.09 + Math.random()*0.07, sess, "SHORT"
-      ));
-      // BB midpoint in range = chop, lose
-      for (let i = 0; i < 5; i++) losses.push(L(
-        this._fp("LONG","BTCUSDT","50","up","L","L","m","F","ranging","50",sess,"N","neutral"),
-        this._bfp("LONG","50","L","F","ranging","neutral"),
-        this._mfp("LONG","BTCUSDT","50","F","L","ranging","up","neutral"),
-        this._rk("LONG","F","ranging"), 0.04 + Math.random()*0.03, sess, "LONG"
-      ));
-    });
-
-    // ═══════════════════════════════════════════════════════════
-    // EXPERT RULE SET 10: COUNTER-TREND TRAPS (Always lose)
-    // Going LONG in strong downtrend = capital destruction
-    // ═══════════════════════════════════════════════════════════
-    ["Lon","NY","Tok","Aus"].forEach(sess => {
-      // LONG against strong downtrend = always stop loss
-      for (let i = 0; i < 6; i++) losses.push(L(
-        this._fp("LONG","BTCUSDT","35","down","H","H","lower","SD","trending","30",sess,"R","bearish"),
-        this._bfp("LONG","30","H","D","trending","bearish"),
-        this._mfp("LONG","BTCUSDT","30","D","H","trending","down","bearish"),
-        this._rk("LONG","D","trending"), 0.08 + Math.random()*0.06, sess, "LONG"
-      ));
-      // SHORT against strong uptrend = always stop loss
-      for (let i = 0; i < 6; i++) losses.push(L(
-        this._fp("SHORT","BTCUSDT","65","up","H","H","upper","SU","trending","70",sess,"B","bullish"),
-        this._bfp("SHORT","70","H","U","trending","bullish"),
-        this._mfp("SHORT","BTCUSDT","70","U","H","trending","up","bullish"),
-        this._rk("SHORT","U","trending"), 0.08 + Math.random()*0.06, sess, "SHORT"
-      ));
-    });
-
-    // ═══════════════════════════════════════════════════════════
-    // EXPERT RULE SET 11: LOW VOLUME = DANGER
-    // Low volume moves are fake, get reversed
-    // ═══════════════════════════════════════════════════════════
-    ["Lon","NY","Tok","Aus"].forEach(sess => {
-      for (let i = 0; i < 5; i++) losses.push(L(
-        this._fp("LONG","BTCUSDT","55","up","L","N","m","U","trending","55",sess,"N","bullish"),
-        this._bfp("LONG","50","L","U","trending","bullish"),
-        this._mfp("LONG","BTCUSDT","50","U","L","trending","up","bullish"),
-        this._rk("LONG","U","trending"), 0.05 + Math.random()*0.03, sess, "LONG"
-      ));
-      for (let i = 0; i < 5; i++) losses.push(L(
-        this._fp("SHORT","BTCUSDT","45","down","L","N","m","D","trending","45",sess,"N","bearish"),
-        this._bfp("SHORT","50","L","D","trending","bearish"),
-        this._mfp("SHORT","BTCUSDT","50","D","L","trending","down","bearish"),
-        this._rk("SHORT","D","trending"), 0.05 + Math.random()*0.03, sess, "SHORT"
-      ));
-    });
-
-    // ═══════════════════════════════════════════════════════════
-    // EXPERT RULE SET 12: MORNING STAR / 3 WHITE SOLDIERS
-    // Strong candlestick patterns = reliable signals
-    // ═══════════════════════════════════════════════════════════
-    ["Lon","NY"].forEach(sess => {
-      // 3 white soldiers = very bullish
-      for (let i = 0; i < 7; i++) wins.push(W(
-        this._fp("LONG","BTCUSDT","55","up","H","N","m","SU","trending","55",sess,"B","bullish"),
-        this._bfp("LONG","60","H","U","trending","bullish"),
-        this._mfp("LONG","BTCUSDT","60","U","H","trending","up","bullish"),
-        this._rk("LONG","U","trending"), 0.24 + Math.random()*0.16, sess, "LONG"
-      ));
-      // 3 black crows = very bearish
-      for (let i = 0; i < 7; i++) wins.push(W(
-        this._fp("SHORT","BTCUSDT","45","down","H","N","m","SD","trending","45",sess,"R","bearish"),
-        this._bfp("SHORT","40","H","D","trending","bearish"),
-        this._mfp("SHORT","BTCUSDT","40","D","H","trending","down","bearish"),
-        this._rk("SHORT","D","trending"), 0.22 + Math.random()*0.14, sess, "SHORT"
-      ));
-    });
-
-    // ═══════════════════════════════════════════════════════════
-    // EXPERT RULE SET 13: NEWS IMPACT
-    // Strong positive news + oversold = explosive move
-    // ═══════════════════════════════════════════════════════════
-    ["Lon","NY"].forEach(sess => {
-      for (let i = 0; i < 6; i++) wins.push(W(
-        this._fp("LONG","BTCUSDT","40","up","XH","N","lower","F","ranging","30",sess,"B","bullish"),
-        this._bfp("LONG","40","H","F","ranging","bullish"),
-        this._mfp("LONG","BTCUSDT","40","F","H","ranging","up","bullish"),
-        this._rk("LONG","F","ranging"), 0.20 + Math.random()*0.15, sess, "LONG"
-      ));
-      for (let i = 0; i < 5; i++) wins.push(W(
-        this._fp("SHORT","BTCUSDT","60","down","XH","N","upper","F","ranging","70",sess,"R","bearish"),
-        this._bfp("SHORT","60","H","F","ranging","bearish"),
-        this._mfp("SHORT","BTCUSDT","60","F","H","ranging","down","bearish"),
-        this._rk("SHORT","F","ranging"), 0.18 + Math.random()*0.12, sess, "SHORT"
-      ));
-    });
-
-    // ═══════════════════════════════════════════════════════════
-    // EXPERT RULE SET 14: ETH/SOL/BNB — Follow BTC trend
-    // Alt coins amplify BTC moves, don't fight them
-    // ═══════════════════════════════════════════════════════════
-    ["ETHUSDT","SOLUSDT","BNBUSDT"].forEach(pair => {
-      const pn = pair.replace("USDT","");
-      ["Lon","NY"].forEach(sess => {
-        // Alts in BTC uptrend = strong longs
-        for (let i = 0; i < 5; i++) wins.push(W(
-          this._fp("LONG",pair,"50","up","H","N","m","U","trending","50",sess,"B","bullish"),
-          this._bfp("LONG","50","H","U","trending","bullish"),
-          this._mfp("LONG",pair,"50","U","H","trending","up","bullish"),
-          this._rk("LONG","U","trending"), 0.18 + Math.random()*0.14, sess, "LONG", pair
-        ));
-        // Alts counter-trend = dangerous, wider swings
-        for (let i = 0; i < 5; i++) losses.push(L(
-          this._fp("LONG",pair,"40","down","H","H","lower","D","trending","35",sess,"N","bearish"),
-          this._bfp("LONG","40","H","D","trending","bearish"),
-          this._mfp("LONG",pair,"40","D","H","trending","down","bearish"),
-          this._rk("LONG","D","trending"), 0.10 + Math.random()*0.07, sess, "LONG", "Stop Loss", pair
-        ));
-      });
-    });
-
-    // ═══════════════════════════════════════════════════════════
-    // EXPERT RULE SET 15: STOCH RSI EXTREMES
-    // StochRSI < 5 + oversold RSI = highest probability bounce
-    // ═══════════════════════════════════════════════════════════
-    ["Lon","NY"].forEach(sess => {
-      for (let i = 0; i < 8; i++) wins.push(W(
-        this._fp("LONG","BTCUSDT","30","up","H","N","lower","F","ranging","0",sess,"N","neutral"),
-        this._bfp("LONG","30","H","F","ranging","neutral"),
-        this._mfp("LONG","BTCUSDT","30","F","H","ranging","up","neutral"),
-        this._rk("LONG","F","ranging"), 0.15 + Math.random()*0.12, sess, "LONG"
-      ));
-      for (let i = 0; i < 8; i++) wins.push(W(
-        this._fp("SHORT","BTCUSDT","70","down","H","N","upper","F","ranging","100",sess,"N","neutral"),
-        this._bfp("SHORT","70","H","F","ranging","neutral"),
-        this._mfp("SHORT","BTCUSDT","70","F","H","ranging","down","neutral"),
-        this._rk("SHORT","F","ranging"), 0.14 + Math.random()*0.10, sess, "SHORT"
-      ));
-    });
-
-    // Merge into brain, mark as expert seed (don't overwrite real trades)
-    brain.wins = [...wins, ...brain.wins.filter(w => w.source !== "expert")];
-    brain.losses = [...losses, ...brain.losses.filter(l => l.source !== "expert")];
-    brain.save();
-    DB.set(this.SEED_KEY, true);
-
-    const total = wins.length + losses.length;
-    console.log(`[NEXUS] 🧠 EXPERT SEEDED: ${wins.length} wins + ${losses.length} losses = ${total} patterns loaded`);
-    return total;
-  },
-
-  // Pre-train ML with expert weights biased toward known good features
-  // RSI, MACD direction, trend, and volume are the most predictive
-  seedML(mlEngine) {
-    const seeded = DB.get("ml_expert_seed_v92", false);
-    if (seeded || mlEngine._trained) return;
-
-    // Override with expert-biased weights (still random but directionally correct)
-    // These weights encode: RSI extreme + MACD aligned + trend = high win prob
-    const nIn = 24, nH1 = 16, nH2 = 8;
-
-    // Expert weight initialization: key features get stronger initial weights
-    // Feature order: rsi, rsi7, macdHist, atrPct, bbWidth, volRatio, trendStr,
-    //   mom5, mom20, stochRSI, greenStreak, redStreak, sentiment, newsScore,
-    //   fgIndex, redditScore, macroScore, onChainScore, obvTrend, regime_enc,
-    //   fundingRate, obImbalance, btcDom, liqMagnet
-    const featureImportance = [
-      0.85, // rsi — critical
-      0.75, // rsi7
-      0.90, // macdHist — most important
-      0.30, // atrPct — moderate (higher = more noise)
-      0.40, // bbWidth
-      0.70, // volRatio — important
-      0.88, // trendStr — critical
-      0.65, // mom5
-      0.72, // mom20
-      0.80, // stochRSI — important
-      0.55, // greenStreak
-      0.55, // redStreak
-      0.45, // sentiment
-      0.40, // newsScore
-      0.35, // fgIndex
-      0.30, // redditScore — unreliable
-      0.40, // macroScore
-      0.35, // onChainScore
-      0.60, // obvTrend
-      0.65, // regime_enc
-      0.50, // fundingRate
-      0.55, // obImbalance
-      0.35, // btcDom
-      0.45, // liqMagnet
-    ];
-
-    const he = (fan_in) => Math.sqrt(2 / fan_in);
-    // Scale weights by feature importance — important features start stronger
-    const w1 = Array.from({ length: nIn }, (_, k) =>
-      Array.from({ length: nH1 }, () =>
-        (Math.random() * 2 - 1) * he(nIn) * (featureImportance[k] || 0.5)
-      )
-    );
-    const w2 = Array.from({ length: nH1 }, () =>
-      Array.from({ length: nH2 }, () => (Math.random() * 2 - 1) * he(nH1))
-    );
-    const w3 = Array.from({ length: nH2 }, () =>
-      Array.from({ length: 1 }, () => (Math.random() * 2 - 1) * he(nH2))
-    );
-    const b1 = Array.from({ length: nH1 }, () => 0);
-    const b2 = Array.from({ length: nH2 }, () => 0);
-    const b3 = [0];
-
-    mlEngine._weights = { w1, w2, w3 };
-    mlEngine._biases = { b1, b2, b3 };
-    mlEngine._featureImportance = featureImportance;
-    mlEngine.save();
-    DB.set("ml_expert_seed_v92", true);
-    console.log("[NEXUS] 🤖 ML EXPERT WEIGHTS SEEDED — feature-importance initialized");
-  }
-};
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // BRAIN v7 — SELF-LEARNING ENGINE (PERSISTENT ACROSS REFRESH)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // ═══════════════════════════════════════════════════════════════════════
@@ -3150,35 +2679,30 @@ const Brain = {
       const HOUR = 36e5;
       const now = Date.now();
 
-      // v9.2: Only count losses from AFTER v9.2 deploy — old trades used broken tight SLs
-      // Losses before V9_DEPLOY_TS are from a broken bot and must not block a fixed bot
-      const isValidLoss = e => e.source !== "expert" && e.ts >= V9_DEPLOY_TS;
-      const isValidWin  = e => e.source !== "expert" && e.ts >= V9_DEPLOY_TS;
-
-      // CHECK 1: Cooldown timer
+      // CHECK 1: Cooldown timer (severity-scaled in recordLoss)
       if (now < this.coolUntil) return { blocked: true, reason: `Cooling down (${Math.ceil((this.coolUntil - now) / 1000)}s)`, severity: "COOL" };
 
-      // CHECK 2: Exact fingerprint
-      const exactLosses = this.losses.filter(e => isValidLoss(e) && e.fp === fp && now - e.ts < TWO_WEEKS);
+      // CHECK 2: Exact fingerprint — v8: needs 4 losses (was 2 — too aggressive)
+      const exactLosses = this.losses.filter(e => e.fp === fp && now - e.ts < TWO_WEEKS);
       if (exactLosses.length >= 4) return { blocked: true, reason: `Exact pattern lost ${exactLosses.length}x recently`, severity: "HIGH" };
 
-      // CHECK 3: Medium fingerprint
-      const medLosses = this.losses.filter(e => isValidLoss(e) && e.mfp === mfp && now - e.ts < WEEK);
-      const medWins = this.wins.filter(e => isValidWin(e) && e.mfp === mfp && now - e.ts < WEEK);
+      // CHECK 3: Medium fingerprint — v8: needs 4 losses (was 2)
+      const medLosses = this.losses.filter(e => e.mfp === mfp && now - e.ts < WEEK);
+      const medWins = this.wins.filter(e => e.mfp === mfp && now - e.ts < WEEK);
       if (medLosses.length >= 4 && medWins.length < medLosses.length * 0.4) {
         return { blocked: true, reason: `Medium pattern ${medWins.length}W/${medLosses.length}L this week`, severity: "HIGH" };
       }
 
-      // CHECK 4: Broad pattern
-      const broadLosses = this.losses.filter(e => isValidLoss(e) && e.bfp === bfp && now - e.ts < WEEK);
-      const broadWins = this.wins.filter(e => isValidWin(e) && e.bfp === bfp && now - e.ts < WEEK);
+      // CHECK 4: Broad pattern — v8: needs 6 losses (was 3)
+      const broadLosses = this.losses.filter(e => e.bfp === bfp && now - e.ts < WEEK);
+      const broadWins = this.wins.filter(e => e.bfp === bfp && now - e.ts < WEEK);
       if (broadLosses.length >= 6 && broadWins.length < broadLosses.length * 0.35) {
         return { blocked: true, reason: `Broad pattern ${broadWins.length}W/${broadLosses.length}L this week`, severity: "MED" };
       }
 
-      // CHECK 5: REGIME LEARNING
-      const regimeLosses = this.losses.filter(e => isValidLoss(e) && e.rk === rk && now - e.ts < TWO_WEEKS);
-      const regimeWins = this.wins.filter(e => isValidWin(e) && e.rk === rk && now - e.ts < TWO_WEEKS);
+      // CHECK 5: REGIME LEARNING — v8: needs 5 trades min (was 3), 2.5x ratio (was 2x)
+      const regimeLosses = this.losses.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
+      const regimeWins = this.wins.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
       const regimeTotal = regimeLosses.length + regimeWins.length;
       if (regimeTotal >= 5 && regimeLosses.length > regimeWins.length * 2.5) {
         return { blocked: true, reason: `${action} in this regime: ${regimeWins.length}W/${regimeLosses.length}L — learned to avoid`, severity: "HIGH" };
@@ -3188,20 +2712,20 @@ const Brain = {
       const exitReasonBlock = this._checkExitReasonPattern(action, symbol);
       if (exitReasonBlock) return exitReasonBlock;
 
-      // CHECK 7: CUMULATIVE $ LOSS
+      // CHECK 7: CUMULATIVE $ LOSS — v8: needs 4 losses, $0.40 threshold (was 2/$0.15)
       const broadDollarLoss = broadLosses.reduce((a, e) => a + (e.loss || 0), 0);
       const broadDollarWin = broadWins.reduce((a, e) => a + (e.profit || 0), 0);
       if (broadLosses.length >= 4 && broadDollarLoss > broadDollarWin * 1.5 && broadDollarLoss > 0.40) {
         return { blocked: true, reason: `Pattern net loss $${(broadDollarLoss - broadDollarWin).toFixed(2)} — money drain`, severity: "MED" };
       }
 
-      // CHECK 8: Pair losses in 1 hour
-      const pairLosses = this.losses.filter(e => isValidLoss(e) && e.pair === symbol && now - e.ts < HOUR);
-      if (pairLosses.length >= 2) return { blocked: true, reason: `${pairLosses.length} losses on ${symbol} in 1h`, severity: "MED" };
+      // CHECK 8: Pair losses in 1 hour — v8: needs 3 (was 2)
+      const pairLosses = this.losses.filter(e => e.pair === symbol && now - e.ts < HOUR);
+      if (pairLosses.length >= 3) return { blocked: true, reason: `${pairLosses.length} losses on ${symbol} in 1h`, severity: "MED" };
 
-      // CHECK 9: Emergency brake
-      const allRecent = this.losses.filter(e => isValidLoss(e) && now - e.ts < HOUR * 2);
-      if (allRecent.length >= 4) return { blocked: true, reason: `${allRecent.length} losses in 2h — emergency brake`, severity: "CRIT" };
+      // CHECK 9: Emergency brake — v8: 6 in 2h (was 4)
+      const allRecent = this.losses.filter(e => now - e.ts < HOUR * 2);
+      if (allRecent.length >= 6) return { blocked: true, reason: `${allRecent.length} losses in 2h — emergency brake`, severity: "CRIT" };
 
       // CHECK 10: Session-specific pattern failure — v8: needs 3 (was 2)
       const sessionName = Sessions.getCurrent().primary.name;
@@ -3220,9 +2744,8 @@ const Brain = {
     try {
       const WEEK = 7 * 864e5;
       const now = Date.now();
-      // v9.2: real trades only AND only after v9.2 deploy — old broken-SL trades must not block
-      const recentLosses = this.losses.filter(e => e.source !== "expert" && e.ts >= V9_DEPLOY_TS && e.action === action && now - e.ts < WEEK);
-      const recentWins = this.wins.filter(e => e.source !== "expert" && e.ts >= V9_DEPLOY_TS && e.action === action && now - e.ts < WEEK);
+      const recentLosses = this.losses.filter(e => e.action === action && now - e.ts < WEEK);
+      const recentWins = this.wins.filter(e => e.action === action && now - e.ts < WEEK);
       if (recentLosses.length < 3) return null;
 
       const exitReasons = {};
@@ -3233,18 +2756,18 @@ const Brain = {
         exitReasons[reason].totalLoss += (e.loss || 0);
       });
 
-      // v9.2: needs 3 losses and $0.15 before blocking (was 5/$0.40 — way too slow to react)
+      // v8: needs 5 losses and $0.40 before blocking (was 3/$0.10)
       for (const [reason, data] of Object.entries(exitReasons)) {
-        if (data.losses >= 3 && data.totalLoss > 0.15) {
-          if (data.losses / recentLosses.length > 0.45) {
+        if (data.losses >= 5 && data.totalLoss > 0.40) {
+          if (data.losses / recentLosses.length > 0.5) {
             return { blocked: true, reason: `"${reason}" caused ${data.losses} losses ($${data.totalLoss.toFixed(2)}) — learned to avoid`, severity: "HIGH" };
           }
         }
       }
 
-      // v9.2: SL block needs only 3 SLs at 50% dominance (was 6 at 65% — way too lenient, caused the SL massacre)
+      // v8: SL block needs 6 SLs at 65% dominance (was 3 at 50%)
       const slCount = (exitReasons["Stop Loss"]?.losses || 0);
-      if (slCount >= 3 && slCount / recentLosses.length > 0.50) {
+      if (slCount >= 6 && slCount / recentLosses.length > 0.65) {
         return { blocked: true, reason: `${slCount} stop losses this week for ${action} — entry timing bad`, severity: "HIGH" };
       }
 
@@ -3260,48 +2783,26 @@ const Brain = {
       const MONTH = 30 * 864e5;
       const now = Date.now();
 
-      // v9.2: Prefer REAL trades for win rate — use expert only as fallback when no real data
-      // Real trades = no source field or source !== 'expert'
-      const isReal = e => e.source !== "expert";
-      const isExpert = e => e.source === "expert";
-
-      // Layer 1: Exact fingerprint — real trades first
+      // Layer 1: Exact fingerprint
       const exactKey = fp.split("|").slice(0, 5).join("|");
-      const exactLossR = this.losses.filter(e => isReal(e) && e.fp.startsWith(exactKey) && now - e.ts < MONTH).length;
-      const exactWinR = this.wins.filter(e => isReal(e) && e.fp.startsWith(exactKey) && now - e.ts < MONTH).length;
-      const exactTotalR = exactWinR + exactLossR;
+      const exactLoss = this.losses.filter(e => e.fp.startsWith(exactKey) && now - e.ts < MONTH).length;
+      const exactWin = this.wins.filter(e => e.fp.startsWith(exactKey) && now - e.ts < MONTH).length;
+      const exactTotal = exactWin + exactLoss;
 
-      // Layer 2: Medium fingerprint — real trades
-      const mLossR = this.losses.filter(e => isReal(e) && e.mfp === mfp && now - e.ts < MONTH).length;
-      const mWinR = this.wins.filter(e => isReal(e) && e.mfp === mfp && now - e.ts < MONTH).length;
-      const medTotalR = mWinR + mLossR;
+      // Layer 2: Medium fingerprint (NEW — better overlap than exact)
+      const mLoss = this.losses.filter(e => e.mfp === mfp && now - e.ts < MONTH).length;
+      const mWin = this.wins.filter(e => e.mfp === mfp && now - e.ts < MONTH).length;
+      const medTotal = mWin + mLoss;
 
-      // Layer 3: Broad fingerprint — real trades
-      const bLossR = this.losses.filter(e => isReal(e) && e.bfp === bfp && now - e.ts < MONTH).length;
-      const bWinR = this.wins.filter(e => isReal(e) && e.bfp === bfp && now - e.ts < MONTH).length;
-      const broadTotalR = bWinR + bLossR;
+      // Layer 3: Broad fingerprint
+      const bLoss = this.losses.filter(e => e.bfp === bfp && now - e.ts < MONTH).length;
+      const bWin = this.wins.filter(e => e.bfp === bfp && now - e.ts < MONTH).length;
+      const broadTotal = bWin + bLoss;
 
-      // Use real trades if enough data
-      if (exactTotalR >= 3) return { rate: (exactWinR / exactTotalR) * 100, total: exactTotalR, wins: exactWinR, losses: exactLossR, layer: "exact" };
-      if (medTotalR >= 2) return { rate: (mWinR / medTotalR) * 100, total: medTotalR, wins: mWinR, losses: mLossR, layer: "medium" };
-      if (broadTotalR >= 2) return { rate: (bWinR / broadTotalR) * 100, total: broadTotalR, wins: bWinR, losses: bLossR, layer: "broad" };
-
-      // Fallback: use expert seed data for guidance when no real trades yet
-      const exactLossE = this.losses.filter(e => isExpert(e) && e.fp.startsWith(exactKey) && now - e.ts < MONTH).length;
-      const exactWinE = this.wins.filter(e => isExpert(e) && e.fp.startsWith(exactKey) && now - e.ts < MONTH).length;
-      const exactTotalE = exactWinE + exactLossE;
-      const mLossE = this.losses.filter(e => isExpert(e) && e.mfp === mfp && now - e.ts < MONTH).length;
-      const mWinE = this.wins.filter(e => isExpert(e) && e.mfp === mfp && now - e.ts < MONTH).length;
-      const medTotalE = mWinE + mLossE;
-      const bLossE = this.losses.filter(e => isExpert(e) && e.bfp === bfp && now - e.ts < MONTH).length;
-      const bWinE = this.wins.filter(e => isExpert(e) && e.bfp === bfp && now - e.ts < MONTH).length;
-      const broadTotalE = bWinE + bLossE;
-
-      // Expert data gives gentler modifier (+/-8 max via halved rate deviation from 50)
-      if (exactTotalE >= 3) { const r = (exactWinE/exactTotalE)*100; return { rate: 50 + (r-50)*0.4, total: exactTotalE, wins: exactWinE, losses: exactLossE, layer: "expert-exact" }; }
-      if (medTotalE >= 2) { const r = (mWinE/medTotalE)*100; return { rate: 50 + (r-50)*0.4, total: medTotalE, wins: mWinE, losses: mLossE, layer: "expert-medium" }; }
-      if (broadTotalE >= 2) { const r = (bWinE/broadTotalE)*100; return { rate: 50 + (r-50)*0.4, total: broadTotalE, wins: bWinE, losses: bLossE, layer: "expert-broad" }; }
-
+      // Prefer most specific layer that has enough data
+      if (exactTotal >= 3) return { rate: (exactWin / exactTotal) * 100, total: exactTotal, wins: exactWin, losses: exactLoss, layer: "exact" };
+      if (medTotal >= 2) return { rate: (mWin / medTotal) * 100, total: medTotal, wins: mWin, losses: mLoss, layer: "medium" };
+      if (broadTotal >= 2) return { rate: (bWin / broadTotal) * 100, total: broadTotal, wins: bWin, losses: bLoss, layer: "broad" };
       return { rate: 50, total: 0, wins: 0, losses: 0, layer: "none" };
     } catch { return { rate: 50, total: 0, wins: 0, losses: 0, layer: "none" }; }
   },
@@ -3312,41 +2813,36 @@ const Brain = {
       const rk = this.regimeKey(indicators, action);
       let mod = 0;
 
-      // Win rate based modifier — expert seeds give instant signal on day 1
+      // Win rate based modifier
       if (wr.total >= 2) {
-        // Cap penalties from expert data — only gentle nudges until real trades exist
-        const isExpertLayer = wr.layer && wr.layer.startsWith("expert");
-        if (wr.rate > 75) mod += isExpertLayer ? 8 : 18;
-        else if (wr.rate > 65) mod += isExpertLayer ? 5 : 10;
-        else if (wr.rate > 55) mod += isExpertLayer ? 2 : 4;
-        else if (wr.rate < 20) mod -= isExpertLayer ? 8 : 30;   // Expert: gentle. Real: harsh
-        else if (wr.rate < 30) mod -= isExpertLayer ? 6 : 20;
-        else if (wr.rate < 40) mod -= isExpertLayer ? 4 : 12;
-        else if (wr.rate < 48) mod -= isExpertLayer ? 2 : 6;
+        if (wr.rate > 75) mod += 18;
+        else if (wr.rate > 65) mod += 10;
+        else if (wr.rate > 55) mod += 4;
+        else if (wr.rate < 20) mod -= 30;   // Terrible: near-block level
+        else if (wr.rate < 30) mod -= 20;   // Very bad (was -25 at <25)
+        else if (wr.rate < 40) mod -= 12;   // Bad
+        else if (wr.rate < 48) mod -= 6;    // Below average
       }
 
-      // ═══ Regime penalty — real trades only, requires 4+ real trades before penalizing ═══
+      // ═══ v8.0: Regime penalty — requires 4+ trades (was 2) before penalizing ═══
       const TWO_WEEKS = 14 * 864e5;
       const now = Date.now();
-      const regimeLosses = this.losses.filter(e => e.source !== "expert" && e.rk === rk && now - e.ts < TWO_WEEKS).length;
-      const regimeWins = this.wins.filter(e => e.source !== "expert" && e.rk === rk && now - e.ts < TWO_WEEKS).length;
+      const regimeLosses = this.losses.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS).length;
+      const regimeWins = this.wins.filter(e => e.rk === rk && now - e.ts < TWO_WEEKS).length;
       const regimeTotal = regimeLosses + regimeWins;
       if (regimeTotal >= 4) {
         const regimeWR = (regimeWins / regimeTotal) * 100;
-        if (regimeWR < 30) mod -= 8;
-        else if (regimeWR < 40) mod -= 4;
+        if (regimeWR < 30) mod -= 8;  // v8: reduced from -10
+        else if (regimeWR < 40) mod -= 4;  // v8: reduced from -5
       }
 
       // ═══ v8.0: Exit-reason penalty — needs 5 losses (was 3) ═══
       const WEEK = 7 * 864e5;
-      // v9.2 FIX: Only real trades count for exit-reason penalties, not expert seed entries
-      const timeExitLosses = this.losses.filter(e => e.action === action && e.source !== "expert" && e.ts >= V9_DEPLOY_TS && (e.exitReason || "").includes("Time Exit") && now - e.ts < WEEK).length;
-      if (timeExitLosses >= 5) mod -= (timeExitLosses * 1.5);
+      const timeExitLosses = this.losses.filter(e => e.action === action && (e.exitReason || "").includes("Time Exit") && now - e.ts < WEEK).length;
+      if (timeExitLosses >= 5) mod -= (timeExitLosses * 1.5);  // v8: needs 5+ and lower penalty
 
-      // v9.2 FIX: Exclude expert-seeded entries from SL penalty — they aren't real trades
-      // Expert entries have source='expert', real trades don't have source field
-      const slLosses = this.losses.filter(e => e.action === action && e.exitReason === "Stop Loss" && e.source !== "expert" && e.ts >= V9_DEPLOY_TS && now - e.ts < WEEK).length;
-      if (slLosses >= 5) mod -= (slLosses * 1.0);
+      const slLosses = this.losses.filter(e => e.action === action && e.exitReason === "Stop Loss" && now - e.ts < WEEK).length;
+      if (slLosses >= 5) mod -= (slLosses * 1.5);  // v8: needs 5+ SLs before penalizing
 
       return mod;
     } catch { return 0; }
@@ -4181,6 +3677,20 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     if (regime === "squeeze") reasons.push("Squeeze - big move coming");
     if (regime === "volatile") reasons.push("High volatility - caution");
 
+    // ═══ TREND CONTINUATION ENGINE — Prevents oversold traps from blocking trend trades ═══
+    // In strong downtrends, RSI 30 + BB lower + near support are TRAPS not buy signals.
+    // Reward trend continuation so bearPct/bullPct can cross threshold despite oversold noise.
+    if (marketBias.bias === "bear" && marketBias.strength > 55) {
+      const trendBonus = Math.round((marketBias.strength - 55) * 0.45); // up to ~20 pts at 100%
+      bear += trendBonus;
+      if (trendBonus >= 5) reasons.push("Bear trend continuation (bias " + marketBias.strength + "%)");
+    }
+    if (marketBias.bias === "bull" && marketBias.strength > 55) {
+      const trendBonus = Math.round((marketBias.strength - 55) * 0.45);
+      bull += trendBonus;
+      if (trendBonus >= 5) reasons.push("Bull trend continuation (bias " + marketBias.strength + "%)");
+    }
+
     // Local sentiment — context-aware: fear in bear market confirms trend
     if (marketBias.bias === "bear" && marketBias.strength > 30) {
       // In bear market, fear = confirmation, greed = contrarian sell
@@ -4337,9 +3847,11 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     if (atrPct > 3 || volRatio > 3 || regime === "volatile") riskLevel = "HIGH";
     else if (atrPct > 1.5 || volRatio > 2) riskLevel = "MED";
 
-    // ═══ TUNED THRESHOLDS v9.2 — Raise bar significantly, stop loss massacre fix ═══
-    const confThreshold = riskLevel === "HIGH" ? 52 : riskLevel === "MED" ? 46 : 40;
-    const pctThreshold = riskLevel === "HIGH" ? 62 : riskLevel === "MED" ? 59 : 56;
+    // ═══ TUNED THRESHOLDS v7.4 — Quality over quantity, must clear fee drag ═══
+    const confThreshold = riskLevel === "HIGH" ? 42 : riskLevel === "MED" ? 36 : 30;
+    // In strong trending markets, relax pctThreshold — bias confirms direction
+    const biasThreshBonus = (marketBias.bias !== "neutral" && marketBias.strength > 60) ? 3 : 0;
+    const pctThreshold = (riskLevel === "HIGH" ? 58 : riskLevel === "MED" ? 55 : 52) - biasThreshBonus;
 
     let action = "WAIT";
     let sl = 0, tp = 0;
@@ -4403,13 +3915,12 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
         action = "WAIT";
         reasons.unshift(`TP ${tpPct.toFixed(2)}% < ${minTpPct.toFixed(1)}% min (can't clear fees)`);
       }
-      // Risk:reward must be at least 1.5:1 after fees
-      // v9.2: lowered from 2.0 to 1.5 — 2.0 was blocking ALL trades with wider SLs (math conflict)
+      // Risk:reward must be at least 2:1 after fees (was 1.5:1 — too low)
       const netTP = tpPct - feeDrag;
       const netSL = slPct + feeDrag;
-      if (netTP > 0 && netSL > 0 && netTP / netSL < 1.5) {
+      if (netTP > 0 && netSL > 0 && netTP / netSL < 2.0) {
         action = "WAIT";
-        reasons.unshift(`R:R ${(netTP/netSL).toFixed(1)}:1 after fees < 1.5:1 min`);
+        reasons.unshift(`R:R ${(netTP/netSL).toFixed(1)}:1 after fees < 2.0:1 min`);
       }
     }
 
@@ -4603,10 +4114,6 @@ export default function NexusV7() {
     try {
       Brain.load();
       setBrainStats(Brain.getStats());
-
-      // ═══ EXPERT KNOWLEDGE: Seed brain with 500+ proven patterns on first load ═══
-      const expertCount = ExpertKnowledge.seed(Brain);
-      if (expertCount > 0) console.log(`[NEXUS] 🧠 Expert brain seeded with ${expertCount} patterns — bot starts as expert`);
       StabilityEngine.load(); // ═══ STABILITY: restore trade throttle state ═══
       const saved = DB.get("state7", {});
 
@@ -4654,8 +4161,6 @@ export default function NexusV7() {
 
       // Init ML Engine
       MLEngine.init();
-      // ═══ EXPERT ML: Seed ML weights with feature importance on first load ═══
-      ExpertKnowledge.seedML(MLEngine);
       setMlStats(MLEngine.getStats());
 
       // Load API settings (with hardcoded defaults for cross-device access)
