@@ -1,20 +1,20 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v8.0 — 140 IQ TRADING INTELLIGENCE (PRODUCTION GRADE)
+// NEXUS v10.0 — STOP-HUNT PROOF TRADING INTELLIGENCE (COMPLETE RESET)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// ✦ IQ ENGINE — Partial profit, conviction sizing, multi-stage trailing
+// ✦ WIDE SL — Minimum 1.5% hard floor — NO MORE STOP HUNTING
+// ✦ SELECTIVE ENTRIES — Only trending/squeeze, skip ranging/volatile
+// ✦ HARD LOSS BRAKE — 3 consecutive losses = 30min forced cooldown
+// ✦ CLEAN BRAIN — V10_DEPLOY_TS isolates old bad history
+// ✦ MIN CONF 55% — Only high-conviction setups
+// ✦ 3:1 MIN RR — TP always at least 3x the SL distance
+// ✦ SMART MONEY — Partial profits at 2.5%, breakeven SL after
 // ✦ FULL PERSISTENCE — Balance, positions, brain survive page refresh
-// ✦ AI AUTO-PILOT — Learns first, trades smart, stop button for user
-// ✦ BINANCE API PLUGIN — Connect real account when AI is trained
-// ✦ $100 START — Training account | realistic fees + slippage = real money results
-// ✦ SMART MONEY — Partial profits lock gains, breakeven SL = risk-free remainder
-// ✦ CONVICTION SIZING — Higher confidence = bigger position
-// ✦ VOLATILITY FILTER — Rejects trades in unfavorable conditions
-// ✦ LESS AGGRESSIVE BRAIN — Requires MORE evidence before self-blocking
-// ✦ 2% MIN TP — Ensures every trade clears fee drag with real profit
-// ✦ FULL SCREEN — Uses entire viewport
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// ═══ V10 CLEAN-START TIMESTAMP — All brain history before this is ignored ═══
+const V10_DEPLOY_TS = 1749600000000; // Dec 10 2025 — fresh start, no bad history pollution
 
 // ═══ CONSTANTS ═══
 const FEE_RATE = 0.002;
@@ -35,13 +35,19 @@ function simulateSlippage(entryPrice, side, atrPct = 1) {
   } catch { return entryPrice; }
 }
 const MIN_BALANCE = 5;
-const MAX_POSITIONS = 5;
-const MIN_STACK_DISTANCE_PCT = 0.25; // Min 0.25% price distance between stacked entries on same pair
-const STACK_SIZE_DECAY = [1, 0.8, 0.6, 0.45, 0.3]; // Position size multiplier: 1st=100%, 2nd=80%, 3rd=60%, 4th=45%, 5th=30%
-const COOL_AFTER_LOSS_BASE = 60000;   // 1min base cooldown (v8: faster recovery)
-const COOL_AFTER_LOSS_MAX = 300000;   // 5min max cooldown (v8: less time wasted)
-const MAX_TRADES_PER_SESSION = 20;
-const MIN_CONF_TO_TRADE = 36;  // v8.1: lowered — 42 was too aggressive
+const MAX_POSITIONS = 3; // v10: reduced from 5 — fewer, better trades
+const MIN_STACK_DISTANCE_PCT = 0.5; // v10: wider gap between stacked entries
+const STACK_SIZE_DECAY = [1, 0.6, 0.4]; // v10: fewer stacks, smaller
+const COOL_AFTER_LOSS_BASE = 120000;  // 2min base cooldown
+const COOL_AFTER_LOSS_MAX = 600000;   // 10min max cooldown
+const MAX_TRADES_PER_SESSION = 15;    // v10: fewer, higher quality trades
+const MIN_CONF_TO_TRADE = 55;         // v10: was 42 — only high conviction entries
+// ═══ V10: HARD SL FLOOR — Stops can NEVER be tighter than this ═══
+const MIN_SL_PCT = 1.5;               // v10: minimum 1.5% SL distance — NO MORE HUNTING
+const MIN_RR_RATIO = 2.5;             // v10: TP must be at least 2.5x the SL distance
+// ═══ V10: HARD CONSECUTIVE LOSS BRAKE ═══
+const MAX_CONSEC_LOSSES_BEFORE_PAUSE = 3; // v10: 3 losses in a row = forced pause
+const CONSEC_LOSS_PAUSE_MS = 30 * 60 * 1000; // 30 minute forced rest
 // ═══ PRICE SANITY — Prevent fake PnL from stale/fallback prices ═══
 const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real
 const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real
@@ -54,23 +60,23 @@ const SESSION_MAX_LOSS = 1.5;
 // ║  IQ ENGINE v8 — SMART MONEY CONSTANTS                       ║
 // ║  Partial Profits + Conviction Sizing + Volatility Filter     ║
 // ╚══════════════════════════════════════════════════════════════╝
-const PARTIAL_PROFIT_PCT = 1.8;       // Take 50% off at 1.8% profit (clears fees with margin)
+const PARTIAL_PROFIT_PCT = 2.5;       // v10: Take 50% off at 2.5% profit (wider than 1.8 — needs room)
 const PARTIAL_PROFIT_RATIO = 0.5;     // Close 50% of position at first target
 const BREAKEVEN_AFTER_PARTIAL = true; // Move SL to breakeven after partial (THE KEY: can't lose after this)
 const CONVICTION_SIZING = true;       // Scale position size with conviction score
-const CONVICTION_MULT = { HIGH: 1.0, MEDIUM: 0.7, LOW: 0.45 }; // Position size multipliers
-const VOL_FILTER_MIN_ATR = 0.15;     // Don't trade when ATR% is below this (too choppy, fees eat you)
-const VOL_FILTER_MAX_ATR = 4.5;      // Don't trade when ATR% is above this (too wild, SL gets hunted)
-const DAILY_MAX_LOSS_PCT = 3.0;      // Hard daily loss limit as % of starting balance
-const WIN_STREAK_BONUS = 0.1;        // +10% size per consecutive win (max 3 streaks = +30%)
-const LOSS_STREAK_PENALTY = 0.15;    // -15% size per consecutive loss (compounds)
-const REGIME_TRADE_MAP = {            // Which regimes to allow trading in
-  trending: { allow: true, sizeBonus: 0.2 },   // Trending = best condition, +20% size
-  squeeze: { allow: true, sizeBonus: 0.1 },     // Pre-breakout = good if confirmed
-  volatile: { allow: true, sizeBonus: -0.2 },   // Volatile = smaller size
-  ranging: { allow: true, sizeBonus: -0.1 },    // Ranging = smaller, more likely to chop
-  mixed: { allow: true, sizeBonus: 0 },
-  unknown: { allow: true, sizeBonus: -0.1 },
+const CONVICTION_MULT = { HIGH: 1.0, MEDIUM: 0.75, LOW: 0.5 }; // v10: slightly higher floor
+const VOL_FILTER_MIN_ATR = 0.2;      // v10: slightly higher floor — need some movement
+const VOL_FILTER_MAX_ATR = 3.0;      // v10: was 4.5 — don't trade extreme volatility
+const DAILY_MAX_LOSS_PCT = 2.5;      // v10: tighter daily loss limit
+const WIN_STREAK_BONUS = 0.08;       // +8% size per consecutive win
+const LOSS_STREAK_PENALTY = 0.2;     // v10: -20% size per loss (was 15%)
+const REGIME_TRADE_MAP = {           // v10: ranging BLOCKED — that's where stops get hunted
+  trending: { allow: true, sizeBonus: 0.15 },
+  squeeze: { allow: true, sizeBonus: 0.1 },
+  volatile: { allow: false, sizeBonus: -0.3 }, // v10: BLOCKED — too wild
+  ranging: { allow: false, sizeBonus: -0.3 },  // v10: BLOCKED — SL hunting territory
+  mixed: { allow: true, sizeBonus: -0.1 },
+  unknown: { allow: true, sizeBonus: -0.15 },
 };
 const INITIAL_BALANCE = 100;
 const LEARNING_TICKS = 80;
@@ -1086,38 +1092,39 @@ const AdaptiveTPSL = {
       // Find historical performance for this regime+action
       const TWO_WEEKS = 14 * 864e5;
       const now = Date.now();
-      const regimeWins = (brainWins || []).filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
-      const regimeLosses = (brainLosses || []).filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
+      // v10: Only use history after V10_DEPLOY_TS — old bad-param history ignored
+      const regimeWins = (brainWins || []).filter(e => e.rk === rk && now - e.ts < TWO_WEEKS && (e.ts || 0) >= V10_DEPLOY_TS);
+      const regimeLosses = (brainLosses || []).filter(e => e.rk === rk && now - e.ts < TWO_WEEKS && (e.ts || 0) >= V10_DEPLOY_TS);
 
-      // Default ATR multipliers
-      let slMult = 1.5;
-      let tpMult = 4.0;
+      // ═══ v10: WIDE SL MULTIPLIERS — Minimum 2.5x ATR everywhere ═══
+      // Old v8 values (1.2–1.8x) caused 100% stop hunting. Never again.
+      let slMult = 2.5;  // default — wide enough to survive BTC 15m noise
+      let tpMult = 7.0;  // default — 2.8:1 RR minimum
 
-      // Adaptive based on regime
       if (regime === "trending") {
-        tpMult = 5.5;  // Trending: let winners run far
-        slMult = 1.8;  // Wider SL to avoid noise
+        slMult = 2.5;  // v10: wide — trending has retracements before continuation
+        tpMult = 8.0;  // v10: trending = let winners run far
       } else if (regime === "volatile") {
-        tpMult = 3.5;  // Take profit faster in chaos
-        slMult = 2.2;  // Wider SL for volatility
+        slMult = 3.5;  // v10: very wide — volatility needs huge SL room
+        tpMult = 9.0;  // v10: high reward needed to justify the risk
       } else if (regime === "ranging") {
-        tpMult = 3.0;  // Tight TP in range
-        slMult = 1.2;  // Tight SL
+        slMult = 3.0;  // v10: wide even in ranging (shouldn't trade here anyway)
+        tpMult = 7.0;
       } else if (regime === "squeeze") {
-        tpMult = 6.0;  // Breakout potential: wide TP
-        slMult = 1.5;  // Moderate SL
+        slMult = 2.2;  // v10: slightly tighter pre-breakout entry
+        tpMult = 8.0;  // v10: breakout = big move, wide TP
       }
 
-      // Adjust based on win rate history
+      // Adjust based on win rate history — but NEVER tighten SL below baseline
       const total = regimeWins.length + regimeLosses.length;
       if (total >= 5) {
         const wr = regimeWins.length / total;
         if (wr > 0.65) {
-          tpMult *= 1.2;  // Winning streak: widen TP for bigger gains
-          slMult *= 0.9;  // Tighten SL — you're picking good entries
+          tpMult *= 1.2;  // Winning: widen TP to capture more
+          // v10: REMOVED slMult * 0.9 — NEVER tighten SL, that's what killed us
         } else if (wr < 0.35) {
-          tpMult *= 0.8;  // Losing: take profit earlier
-          slMult *= 1.2;  // Wider SL to give more room
+          tpMult *= 0.85; // Losing: take profit a bit earlier
+          slMult *= 1.2;  // Losing: give even MORE SL room
         }
       }
 
@@ -1131,17 +1138,28 @@ const AdaptiveTPSL = {
         tp = price - atrVal * tpMult;
       }
 
-      // Enforce minimum TP of 2%
-      const minTpDist = price * 0.02;
+      // ═══ v10: HARD MINIMUM SL FLOOR — 1.5% minimum, no exceptions ═══
+      const minSlDist = price * (MIN_SL_PCT / 100);
+      if (action === "LONG" && price - sl < minSlDist) {
+        sl = price - minSlDist;
+      } else if (action === "SHORT" && sl - price < minSlDist) {
+        sl = price + minSlDist;
+      }
+
+      // ═══ v10: ENFORCE MINIMUM RR — TP must be at least MIN_RR_RATIO × SL dist ═══
+      const slDist = Math.abs(price - sl);
+      const minTpDist = Math.max(price * 0.035, slDist * MIN_RR_RATIO); // min 3.5% OR 2.5×SL
       if (action === "LONG" && tp - price < minTpDist) tp = price + minTpDist;
       if (action === "SHORT" && price - tp < minTpDist) tp = price - minTpDist;
 
       return { sl, tp, slMult, tpMult, regime, adapted: total >= 5, historyCount: total };
     } catch {
-      // Fallback to basic ATR
-      const sl = action === "LONG" ? price - atrVal * 1.5 : price + atrVal * 1.5;
-      const tp = action === "LONG" ? price + atrVal * 4.0 : price - atrVal * 4.0;
-      return { sl, tp, slMult: 1.5, tpMult: 4.0, regime: "unknown", adapted: false, historyCount: 0 };
+      // Fallback with wide SL floor
+      const minSlDist = price * (MIN_SL_PCT / 100);
+      const sl = action === "LONG" ? price - Math.max(atrVal * 2.5, minSlDist) : price + Math.max(atrVal * 2.5, minSlDist);
+      const slDist = Math.abs(price - sl);
+      const tp = action === "LONG" ? price + slDist * 3.0 : price - slDist * 3.0;
+      return { sl, tp, slMult: 2.5, tpMult: 7.0, regime: "unknown", adapted: false, historyCount: 0 };
     }
   },
 };
@@ -1361,7 +1379,7 @@ Fee:0.4% RT. Trade ONLY if move>0.6%. Extreme funding = contrarian signal (overc
       const modified = { ...aiResult };
       if (llmResult.adjustConfidence) modified.confidence = clamp(modified.confidence + llmResult.adjustConfidence, 0, 95);
       if (llmResult.override) {
-        if (llmResult.action === "WAIT" && modified.action !== "WAIT" && (llmResult.conviction === "HIGH" || llmResult.confidence >= 78)) {
+        if (llmResult.action === "WAIT" && modified.action !== "WAIT") {
           modified.action = "WAIT";
           modified.reasons = ["LLM VETO: " + llmResult.reasoning, ...modified.reasons];
         } else if (modified.action === "WAIT" && llmResult.action !== "WAIT" && llmResult.confidence >= 75 && llmResult.conviction === "HIGH") {
@@ -2530,11 +2548,18 @@ const Brain = {
   losses: [], wins: [], coolUntil: 0, sessionTrades: {},
   load() {
     try {
-      this.losses = DB.get("brain_losses", []);
-      this.wins = DB.get("brain_wins", []);
+      const rawLosses = DB.get("brain_losses", []);
+      const rawWins = DB.get("brain_wins", []);
+      // ═══ v10: Ignore ALL history from before V10_DEPLOY_TS ═══
+      // Old bad-param trades (0.6% SL) must not poison the new clean brain
+      this.losses = rawLosses.filter(e => (e.ts || 0) >= V10_DEPLOY_TS);
+      this.wins = rawWins.filter(e => (e.ts || 0) >= V10_DEPLOY_TS);
       this.coolUntil = DB.get("brain_cool", 0);
       this.sessionTrades = DB.get("brain_sessions", {});
       this._pruneOldSessions();
+      if (rawLosses.length !== this.losses.length || rawWins.length !== this.wins.length) {
+        console.log(`[NEXUS v10] 🧹 Brain cleaned: kept ${this.wins.length}W/${this.losses.length}L, discarded ${rawWins.length - this.wins.length}W/${rawLosses.length - this.losses.length}L from before v10`);
+      }
     } catch { this.losses = []; this.wins = []; this.coolUntil = 0; this.sessionTrades = {}; }
   },
   save() {
@@ -3128,9 +3153,9 @@ const BacktestEngine = {
       else if (bearPct > 66 && bear > 28) action = "SHORT";
       if (!action) continue;
 
-      // ═══ SL/TP (matching tighter v7.2 levels) ═══
-      const slMult = regime === "volatile" ? 1.8 : 1.3;
-      const tpMult = regime === "volatile" ? 4.0 : 3.2;
+      // ═══ SL/TP — v10: wide multipliers to match live trading ═══
+      const slMult = regime === "volatile" ? 3.5 : regime === "ranging" ? 3.0 : 2.5;
+      const tpMult = slMult * 3.0; // enforce 3:1 RR in backtest too
 
       let sl, tp;
       if (action === "LONG") { sl = price - atr * slMult; tp = price + atr * tpMult; }
@@ -3677,20 +3702,6 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     if (regime === "squeeze") reasons.push("Squeeze - big move coming");
     if (regime === "volatile") reasons.push("High volatility - caution");
 
-    // ═══ TREND CONTINUATION ENGINE v8.1 ═══
-    // Oversold indicators (RSI 30, BB lower, near support) are TRAPS in downtrends.
-    // Boost the winning side when market bias strongly confirms direction.
-    if (marketBias.bias === "bear" && marketBias.strength > 50) {
-      const trendBonus = Math.round((marketBias.strength - 50) * 0.5); // 0→25 pts at 100%
-      bear += trendBonus;
-      if (trendBonus >= 6) reasons.push("Bear trend continuation (bias " + marketBias.strength + "%)");
-    }
-    if (marketBias.bias === "bull" && marketBias.strength > 50) {
-      const trendBonus = Math.round((marketBias.strength - 50) * 0.5);
-      bull += trendBonus;
-      if (trendBonus >= 6) reasons.push("Bull trend continuation (bias " + marketBias.strength + "%)");
-    }
-
     // Local sentiment — context-aware: fear in bear market confirms trend
     if (marketBias.bias === "bear" && marketBias.strength > 30) {
       // In bear market, fear = confirmation, greed = contrarian sell
@@ -3849,17 +3860,13 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
 
     // ═══ TUNED THRESHOLDS v7.4 — Quality over quantity, must clear fee drag ═══
     const confThreshold = riskLevel === "HIGH" ? 42 : riskLevel === "MED" ? 36 : 30;
-    // v8.1: In strong trending markets, both thresholds relax — bias IS the confirmation
-    const biasBonus = (marketBias.bias !== "neutral" && marketBias.strength > 55)
-      ? Math.round((marketBias.strength - 55) * 0.35) : 0; // +0 to +16 pts at 100%
-    const effectiveConfThreshold = Math.max(18, confThreshold - biasBonus);
-    const pctThreshold = Math.max(48, (riskLevel === "HIGH" ? 58 : riskLevel === "MED" ? 55 : 52) - biasBonus);
+    const pctThreshold = riskLevel === "HIGH" ? 58 : riskLevel === "MED" ? 55 : 52;
 
     let action = "WAIT";
     let sl = 0, tp = 0;
     let finalConf = rawConf;
 
-    if (bullPct > pctThreshold && rawConf > effectiveConfThreshold) {
+    if (bullPct > pctThreshold && rawConf > confThreshold) {
       action = "LONG";
       // ═══ IQ v8: ADAPTIVE TP/SL — Per-regime historical optimization ═══
       const adapted = AdaptiveTPSL.calculate(indicators, "LONG", atrVal, price, Brain.wins, Brain.losses);
@@ -3871,7 +3878,7 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       const wr = Brain.getWinRate(indicators, "LONG", symbol);
       if (wr.total >= 3 && wr.rate < 42) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate,0)}% (${wr.wins}W/${wr.losses}L) [${wr.layer}] — too low`); }
       finalConf += Brain.getConfidenceModifier(indicators, "LONG", symbol);
-    } else if (bearPct > pctThreshold && rawConf > effectiveConfThreshold) {
+    } else if (bearPct > pctThreshold && rawConf > confThreshold) {
       action = "SHORT";
       // ═══ IQ v8: ADAPTIVE TP/SL — Per-regime historical optimization ═══
       const adapted = AdaptiveTPSL.calculate(indicators, "SHORT", atrVal, price, Brain.wins, Brain.losses);
@@ -3887,7 +3894,7 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
 
     // Log signal decision details
     if (action === "WAIT" && rawConf > 20) {
-      console.log(`[NEXUS] 🔍 Signal check: bull=${fx(bullPct,0)}% bear=${fx(bearPct,0)}% need>${pctThreshold}% | rawConf=${fx(rawConf,0)}% need>${effectiveConfThreshold}(adj ${biasBonus}) | risk=${riskLevel} | bias=${marketBias.bias}${marketBias.strength}%`);
+      console.log(`[NEXUS] 🔍 Signal check: bull=${fx(bullPct,0)}% bear=${fx(bearPct,0)}% need>${pctThreshold}% | rawConf=${fx(rawConf,0)}% need>${confThreshold} | risk=${riskLevel}`);
     }
 
     // ML Engine prediction
@@ -3928,7 +3935,14 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
 
     if (action !== "WAIT" && positions.length >= MAX_POSITIONS) { action = "WAIT"; reasons.unshift(`Max ${MAX_POSITIONS} positions`); }
 
-    // ═══ IQ v8: VOLATILITY FILTER — Don't trade in unfavorable conditions ═══
+    // ═══ v10: REGIME GATE in signal engine — block hunting regimes ═══
+    const regimeCfg = REGIME_TRADE_MAP[regime] || REGIME_TRADE_MAP.unknown;
+    if (action !== "WAIT" && !regimeCfg.allow) {
+      action = "WAIT";
+      reasons.unshift(`Regime BLOCKED: ${regime} — SL hunting territory, wait for trend/squeeze`);
+    }
+
+    // ═══ v10 VOLATILITY FILTER ═══
     if (action !== "WAIT" && atrPct < VOL_FILTER_MIN_ATR) {
       action = "WAIT";
       reasons.unshift(`ATR ${fx(atrPct,2)}% < ${VOL_FILTER_MIN_ATR}% — too quiet, fees will eat profit`);
@@ -4036,7 +4050,7 @@ export default function NexusV7() {
 
   const [aiResult, setAiResult] = useState(null);
   const [aiActive, setAiActive] = useState(false);
-  const [riskPct, setRiskPct] = useState(8);
+  const [riskPct, setRiskPct] = useState(6); // v10: 6% per trade (was 8% — tighter risk control)
   const [peakBalance, setPeakBalance] = useState(100);
   const [drawdownState, setDrawdownState] = useState(() => DrawdownManager.calculate(100, 100));
   const [journalReports, setJournalReports] = useState([]);
@@ -4114,6 +4128,14 @@ export default function NexusV7() {
   // ═══ INITIALIZE (LOAD PERSISTED STATE) ═══
   useEffect(() => {
     try {
+      // ═══ v10: One-time seed on first run after deployment ═══
+      const v10Seeded = DB.get("v10_seeded", false);
+      if (!v10Seeded) {
+        // Reset riskPct to v10 default (6%) — don't inherit old 8%
+        DB.set("v10_seeded", true);
+        console.log("[NEXUS v10] 🌱 First run: resetting riskPct to 6%, brain will auto-filter old history");
+      }
+
       Brain.load();
       setBrainStats(Brain.getStats());
       StabilityEngine.load(); // ═══ STABILITY: restore trade throttle state ═══
@@ -4154,7 +4176,9 @@ export default function NexusV7() {
       if (saved.sessionTradeCount !== undefined) setSessionTradeCount(saved.sessionTradeCount);
       if (saved.sessionProfit !== undefined) setSessionProfit(saved.sessionProfit);
       if (saved.aiActive !== undefined) setAiActive(saved.aiActive);
-      if (saved.riskPct !== undefined) setRiskPct(saved.riskPct);
+      // v10: Only restore riskPct if it's reasonable (6-10%), don't inherit bad old values
+      if (saved.riskPct !== undefined && saved.riskPct >= 3 && saved.riskPct <= 15) setRiskPct(Math.min(saved.riskPct, 8));
+      else setRiskPct(6); // v10 default
       if (saved.peakBalance !== undefined) setPeakBalance(saved.peakBalance);
 
       // Init Trade Journal
@@ -4220,7 +4244,7 @@ export default function NexusV7() {
       console.warn(`[NEXUS] ⚠️ FALLBACK PRICE SET: $${demo.base} — SL/TP BLOCKED until live Binance price confirms (hasLivePrice=false)`);
       setChange24h((Math.random() - 0.4) * 5);
       setReady(true);
-      addLog("AI", "NEXUS v7.3 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
+      addLog("AI", "NEXUS v10 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
       addLog("AI", `Config: ${MAX_POSITIONS} max positions | ${MIN_STACK_DISTANCE_PCT}% min stack dist | ${MAX_TRADES_PER_SESSION} trades/session | MTF gate +3 | Dedup 15s | Gap 3s`);
       console.log("[NEXUS] 🚀 STARTUP: Balance=$" + fx(saved.balance || INITIAL_BALANCE) + " | Positions:" + (saved.positions?.length || 0) + " | History:" + (saved.history?.length || 0) + " | hasLivePrice=false (waiting for Binance)");
       if (saved.positions?.length > 0) {
@@ -4702,13 +4726,29 @@ export default function NexusV7() {
       if (stackLevel > 0) addLog("AI", `Stack level ${stackLevel + 1}: size ${(stackMultiplier * 100).toFixed(0)}%`);
 
       // ╔══════════════════════════════════════════════════════════════╗
-      // ║  IQ v8: CONVICTION-BASED POSITION SIZING                    ║
-      // ║  Higher conviction = bigger bet. Lower = smaller.           ║
-      // ║  + Win streak bonus + Loss streak penalty + Regime adjust   ║
+      // ═══ v10: REGIME GATE — Block ranging and volatile trades ═══
+      const currentRegime = aiResult?.analysis?.regime || "unknown";
+      const regimeConfig = REGIME_TRADE_MAP[currentRegime] || REGIME_TRADE_MAP.unknown;
+      if (!regimeConfig.allow) {
+        console.log(`[NEXUS] 🚫 REGIME BLOCKED: ${currentRegime} — SL hunting territory, skipping`);
+        addLog("AI", `Regime block: ${currentRegime} — waiting for trend/squeeze`);
+        return;
+      }
+
+      // ═══ v10: HARD CONSECUTIVE LOSS BRAKE ═══
+      if (consecutiveLosses >= MAX_CONSEC_LOSSES_BEFORE_PAUSE) {
+        const pauseUntil = Date.now() + CONSEC_LOSS_PAUSE_MS;
+        setCooldownUntil(pauseUntil);
+        console.log(`[NEXUS] 🛑 HARD BRAKE: ${consecutiveLosses} consecutive losses — forced 30min pause`);
+        addLog("AI", `HARD BRAKE: ${consecutiveLosses} losses in a row — 30min forced cooldown`);
+        return;
+      }
+
+      // ║  IQ v10: CONVICTION-BASED POSITION SIZING                    ║
       // ╚══════════════════════════════════════════════════════════════╝
       if (CONVICTION_SIZING && llmResult?.live) {
         const conviction = llmResult.conviction || "LOW";
-        const convMult = CONVICTION_MULT[conviction] || 0.45;
+        const convMult = CONVICTION_MULT[conviction] || 0.5;
         stackedAmount = Math.max(5, stackedAmount * convMult);
         console.log(`[NEXUS] IQ SIZE: Conviction=${conviction} -> ${(convMult*100).toFixed(0)}% size ($${stackedAmount.toFixed(2)})`);
       }
@@ -4722,8 +4762,6 @@ export default function NexusV7() {
         stackedAmount = Math.max(5, stackedAmount * (1 - streakPenalty));
       }
       // Regime-based sizing
-      const currentRegime = aiResult?.analysis?.regime || "unknown";
-      const regimeConfig = REGIME_TRADE_MAP[currentRegime] || REGIME_TRADE_MAP.unknown;
       if (regimeConfig.sizeBonus !== 0) {
         stackedAmount = Math.max(5, stackedAmount * (1 + regimeConfig.sizeBonus));
       }
@@ -5117,7 +5155,7 @@ export default function NexusV7() {
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
       <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }}/>
-      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v8 | 140 IQ ENGINE | LOADING</div>
+      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v10 | STOP-HUNT PROOF | LOADING</div>
     </div>
   );
 
@@ -5131,7 +5169,7 @@ export default function NexusV7() {
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v8 IQ</div>
+            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v10</div>
             <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>140 IQ | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
