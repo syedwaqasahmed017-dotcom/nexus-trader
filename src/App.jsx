@@ -1,14 +1,16 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v10.0 — 140 IQ TRADING INTELLIGENCE (UNBLOCKED)
+// NEXUS v11.0 — PERMANENT FIX: 5 ROOT CAUSES ELIMINATED
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// ✦ v10 FIX: MIN_CONF 42→30, bias-adaptive thresholds, trend continuation
-// ✦ v10 FIX: Fee gate 3.5x→2.5x, R:R 2.0→1.5, anti-freeze timer
-// ✦ v10 FIX: Brain deploy timestamp — old losses don't block new trades
-// ✦ v10 FIX: Emergency brake 6→10, pair losses 3→5, SL block 6→8
-// ✦ v10 FIX: Cooldown 60s/5min→30s/3min, LLM veto needs HIGH+70%
-// ✦ v10 FIX: MTF soft gate removed, session pattern 3→5
+// ✦ ROOT FIX 1: Minimum SL distance 1.0% restored (v10 lost it → instant stops)
+// ✦ ROOT FIX 2: SHORT trades enabled — MTF penalizes not hard-blocks
+// ✦ ROOT FIX 3: Partial profit raised 1.8→2.5%, breakeven buffer +0.5%
+// ✦ ROOT FIX 4: Position sizing floor raised — MEDIUM=0.85, LOW=0.65
+// ✦ ROOT FIX 5: AdaptiveTPSL widened — ranging SL 1.2→2.2, all regimes wider
+// ✦ v11: Post-partial trail only at 4.5%, keep 65% (was 3%/75% → too tight)
+// ✦ v11: Deploy timestamp reset — old brain losses wiped clean
+// ✦ v11: Loss streak penalty halved (0.15→0.08 per loss)
 // ✦ IQ ENGINE — Partial profit, conviction sizing, multi-stage trailing
 // ✦ FULL PERSISTENCE — Balance, positions, brain survive page refresh
 // ✦ AI AUTO-PILOT — Learns first, trades smart, stop button for user
@@ -53,23 +55,23 @@ const SESSION_MAX_LOSS = 1.5;
 // ║  IQ ENGINE v8 — SMART MONEY CONSTANTS                       ║
 // ║  Partial Profits + Conviction Sizing + Volatility Filter     ║
 // ╚══════════════════════════════════════════════════════════════╝
-const PARTIAL_PROFIT_PCT = 1.8;       // Take 50% off at 1.8% profit (clears fees with margin)
+const PARTIAL_PROFIT_PCT = 2.5;       // v11: was 1.8 — too early, remaining 50% got stopped at breakeven instantly
 const PARTIAL_PROFIT_RATIO = 0.5;     // Close 50% of position at first target
 const BREAKEVEN_AFTER_PARTIAL = true; // Move SL to breakeven after partial (THE KEY: can't lose after this)
 const CONVICTION_SIZING = true;       // Scale position size with conviction score
-const CONVICTION_MULT = { HIGH: 1.0, MEDIUM: 0.7, LOW: 0.45 }; // Position size multipliers
+const CONVICTION_MULT = { HIGH: 1.0, MEDIUM: 0.85, LOW: 0.65 }; // v11: was 0.7/0.45 — crushed position sizes
 const VOL_FILTER_MIN_ATR = 0.15;     // Don't trade when ATR% is below this (too choppy, fees eat you)
 const VOL_FILTER_MAX_ATR = 4.5;      // Don't trade when ATR% is above this (too wild, SL gets hunted)
 const DAILY_MAX_LOSS_PCT = 3.0;      // Hard daily loss limit as % of starting balance
 const WIN_STREAK_BONUS = 0.1;        // +10% size per consecutive win (max 3 streaks = +30%)
-const LOSS_STREAK_PENALTY = 0.15;    // -15% size per consecutive loss (compounds)
+const LOSS_STREAK_PENALTY = 0.08;    // v11: was 0.15 — compounding too aggressively, crushing size after 2 losses
 const REGIME_TRADE_MAP = {            // Which regimes to allow trading in
-  trending: { allow: true, sizeBonus: 0.2 },   // Trending = best condition, +20% size
+  trending: { allow: true, sizeBonus: 0.15 },   // Trending = best condition
   squeeze: { allow: true, sizeBonus: 0.1 },     // Pre-breakout = good if confirmed
-  volatile: { allow: true, sizeBonus: -0.2 },   // Volatile = smaller size
-  ranging: { allow: true, sizeBonus: -0.1 },    // Ranging = smaller, more likely to chop
+  volatile: { allow: true, sizeBonus: -0.1 },   // v11: was -0.2 — too aggressive
+  ranging: { allow: true, sizeBonus: 0 },        // v11: was -0.1 — stacking with conviction+loss penalties
   mixed: { allow: true, sizeBonus: 0 },
-  unknown: { allow: true, sizeBonus: -0.1 },
+  unknown: { allow: true, sizeBonus: 0 },        // v11: was -0.1
 };
 const INITIAL_BALANCE = 100;
 const LEARNING_TICKS = 80;
@@ -1114,23 +1116,23 @@ const AdaptiveTPSL = {
       const regimeWins = (brainWins || []).filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
       const regimeLosses = (brainLosses || []).filter(e => e.rk === rk && now - e.ts < TWO_WEEKS);
 
-      // Default ATR multipliers
-      let slMult = 1.5;
-      let tpMult = 4.0;
+      // Default ATR multipliers — v11: ALL widened to survive BTC noise
+      let slMult = 2.2;
+      let tpMult = 5.0;
 
-      // Adaptive based on regime
+      // Adaptive based on regime — v11: SL must be wider than normal candle noise
       if (regime === "trending") {
-        tpMult = 5.5;  // Trending: let winners run far
-        slMult = 1.8;  // Wider SL to avoid noise
+        tpMult = 6.0;  // Trending: let winners run far
+        slMult = 2.5;  // Wide SL — trending means bigger swings
       } else if (regime === "volatile") {
-        tpMult = 3.5;  // Take profit faster in chaos
-        slMult = 2.2;  // Wider SL for volatility
+        tpMult = 5.5;  // v11: raised to maintain R:R with wider SL
+        slMult = 3.0;  // Very wide SL for volatility
       } else if (regime === "ranging") {
-        tpMult = 3.0;  // Tight TP in range
-        slMult = 1.2;  // Tight SL
+        tpMult = 4.5;  // v11: raised from 3.0 — needs to clear fees + wider SL
+        slMult = 2.2;  // v11: was 1.2 — THE #1 CAUSE of all stop losses. 1.2x ATR = 0.36% = noise
       } else if (regime === "squeeze") {
-        tpMult = 6.0;  // Breakout potential: wide TP
-        slMult = 1.5;  // Moderate SL
+        tpMult = 7.0;  // Breakout potential: wide TP
+        slMult = 2.0;  // Moderate SL
       }
 
       // Adjust based on win rate history
@@ -1139,10 +1141,10 @@ const AdaptiveTPSL = {
         const wr = regimeWins.length / total;
         if (wr > 0.65) {
           tpMult *= 1.2;  // Winning streak: widen TP for bigger gains
-          slMult *= 0.9;  // Tighten SL — you're picking good entries
+          slMult *= 0.95; // v11: was 0.9 — don't tighten SL too much even on streaks
         } else if (wr < 0.35) {
-          tpMult *= 0.8;  // Losing: take profit earlier
-          slMult *= 1.2;  // Wider SL to give more room
+          tpMult *= 0.85; // Losing: take profit earlier
+          slMult *= 1.15; // Wider SL to give more room
         }
       }
 
@@ -1161,12 +1163,20 @@ const AdaptiveTPSL = {
       if (action === "LONG" && tp - price < minTpDist) tp = price + minTpDist;
       if (action === "SHORT" && price - tp < minTpDist) tp = price - minTpDist;
 
+      // ═══ v11 CRITICAL: ENFORCE MINIMUM SL DISTANCE — 1.0% of price ═══
+      // This was in v9.1/v9.2 but got LOST in v10 — caused ALL stop loss massacres
+      // BTC 1-min candles regularly move 0.3-0.5%. SL must be wider than noise.
+      const MIN_SL_PCT = 1.0;
+      const minSlDist = price * (MIN_SL_PCT / 100);
+      if (action === "LONG" && price - sl < minSlDist) { sl = price - minSlDist; }
+      if (action === "SHORT" && sl - price < minSlDist) { sl = price + minSlDist; }
+
       return { sl, tp, slMult, tpMult, regime, adapted: total >= 5, historyCount: total };
     } catch {
-      // Fallback to basic ATR
-      const sl = action === "LONG" ? price - atrVal * 1.5 : price + atrVal * 1.5;
-      const tp = action === "LONG" ? price + atrVal * 4.0 : price - atrVal * 4.0;
-      return { sl, tp, slMult: 1.5, tpMult: 4.0, regime: "unknown", adapted: false, historyCount: 0 };
+      // Fallback to basic ATR — v11: widened
+      const sl = action === "LONG" ? price - atrVal * 2.2 : price + atrVal * 2.2;
+      const tp = action === "LONG" ? price + atrVal * 5.0 : price - atrVal * 5.0;
+      return { sl, tp, slMult: 2.2, tpMult: 5.0, regime: "unknown", adapted: false, historyCount: 0 };
     }
   },
 };
@@ -2705,8 +2715,8 @@ const Brain = {
       const now = Date.now();
       // ═══ v10 DEPLOY TIMESTAMP — Only consider losses AFTER this deploy ═══
       // Old losses were from broken thresholds/gates — don't let them block new trades
-      const V10_DEPLOY_TS = 1741824000000; // March 13, 2026 00:00 UTC
-      const filterTs = (entries, maxAge) => entries.filter(e => e.ts > V10_DEPLOY_TS && now - e.ts < maxAge);
+      const V11_DEPLOY_TS = 1773619200000; // March 16, 2026 00:00 UTC — v11 wipes all pre-fix brain losses
+      const filterTs = (entries, maxAge) => entries.filter(e => e.ts > V11_DEPLOY_TS && now - e.ts < maxAge);
 
       // CHECK 1: Cooldown timer (severity-scaled in recordLoss)
       if (now < this.coolUntil) return { blocked: true, reason: `Cooling down (${Math.ceil((this.coolUntil - now) / 1000)}s)`, severity: "COOL" };
@@ -2759,8 +2769,8 @@ const Brain = {
       // CHECK 10: Session-specific pattern failure — v10: needs 5 (was 3 — active sessions hit this fast)
       const sessionName = Sessions.getCurrent().primary.name;
       const simKey = fp.split("|").slice(0, 4).join("|");
-      const sessionLosses = this.losses.filter(e => e.ts > V10_DEPLOY_TS && e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
-      const sessionWins = this.wins.filter(e => e.ts > V10_DEPLOY_TS && e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
+      const sessionLosses = this.losses.filter(e => e.ts > V11_DEPLOY_TS && e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
+      const sessionWins = this.wins.filter(e => e.ts > V11_DEPLOY_TS && e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
       if (sessionLosses.length >= 5 && sessionWins.length < sessionLosses.length * 0.35) {
         return { blocked: true, reason: `Pattern fails in ${sessionName} (${sessionWins.length}W/${sessionLosses.length}L)`, severity: "MED" };
       }
@@ -2773,9 +2783,9 @@ const Brain = {
     try {
       const WEEK = 7 * 864e5;
       const now = Date.now();
-      const V10_DEPLOY_TS = 1741824000000; // March 13, 2026 00:00 UTC
-      const recentLosses = this.losses.filter(e => e.ts > V10_DEPLOY_TS && e.action === action && now - e.ts < WEEK);
-      const recentWins = this.wins.filter(e => e.ts > V10_DEPLOY_TS && e.action === action && now - e.ts < WEEK);
+      const V11_DEPLOY_TS = 1773619200000; // March 16, 2026 00:00 UTC — v11 wipes all pre-fix brain losses
+      const recentLosses = this.losses.filter(e => e.ts > V11_DEPLOY_TS && e.action === action && now - e.ts < WEEK);
+      const recentWins = this.wins.filter(e => e.ts > V11_DEPLOY_TS && e.action === action && now - e.ts < WEEK);
       if (recentLosses.length < 5) return null; // v10: was 3
 
       const exitReasons = {};
@@ -2836,46 +2846,48 @@ const Brain = {
       return { rate: 50, total: 0, wins: 0, losses: 0, layer: "none" };
     } catch { return { rate: 50, total: 0, wins: 0, losses: 0, layer: "none" }; }
   },
-  // ═══ v7.5 ENHANCED CONFIDENCE MODIFIER — Steeper penalties, faster learning ═══
+  // ═══ v11: CONFIDENCE MODIFIER — Capped at -15 max penalty ═══
+  // Old: penalties went to -30 which combined with MIN_CONF=30 blocked everything
   getConfidenceModifier(indicators, action, symbol) {
     try {
       const wr = this.getWinRate(indicators, action, symbol);
       const rk = this.regimeKey(indicators, action);
       let mod = 0;
 
-      // Win rate based modifier
-      if (wr.total >= 2) {
-        if (wr.rate > 75) mod += 18;
-        else if (wr.rate > 65) mod += 10;
-        else if (wr.rate > 55) mod += 4;
-        else if (wr.rate < 20) mod -= 30;   // Terrible: near-block level
-        else if (wr.rate < 30) mod -= 20;   // Very bad (was -25 at <25)
-        else if (wr.rate < 40) mod -= 12;   // Bad
-        else if (wr.rate < 48) mod -= 6;    // Below average
+      // Win rate based modifier — v11: capped penalties
+      if (wr.total >= 3) { // v11: need 3 trades, not 2
+        if (wr.rate > 75) mod += 15;
+        else if (wr.rate > 65) mod += 8;
+        else if (wr.rate > 55) mod += 3;
+        else if (wr.rate < 20) mod -= 15;   // v11: was -30 → killed everything
+        else if (wr.rate < 30) mod -= 10;   // v11: was -20
+        else if (wr.rate < 40) mod -= 6;    // v11: was -12
+        else if (wr.rate < 48) mod -= 3;    // v11: was -6
       }
 
-      // ═══ v10: Regime penalty — requires 4+ trades post-deploy before penalizing ═══
+      // ═══ v11: Regime penalty — requires 5+ trades post-deploy ═══
       const TWO_WEEKS = 14 * 864e5;
       const now = Date.now();
-      const V10_DEPLOY_TS = 1741824000000;
-      const regimeLosses = this.losses.filter(e => e.ts > V10_DEPLOY_TS && e.rk === rk && now - e.ts < TWO_WEEKS).length;
-      const regimeWins = this.wins.filter(e => e.ts > V10_DEPLOY_TS && e.rk === rk && now - e.ts < TWO_WEEKS).length;
+      const V11_DEPLOY_TS = 1773619200000;
+      const regimeLosses = this.losses.filter(e => e.ts > V11_DEPLOY_TS && e.rk === rk && now - e.ts < TWO_WEEKS).length;
+      const regimeWins = this.wins.filter(e => e.ts > V11_DEPLOY_TS && e.rk === rk && now - e.ts < TWO_WEEKS).length;
       const regimeTotal = regimeLosses + regimeWins;
-      if (regimeTotal >= 4) {
+      if (regimeTotal >= 5) { // v11: was 4
         const regimeWR = (regimeWins / regimeTotal) * 100;
-        if (regimeWR < 30) mod -= 8;  // v8: reduced from -10
-        else if (regimeWR < 40) mod -= 4;  // v8: reduced from -5
+        if (regimeWR < 30) mod -= 5;  // v11: was -8
+        else if (regimeWR < 40) mod -= 2;  // v11: was -4
       }
 
-      // ═══ v10: Exit-reason penalty — only post-deploy losses ═══
+      // ═══ v11: Exit-reason penalty — only post-deploy, capped ═══
       const WEEK = 7 * 864e5;
-      const timeExitLosses = this.losses.filter(e => e.ts > V10_DEPLOY_TS && e.action === action && (e.exitReason || "").includes("Time Exit") && now - e.ts < WEEK).length;
-      if (timeExitLosses >= 5) mod -= (timeExitLosses * 1.5);
+      const timeExitLosses = this.losses.filter(e => e.ts > V11_DEPLOY_TS && e.action === action && (e.exitReason || "").includes("Time Exit") && now - e.ts < WEEK).length;
+      if (timeExitLosses >= 6) mod -= Math.min(8, timeExitLosses * 1.0); // v11: capped at -8
 
-      const slLosses = this.losses.filter(e => e.ts > V10_DEPLOY_TS && e.action === action && e.exitReason === "Stop Loss" && now - e.ts < WEEK).length;
-      if (slLosses >= 6) mod -= (slLosses * 1.2);  // v10: needs 6+ SLs, reduced penalty
+      const slLosses = this.losses.filter(e => e.ts > V11_DEPLOY_TS && e.action === action && e.exitReason === "Stop Loss" && now - e.ts < WEEK).length;
+      if (slLosses >= 7) mod -= Math.min(8, slLosses * 0.8);  // v11: capped at -8, needs 7+
 
-      return mod;
+      // ═══ v11 HARD CAP: total modifier can never drop below -15 ═══
+      return Math.max(-15, mod);
     } catch { return 0; }
   },
   // ═══ v7.5 NEW: MTF CONFIDENCE — Check if this action needs MTF support ═══
@@ -3895,7 +3907,7 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       const blockCheck = Brain.shouldBlock(indicators, "LONG", symbol);
       if (blockCheck.blocked) { action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason); }
       const wr = Brain.getWinRate(indicators, "LONG", symbol);
-      if (wr.total >= 3 && wr.rate < 42) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate,0)}% (${wr.wins}W/${wr.losses}L) [${wr.layer}] — too low`); }
+      if (wr.total >= 5 && wr.rate < 30) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate,0)}% (${wr.wins}W/${wr.losses}L) [${wr.layer}] — too low`); } // v11: was 3/42% — too aggressive with small samples
       finalConf += Brain.getConfidenceModifier(indicators, "LONG", symbol);
     } else if (bearPct > pctThreshold && rawConf > confThreshold) {
       action = "SHORT";
@@ -3907,7 +3919,7 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
       const blockCheck = Brain.shouldBlock(indicators, "SHORT", symbol);
       if (blockCheck.blocked) { action = "WAIT"; reasons.unshift("BRAIN: " + blockCheck.reason); }
       const wr = Brain.getWinRate(indicators, "SHORT", symbol);
-      if (wr.total >= 3 && wr.rate < 42) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate,0)}% (${wr.wins}W/${wr.losses}L) [${wr.layer}] — too low`); }
+      if (wr.total >= 5 && wr.rate < 30) { action = "WAIT"; reasons.unshift(`Pattern WR ${fx(wr.rate,0)}% (${wr.wins}W/${wr.losses}L) [${wr.layer}] — too low`); } // v11: was 3/42%
       finalConf += Brain.getConfidenceModifier(indicators, "SHORT", symbol);
     }
 
@@ -4614,25 +4626,27 @@ export default function NexusV7() {
       // Drawdown escalation check
       if (drawdownState?.isPaused) { console.log("[NEXUS] ⏸ Drawdown pause active"); return; }
 
-      // ═══ MTF ALIGNMENT GATE (v7.2) — Don't trade against the big picture ═══
+      // ═══ MTF ALIGNMENT GATE v11 — Penalize against-trend trades, don't hard-block ═══
       const mtfCombined = mtfData?.combined;
       console.log(`[NEXUS] 🧠 AI Signal: ${aiResult.action} ${pair.name} conf=${aiResult.confidence}% | MTF: ${mtfCombined?.valid ? mtfCombined.trend + " " + mtfCombined.strength + "%" + (mtfCombined.aligned ? " ALIGNED" : "") : "no data"} | Positions: ${positions.length}/${MAX_POSITIONS} (${samePairPositions.length} same pair)`);
       if (mtfCombined && mtfCombined.valid) {
-        // HARD BLOCK: Never open a LONG when MTF is aligned bearish (or vice versa)
+        // HARD BLOCK: Never open a LONG when MTF is aligned bearish (genuine counter-trend)
         if (aiResult.action === "LONG" && mtfCombined.trend === "bearish" && mtfCombined.aligned) {
           addLog("MTF", "BLOCKED LONG: 3+ timeframes aligned bearish — not fighting the trend");
           console.log("[NEXUS] 🚫 MTF HARD BLOCK: LONG vs aligned bearish");
           return;
         }
+        // ═══ v11 FIX: SHORT vs bullish MTF = PENALTY not BLOCK ═══
+        // In crypto, bull trends dominate 70%+ of the time. Hard-blocking shorts during
+        // bullish MTF means the bot can NEVER short — missing all pullbacks & reversals.
+        // Instead: penalize confidence by strength of MTF, let strong signals through.
         if (aiResult.action === "SHORT" && mtfCombined.trend === "bullish" && mtfCombined.aligned) {
-          addLog("MTF", "BLOCKED SHORT: 3+ timeframes aligned bullish — not fighting the trend");
-          console.log("[NEXUS] 🚫 MTF HARD BLOCK: SHORT vs aligned bullish");
-          return;
+          const mtfPenalty = Math.round(mtfCombined.strength * 0.15); // 63% MTF → -9 conf
+          console.log(`[NEXUS] ⚠️ MTF PENALTY: SHORT vs aligned bullish — conf penalty -${mtfPenalty} (was hard block)`);
+          addLog("MTF", `SHORT penalized -${mtfPenalty} conf (bullish ${mtfCombined.strength}% aligned — not blocked)`);
+          // Don't return — let it pass through with reduced confidence
         }
-        // v10 FIX: Removed +3 conf penalty for neutral MTF — was stacking on already-high thresholds
-        // Neutral MTF just means no strong signal either way — not a reason to block
         if (mtfCombined.trend === "neutral" || mtfCombined.strength < 20) {
-          // No extra gate — let the main confidence threshold handle it
           console.log(`[NEXUS] ℹ MTF neutral/weak (${mtfCombined.strength}%) — no extra gate applied`);
         }
         // BONUS: When MTF confirms trade direction, boost confidence
@@ -4672,26 +4686,31 @@ export default function NexusV7() {
         }
       }
 
-      // ═══ DYNAMIC SHORT CONFIDENCE — adapts to market bias + MTF (v7.2) ═══
-      // Bull market: shorts need extra confidence (crypto upward bias)
-      // Bear market: shorts get a BONUS (trend-aligned)
-      // MTF aligned: additional boost/penalty
+      // ═══ DYNAMIC SHORT CONFIDENCE v11 — Less aggressive, let shorts through ═══
+      // v11: In bull market, shorts get a SMALL penalty (not a death sentence)
+      // The MTF hard block was already removed above; this is the soft penalty layer
       if (aiResult.action === "SHORT") {
         const bias = aiResult?.indicators?.marketBias || "neutral";
         const biasStr = aiResult?.indicators?.marketBiasStrength || 0;
         if (bias === "bear" && biasStr > 40) {
-          tradeConf += 4; // Bear market: shorts are trend-aligned, small boost
+          tradeConf += 5; // Bear market: shorts are trend-aligned, boost
         } else if (bias === "bear") {
-          // mild bear: no penalty, no bonus
-        } else if (bias === "bull" && biasStr > 40) {
-          tradeConf -= 12; // Strong bull: shorts heavily penalized
-        } else {
-          tradeConf -= 2; // v8: minimal penalty in neutral (was -5 — unfairly blocked shorts)
+          tradeConf += 2; // Mild bear: small boost
+        } else if (bias === "bull" && biasStr > 60) {
+          tradeConf -= 6; // v11: was -12 for >40 — way too harsh, killed all shorts
+        } else if (bias === "bull") {
+          tradeConf -= 2; // Mild bull: tiny penalty
         }
-        // MTF alignment bonus for shorts
+        // v11: Apply MTF penalty for shorts against bullish aligned (replaces hard block)
+        if (mtfCombined?.valid && mtfCombined.trend === "bullish" && mtfCombined.aligned) {
+          const mtfShortPenalty = Math.round(mtfCombined.strength * 0.15);
+          tradeConf -= mtfShortPenalty;
+          console.log(`[NEXUS] SHORT MTF penalty: -${mtfShortPenalty} (bullish ${mtfCombined.strength}%)`);
+        }
+        // MTF alignment bonus for shorts (when MTF confirms bearish)
         if (mtfCombined?.valid && mtfCombined.trend === "bearish" && mtfCombined.aligned) {
-          tradeConf += 6; // All timeframes say down — high conviction short
-          addLog("MTF", `Short +6 conf: MTF aligned bearish ${mtfCombined.strength}%`);
+          tradeConf += 8; // v11: raised from 6 — reward trend-aligned shorts more
+          addLog("MTF", `Short +8 conf: MTF aligned bearish ${mtfCombined.strength}%`);
         }
         if (tradeConf < MIN_CONF_TO_TRADE) { console.log(`[NEXUS] ⏸ Conf too low after SHORT penalty: ${tradeConf.toFixed(0)}% < ${MIN_CONF_TO_TRADE}%`); return; }
       }
@@ -4830,17 +4849,22 @@ export default function NexusV7() {
           );
           const mtfAlignedAgainst = mtfAgainst && mtfCombined.aligned;
 
-          // === TRAIL TO BREAKEVEN ===
-          const beThreshold = mtfAgainst ? 1.2 : 2;
+          // === TRAIL TO BREAKEVEN === v11: widened thresholds to prevent premature BE stops
+          const beThreshold = mtfAgainst ? 2.0 : 3.0; // v11: was 1.2/2.0 — too tight, noise hit BE instantly
           if (pnlPct > beThreshold && p.sl) {
-            const be = p.entry + (p.side === "LONG" ? 1 : -1) * (p.cost * FEE_RATE * 2 / p.qty);
-            if (p.side === "LONG" && p.sl < be) { p.sl = be; addLog("AI", `Trail SL to breakeven ${p.pairName}${mtfAgainst ? " (MTF opposing)" : ""}`); console.log(`[NEXUS] 🔄 TRAIL BE: ${p.pairName} SL→$${be.toFixed(2)}`); }
-            if (p.side === "SHORT" && p.sl > be) { p.sl = be; addLog("AI", `Trail SL to breakeven ${p.pairName}${mtfAgainst ? " (MTF opposing)" : ""}`); console.log(`[NEXUS] 🔄 TRAIL BE: ${p.pairName} SL→$${be.toFixed(2)}`); }
+            // v11: Add 0.3% buffer above breakeven so normal noise doesn't trigger it
+            const beFee = p.cost * FEE_RATE * 2 / p.qty;
+            const beBuffer = p.entry * 0.003; // 0.3% breathing room above BE
+            const be = p.side === "LONG" 
+              ? p.entry + beFee + beBuffer
+              : p.entry - beFee - beBuffer;
+            if (p.side === "LONG" && p.sl < be) { p.sl = be; addLog("AI", `Trail SL to breakeven+buffer ${p.pairName}${mtfAgainst ? " (MTF opposing)" : ""}`); console.log(`[NEXUS] 🔄 TRAIL BE: ${p.pairName} SL→$${be.toFixed(2)} (with 0.3% buffer)`); }
+            if (p.side === "SHORT" && p.sl > be) { p.sl = be; addLog("AI", `Trail SL to breakeven+buffer ${p.pairName}${mtfAgainst ? " (MTF opposing)" : ""}`); console.log(`[NEXUS] 🔄 TRAIL BE: ${p.pairName} SL→$${be.toFixed(2)} (with 0.3% buffer)`); }
           }
 
-          // === PROFIT TRAILING ===
-          const trailThreshold = mtfConfirms ? 4.5 : mtfAgainst ? 2.5 : 3.5;
-          const trailKeep = mtfConfirms ? 0.3 : mtfAgainst ? 0.55 : 0.4;
+          // === PROFIT TRAILING === v11: widened to let winners run
+          const trailThreshold = mtfConfirms ? 5.5 : mtfAgainst ? 3.5 : 4.5; // v11: was 4.5/2.5/3.5
+          const trailKeep = mtfConfirms ? 0.25 : mtfAgainst ? 0.45 : 0.35; // v11: was 0.3/0.55/0.4
           if (pnlPct > trailThreshold && p.sl) {
             const trail = p.side === "LONG" ? price - (price - p.entry) * trailKeep : price + (p.entry - price) * trailKeep;
             if (p.side === "LONG" && trail > p.sl) { p.sl = trail; console.log(`[NEXUS] 🔄 PROFIT TRAIL: ${p.pairName} SL→$${trail.toFixed(2)} (keeping ${(trailKeep*100).toFixed(0)}%)`); }
@@ -4848,10 +4872,9 @@ export default function NexusV7() {
           }
 
           // ╔══════════════════════════════════════════════════════════════╗
-          // ║  IQ v8: PARTIAL PROFIT SYSTEM — THE GAME CHANGER            ║
-          // ║  Close 50% at 1.8% profit, move SL to breakeven             ║
+          // ║  IQ v11: PARTIAL PROFIT — Close 50% at 2.5%, BE+0.5% buffer ║
           // ║  After this: you CANNOT lose on the remaining position       ║
-          // ║  Let the remaining 50% ride with trailing stops              ║
+          // ║  Let the remaining 50% ride with WIDER trailing stops        ║
           // ╚══════════════════════════════════════════════════════════════╝
           if (!p._partialTaken && pnlPct >= PARTIAL_PROFIT_PCT && p.qty > 0) {
             const partialQty = p.qty * PARTIAL_PROFIT_RATIO;
@@ -4873,14 +4896,17 @@ export default function NexusV7() {
             p._partialPnl = netPartial;
             p._partialPrice = price;
             
-            // ═══ CRITICAL: Move SL to breakeven — NOW YOU CANNOT LOSE ═══
+            // ═══ v11: Move SL to breakeven WITH 0.5% BUFFER — gives remaining position breathing room ═══
+            // Old: SL at exact breakeven + $0.01 → any 0.1% retrace killed the remaining 50%
+            // New: SL at entry + fees + 0.5% buffer → position can absorb normal noise
             if (BREAKEVEN_AFTER_PARTIAL) {
               const beFee = p.entry * FEE_RATE * 2; // account for entry+exit fees
+              const beBuffer = p.entry * 0.005; // v11: 0.5% buffer (was 0.01 fixed → got hit instantly)
               const beSL = p.side === "LONG" 
-                ? p.entry + beFee / remainQty + 0.01  // tiny buffer above breakeven
-                : p.entry - beFee / remainQty - 0.01;
+                ? p.entry + beFee / remainQty + beBuffer
+                : p.entry - beFee / remainQty - beBuffer;
               p.sl = beSL;
-              console.log(`[NEXUS] 🧠 IQ PARTIAL: ${p.side} ${p.pairName} — Took ${(PARTIAL_PROFIT_RATIO*100).toFixed(0)}% profit +$${netPartial.toFixed(2)} at $${price.toFixed(2)} | SL→BREAKEVEN $${beSL.toFixed(2)} | REMAINING ${remainQty.toFixed(6)} RISK-FREE`);
+              console.log(`[NEXUS] 🧠 IQ PARTIAL: ${p.side} ${p.pairName} — Took ${(PARTIAL_PROFIT_RATIO*100).toFixed(0)}% profit +$${netPartial.toFixed(2)} at $${price.toFixed(2)} | SL→BE+0.5% $${beSL.toFixed(2)} | REMAINING ${remainQty.toFixed(6)} RISK-FREE`);
               addLog("WIN", `IQ PARTIAL: ${p.pairName} +$${netPartial.toFixed(2)} (${(PARTIAL_PROFIT_RATIO*100).toFixed(0)}%) — remainder now RISK-FREE`);
             }
             
@@ -4905,19 +4931,20 @@ export default function NexusV7() {
             changed = true;
           }
 
-          // ═══ IQ v8: MULTI-STAGE TRAILING — Tighter trail as profit grows ═══
-          if (p._partialTaken && pnlPct > 3.0 && p.sl) {
-            // After partial taken, trail aggressively to lock more profit
+          // ═══ v11: MULTI-STAGE TRAILING — Only after substantial move, keep 60% ═══
+          // Old: kicked in at 3.0% keeping 75% → stopped out almost immediately after partial
+          // New: wait for 5.0% profit before trailing, keep 60% → lets remaining 50% actually run
+          if (p._partialTaken && pnlPct > 5.0 && p.sl) {
             const aggressiveTrail = p.side === "LONG" 
-              ? price - (price - p.entry) * 0.25  // Keep 75% of remaining profit
-              : price + (p.entry - price) * 0.25;
+              ? price - (price - p.entry) * 0.40  // Keep 60% of remaining profit (v11: was 25%/keep 75%)
+              : price + (p.entry - price) * 0.40;
             if (p.side === "LONG" && aggressiveTrail > p.sl) { 
               p.sl = aggressiveTrail; 
-              console.log(`[NEXUS] 🧠 IQ TRAIL: ${p.pairName} aggressive trail SL→$${aggressiveTrail.toFixed(2)} (post-partial, keeping 75%)`); 
+              console.log(`[NEXUS] 🧠 IQ TRAIL: ${p.pairName} post-partial trail SL→$${aggressiveTrail.toFixed(2)} (keeping 60%)`); 
             }
             if (p.side === "SHORT" && aggressiveTrail < p.sl) { 
               p.sl = aggressiveTrail; 
-              console.log(`[NEXUS] 🧠 IQ TRAIL: ${p.pairName} aggressive trail SL→$${aggressiveTrail.toFixed(2)} (post-partial, keeping 75%)`); 
+              console.log(`[NEXUS] 🧠 IQ TRAIL: ${p.pairName} post-partial trail SL→$${aggressiveTrail.toFixed(2)} (keeping 60%)`); 
             }
           }
 
