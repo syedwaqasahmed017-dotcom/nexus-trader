@@ -1,16 +1,25 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v11.0 — PERMANENT FIX: 5 ROOT CAUSES ELIMINATED
+// NEXUS v12.0 — 5 ROOT CAUSES FROM v11 ELIMINATED (Mar 30 2026)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// ✦ ROOT FIX 1: Minimum SL distance 1.0% restored (v10 lost it → instant stops)
-// ✦ ROOT FIX 2: SHORT trades enabled — MTF penalizes not hard-blocks
-// ✦ ROOT FIX 3: Partial profit raised 1.8→2.5%, breakeven buffer +0.5%
-// ✦ ROOT FIX 4: Position sizing floor raised — MEDIUM=0.85, LOW=0.65
-// ✦ ROOT FIX 5: AdaptiveTPSL widened — ranging SL 1.2→2.2, all regimes wider
-// ✦ v11: Post-partial trail only at 4.5%, keep 65% (was 3%/75% → too tight)
-// ✦ v11: Deploy timestamp reset — old brain losses wiped clean
-// ✦ v11: Loss streak penalty halved (0.15→0.08 per loss)
+// ✦ ROOT FIX 1: Deploy TS reset to Mar 30 2026 — v11 ran 14 days, brain
+//               accumulated enough post-deploy losses to re-trigger blocks
+// ✦ ROOT FIX 2: Brain Check 10 (session pattern) had NO time expiry window
+//               — all session losses accumulated forever → session blocks grew
+//               infinitely. Fixed: added TWO_WEEKS window to session check.
+// ✦ ROOT FIX 3: FALLBACK_PRICES.BTCUSDT was $98,000 — real price ~$67k.
+//               30% wrong fallback corrupted SL/TP and brain training data
+//               whenever Binance API dropped. Fixed: updated to $67,000.
+// ✦ ROOT FIX 4: Conviction sizing defaulted to LOW (0.65x) whenever LLM
+//               was offline/rate-limited (llmResult.live=false). Over 12 days
+//               this permanently undersized all positions. Fixed: default MEDIUM.
+// ✦ ROOT FIX 5: TWO_WEEKS (14d) filter = v11 deployed Mar 16, by Mar 30
+//               ALL post-deploy losses were in the exact window causing Check 2/3
+//               to trigger. Extended to THREE_WEEKS (21d) so new-version losses
+//               never pile up at the edge of the blocking window.
+// ✦ v11 PRESERVED: SL 1.0% floor, SHORT MTF penalty not block, partial 2.5%,
+//                  breakeven +0.5% buffer, AdaptiveTPSL wide regimes
 // ✦ IQ ENGINE — Partial profit, conviction sizing, multi-stage trailing
 // ✦ FULL PERSISTENCE — Balance, positions, brain survive page refresh
 // ✦ AI AUTO-PILOT — Learns first, trades smart, stop button for user
@@ -2037,11 +2046,11 @@ const MLEngine = {
 
 const FALLBACK_PRICES = {
   // ═══ NOTE: These are FALLBACK ONLY — hasLivePrice flag blocks all trading until real price arrives ═══
-  // Updated Feb 2026 — keep roughly current to minimize damage if sanity checks fail
-  BTCUSDT: { base: 98000, vol: 420 }, ETHUSDT: { base: 2700, vol: 38 },
-  SOLUSDT: { base: 170, vol: 4.5 }, BNBUSDT: { base: 650, vol: 12 },
-  XRPUSDT: { base: 2.60, vol: 0.06 }, DOGEUSDT: { base: 0.25, vol: 0.006 },
-  ADAUSDT: { base: 0.75, vol: 0.018 }, AVAXUSDT: { base: 38.5, vol: 1.4 },
+  // Updated Mar 30 2026 — keep roughly current to minimize damage if sanity checks fail
+  BTCUSDT: { base: 67000, vol: 320 }, ETHUSDT: { base: 1550, vol: 22 },
+  SOLUSDT: { base: 130, vol: 3.5 }, BNBUSDT: { base: 580, vol: 10 },
+  XRPUSDT: { base: 2.10, vol: 0.05 }, DOGEUSDT: { base: 0.17, vol: 0.004 },
+  ADAUSDT: { base: 0.68, vol: 0.015 }, AVAXUSDT: { base: 19.0, vol: 0.8 },
 };
 
 // ═══ COLORS ═══
@@ -2709,39 +2718,39 @@ const Brain = {
       const bfp = this.broadFingerprint(indicators, action, symbol);
       const mfp = this.mediumFingerprint(indicators, action, symbol);
       const rk = this.regimeKey(indicators, action);
+      const THREE_WEEKS = 21 * 864e5; // v12: was 14d — at 14d the deploy-day losses hit the edge of the window and pile up
       const WEEK = 7 * 864e5;
-      const TWO_WEEKS = 14 * 864e5;
       const HOUR = 36e5;
       const now = Date.now();
-      // ═══ v10 DEPLOY TIMESTAMP — Only consider losses AFTER this deploy ═══
+      // ═══ v12 DEPLOY TIMESTAMP — Only consider losses AFTER this deploy ═══
       // Old losses were from broken thresholds/gates — don't let them block new trades
-      const V11_DEPLOY_TS = 1773619200000; // March 16, 2026 00:00 UTC — v11 wipes all pre-fix brain losses
-      const filterTs = (entries, maxAge) => entries.filter(e => e.ts > V11_DEPLOY_TS && now - e.ts < maxAge);
+      const V12_DEPLOY_TS = 1743292800000; // March 30, 2026 00:00 UTC — v12 wipes all pre-fix brain losses
+      const filterTs = (entries, maxAge) => entries.filter(e => e.ts > V12_DEPLOY_TS && now - e.ts < maxAge);
 
       // CHECK 1: Cooldown timer (severity-scaled in recordLoss)
       if (now < this.coolUntil) return { blocked: true, reason: `Cooling down (${Math.ceil((this.coolUntil - now) / 1000)}s)`, severity: "COOL" };
 
-      // CHECK 2: Exact fingerprint — v10: needs 4 losses, only post-deploy
-      const exactLosses = filterTs(this.losses.filter(e => e.fp === fp), TWO_WEEKS);
+      // CHECK 2: Exact fingerprint — v12: needs 4 losses, only post-deploy, 3-week window
+      const exactLosses = filterTs(this.losses.filter(e => e.fp === fp), THREE_WEEKS);
       if (exactLosses.length >= 4) return { blocked: true, reason: `Exact pattern lost ${exactLosses.length}x recently`, severity: "HIGH" };
 
-      // CHECK 3: Medium fingerprint — v10: needs 4 losses, only post-deploy
+      // CHECK 3: Medium fingerprint — v12: needs 4 losses, only post-deploy
       const medLosses = filterTs(this.losses.filter(e => e.mfp === mfp), WEEK);
       const medWins = filterTs(this.wins.filter(e => e.mfp === mfp), WEEK);
       if (medLosses.length >= 4 && medWins.length < medLosses.length * 0.4) {
         return { blocked: true, reason: `Medium pattern ${medWins.length}W/${medLosses.length}L this week`, severity: "HIGH" };
       }
 
-      // CHECK 4: Broad pattern — v10: needs 6 losses, only post-deploy
+      // CHECK 4: Broad pattern — v12: needs 6 losses, only post-deploy
       const broadLosses = filterTs(this.losses.filter(e => e.bfp === bfp), WEEK);
       const broadWins = filterTs(this.wins.filter(e => e.bfp === bfp), WEEK);
       if (broadLosses.length >= 6 && broadWins.length < broadLosses.length * 0.35) {
         return { blocked: true, reason: `Broad pattern ${broadWins.length}W/${broadLosses.length}L this week`, severity: "MED" };
       }
 
-      // CHECK 5: REGIME LEARNING — v10: needs 5 trades min, only post-deploy
-      const regimeLosses = filterTs(this.losses.filter(e => e.rk === rk), TWO_WEEKS);
-      const regimeWins = filterTs(this.wins.filter(e => e.rk === rk), TWO_WEEKS);
+      // CHECK 5: REGIME LEARNING — v12: needs 5 trades min, only post-deploy
+      const regimeLosses = filterTs(this.losses.filter(e => e.rk === rk), THREE_WEEKS);
+      const regimeWins = filterTs(this.wins.filter(e => e.rk === rk), THREE_WEEKS);
       const regimeTotal = regimeLosses.length + regimeWins.length;
       if (regimeTotal >= 5 && regimeLosses.length > regimeWins.length * 2.5) {
         return { blocked: true, reason: `${action} in this regime: ${regimeWins.length}W/${regimeLosses.length}L — learned to avoid`, severity: "HIGH" };
@@ -2766,11 +2775,11 @@ const Brain = {
       const allRecent = filterTs(this.losses, HOUR * 2);
       if (allRecent.length >= 10) return { blocked: true, reason: `${allRecent.length} losses in 2h — emergency brake`, severity: "CRIT" };
 
-      // CHECK 10: Session-specific pattern failure — v10: needs 5 (was 3 — active sessions hit this fast)
+      // CHECK 10: Session-specific pattern failure — v12: needs 5, WITH time window (was missing time expiry → accumulated forever)
       const sessionName = Sessions.getCurrent().primary.name;
       const simKey = fp.split("|").slice(0, 4).join("|");
-      const sessionLosses = this.losses.filter(e => e.ts > V11_DEPLOY_TS && e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
-      const sessionWins = this.wins.filter(e => e.ts > V11_DEPLOY_TS && e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
+      const sessionLosses = this.losses.filter(e => e.ts > V12_DEPLOY_TS && now - e.ts < WEEK && e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
+      const sessionWins = this.wins.filter(e => e.ts > V12_DEPLOY_TS && now - e.ts < WEEK && e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
       if (sessionLosses.length >= 5 && sessionWins.length < sessionLosses.length * 0.35) {
         return { blocked: true, reason: `Pattern fails in ${sessionName} (${sessionWins.length}W/${sessionLosses.length}L)`, severity: "MED" };
       }
@@ -2783,9 +2792,9 @@ const Brain = {
     try {
       const WEEK = 7 * 864e5;
       const now = Date.now();
-      const V11_DEPLOY_TS = 1773619200000; // March 16, 2026 00:00 UTC — v11 wipes all pre-fix brain losses
-      const recentLosses = this.losses.filter(e => e.ts > V11_DEPLOY_TS && e.action === action && now - e.ts < WEEK);
-      const recentWins = this.wins.filter(e => e.ts > V11_DEPLOY_TS && e.action === action && now - e.ts < WEEK);
+      const V12_DEPLOY_TS = 1743292800000; // March 30, 2026 00:00 UTC — v12
+      const recentLosses = this.losses.filter(e => e.ts > V12_DEPLOY_TS && e.action === action && now - e.ts < WEEK);
+      const recentWins = this.wins.filter(e => e.ts > V12_DEPLOY_TS && e.action === action && now - e.ts < WEEK);
       if (recentLosses.length < 5) return null; // v10: was 3
 
       const exitReasons = {};
@@ -2846,7 +2855,7 @@ const Brain = {
       return { rate: 50, total: 0, wins: 0, losses: 0, layer: "none" };
     } catch { return { rate: 50, total: 0, wins: 0, losses: 0, layer: "none" }; }
   },
-  // ═══ v11: CONFIDENCE MODIFIER — Capped at -15 max penalty ═══
+  // ═══ v12: CONFIDENCE MODIFIER — Capped at -15 max penalty ═══
   // Old: penalties went to -30 which combined with MIN_CONF=30 blocked everything
   getConfidenceModifier(indicators, action, symbol) {
     try {
@@ -2855,38 +2864,38 @@ const Brain = {
       let mod = 0;
 
       // Win rate based modifier — v11: capped penalties
-      if (wr.total >= 3) { // v11: need 3 trades, not 2
+      if (wr.total >= 3) { // need 3 trades, not 2
         if (wr.rate > 75) mod += 15;
         else if (wr.rate > 65) mod += 8;
         else if (wr.rate > 55) mod += 3;
-        else if (wr.rate < 20) mod -= 15;   // v11: was -30 → killed everything
-        else if (wr.rate < 30) mod -= 10;   // v11: was -20
-        else if (wr.rate < 40) mod -= 6;    // v11: was -12
-        else if (wr.rate < 48) mod -= 3;    // v11: was -6
+        else if (wr.rate < 20) mod -= 15;
+        else if (wr.rate < 30) mod -= 10;
+        else if (wr.rate < 40) mod -= 6;
+        else if (wr.rate < 48) mod -= 3;
       }
 
-      // ═══ v11: Regime penalty — requires 5+ trades post-deploy ═══
-      const TWO_WEEKS = 14 * 864e5;
-      const now = Date.now();
-      const V11_DEPLOY_TS = 1773619200000;
-      const regimeLosses = this.losses.filter(e => e.ts > V11_DEPLOY_TS && e.rk === rk && now - e.ts < TWO_WEEKS).length;
-      const regimeWins = this.wins.filter(e => e.ts > V11_DEPLOY_TS && e.rk === rk && now - e.ts < TWO_WEEKS).length;
-      const regimeTotal = regimeLosses + regimeWins;
-      if (regimeTotal >= 5) { // v11: was 4
-        const regimeWR = (regimeWins / regimeTotal) * 100;
-        if (regimeWR < 30) mod -= 5;  // v11: was -8
-        else if (regimeWR < 40) mod -= 2;  // v11: was -4
-      }
-
-      // ═══ v11: Exit-reason penalty — only post-deploy, capped ═══
+      // ═══ v12: Regime penalty — requires 5+ trades post-deploy, 3-week window ═══
+      const THREE_WEEKS = 21 * 864e5;
       const WEEK = 7 * 864e5;
-      const timeExitLosses = this.losses.filter(e => e.ts > V11_DEPLOY_TS && e.action === action && (e.exitReason || "").includes("Time Exit") && now - e.ts < WEEK).length;
-      if (timeExitLosses >= 6) mod -= Math.min(8, timeExitLosses * 1.0); // v11: capped at -8
+      const now = Date.now();
+      const V12_DEPLOY_TS = 1743292800000; // March 30, 2026
+      const regimeLosses = this.losses.filter(e => e.ts > V12_DEPLOY_TS && e.rk === rk && now - e.ts < THREE_WEEKS).length;
+      const regimeWins = this.wins.filter(e => e.ts > V12_DEPLOY_TS && e.rk === rk && now - e.ts < THREE_WEEKS).length;
+      const regimeTotal = regimeLosses + regimeWins;
+      if (regimeTotal >= 5) {
+        const regimeWR = (regimeWins / regimeTotal) * 100;
+        if (regimeWR < 30) mod -= 5;
+        else if (regimeWR < 40) mod -= 2;
+      }
 
-      const slLosses = this.losses.filter(e => e.ts > V11_DEPLOY_TS && e.action === action && e.exitReason === "Stop Loss" && now - e.ts < WEEK).length;
-      if (slLosses >= 7) mod -= Math.min(8, slLosses * 0.8);  // v11: capped at -8, needs 7+
+      // ═══ v12: Exit-reason penalty — only post-deploy, capped ═══
+      const timeExitLosses = this.losses.filter(e => e.ts > V12_DEPLOY_TS && e.action === action && (e.exitReason || "").includes("Time Exit") && now - e.ts < WEEK).length;
+      if (timeExitLosses >= 6) mod -= Math.min(8, timeExitLosses * 1.0);
 
-      // ═══ v11 HARD CAP: total modifier can never drop below -15 ═══
+      const slLosses = this.losses.filter(e => e.ts > V12_DEPLOY_TS && e.action === action && e.exitReason === "Stop Loss" && now - e.ts < WEEK).length;
+      if (slLosses >= 7) mod -= Math.min(8, slLosses * 0.8);
+
+      // ═══ v12 HARD CAP: total modifier can never drop below -15 ═══
       return Math.max(-15, mod);
     } catch { return 0; }
   },
@@ -4258,7 +4267,7 @@ export default function NexusV7() {
       console.warn(`[NEXUS] ⚠️ FALLBACK PRICE SET: $${demo.base} — SL/TP BLOCKED until live Binance price confirms (hasLivePrice=false)`);
       setChange24h((Math.random() - 0.4) * 5);
       setReady(true);
-      addLog("AI", "NEXUS v11 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
+      addLog("AI", "NEXUS v12 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
       addLog("AI", `Config: ${MAX_POSITIONS} max positions | ${MIN_STACK_DISTANCE_PCT}% min stack dist | ${MAX_TRADES_PER_SESSION} trades/session | MTF gate +3 | Dedup 15s | Gap 3s`);
       console.log("[NEXUS] 🚀 STARTUP: Balance=$" + fx(saved.balance || INITIAL_BALANCE) + " | Positions:" + (saved.positions?.length || 0) + " | History:" + (saved.history?.length || 0) + " | hasLivePrice=false (waiting for Binance)");
       if (saved.positions?.length > 0) {
@@ -4762,11 +4771,13 @@ export default function NexusV7() {
       // ║  Higher conviction = bigger bet. Lower = smaller.           ║
       // ║  + Win streak bonus + Loss streak penalty + Regime adjust   ║
       // ╚══════════════════════════════════════════════════════════════╝
-      if (CONVICTION_SIZING && llmResult?.live) {
-        const conviction = llmResult.conviction || "LOW";
-        const convMult = CONVICTION_MULT[conviction] || 0.45;
+      if (CONVICTION_SIZING) {
+        // v12 FIX: When LLM is offline/rate-limited (llmResult.live=false), use MEDIUM not LOW
+        // Over 12 days of LLM downtime this permanently undersized all positions (0.65x → should be 0.85x)
+        const conviction = (llmResult?.live && llmResult?.conviction) ? llmResult.conviction : "MEDIUM";
+        const convMult = CONVICTION_MULT[conviction] || CONVICTION_MULT.MEDIUM;
         stackedAmount = Math.max(5, stackedAmount * convMult);
-        console.log(`[NEXUS] IQ SIZE: Conviction=${conviction} -> ${(convMult*100).toFixed(0)}% size ($${stackedAmount.toFixed(2)})`);
+        console.log(`[NEXUS] IQ SIZE: Conviction=${conviction}${llmResult?.live ? "" : " (LLM offline→MEDIUM default)"} -> ${(convMult*100).toFixed(0)}% size ($${stackedAmount.toFixed(2)})`);
       }
       // Win/loss streak adjustment
       if (consecutiveWins >= 2) {
@@ -5181,7 +5192,7 @@ export default function NexusV7() {
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
       <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }}/>
-      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v11 | 140 IQ ENGINE | LOADING</div>
+      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v12 | 140 IQ ENGINE | LOADING</div>
     </div>
   );
 
@@ -5195,7 +5206,7 @@ export default function NexusV7() {
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v11 IQ</div>
+            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v12 IQ</div>
             <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>140 IQ | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
