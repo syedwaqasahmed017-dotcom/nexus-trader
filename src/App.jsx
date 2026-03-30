@@ -2428,6 +2428,8 @@ const ExternalML = {
     DB.remove("external_ml_label_config");
   },
 };
+
+const FALLBACK_PRICES = {
   // ═══ NOTE: These are FALLBACK ONLY — hasLivePrice flag blocks all trading until real price arrives ═══
   // Updated Mar 30 2026 — keep roughly current to minimize damage if sanity checks fail
   BTCUSDT: { base: 67000, vol: 320 }, ETHUSDT: { base: 1550, vol: 22 },
