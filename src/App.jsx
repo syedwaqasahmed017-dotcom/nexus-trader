@@ -4119,6 +4119,14 @@ export default function NexusV7() {
   const [manualSL, setManualSL] = useState("");
   const [manualTP, setManualTP] = useState("");
 
+  // ═══ CHAT WITH AI STATE ═══
+  const [chatMessages, setChatMessages] = useState([
+    { role: "ai", text: "Hey! I'm NEXUS v12. Ask me anything — why I stopped, my current signal, P&L, or tell me to start/stop trading. I'll explain everything in plain English.", time: new Date().toLocaleTimeString() }
+  ]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const chatEndRef = useRef(null);
+
   const [uptime, setUptime] = useState(0);
   const startTimeRef = useRef(Date.now());
 
@@ -5186,6 +5194,217 @@ export default function NexusV7() {
     metric: { background: K.s2, borderRadius: 8, padding: "10px 12px", textAlign: "center" },
   };
 
+  // ═══ CHAT WITH AI — Natural language command interface ═══
+  const sendChat = useCallback(async (inputText) => {
+    const msg = (inputText || chatInput).trim();
+    if (!msg) return;
+    setChatInput("");
+    const userMsg = { role: "user", text: msg, time: new Date().toLocaleTimeString() };
+    setChatMessages(prev => [...prev, userMsg]);
+    setChatLoading(true);
+
+    try {
+      // ─── Handle commands locally (fast, no API needed) ───
+      const lower = msg.toLowerCase();
+
+      // START TRADING
+      if (lower.includes("start") || lower.includes("turn on") || lower.includes("enable") || lower.includes("go")) {
+        if (!aiActive) {
+          setAiActive(true);
+          setChatMessages(prev => [...prev, { role: "ai", text: "✅ Auto-trading ENABLED. I'm now scanning for signals every tick. I'll enter a trade when I see a high-confidence setup.", time: new Date().toLocaleTimeString() }]);
+        } else {
+          setChatMessages(prev => [...prev, { role: "ai", text: "ℹ️ Auto-trading is already ON. I'm actively scanning for signals.", time: new Date().toLocaleTimeString() }]);
+        }
+        setChatLoading(false); return;
+      }
+
+      // STOP TRADING
+      if (lower.includes("stop") || lower.includes("turn off") || lower.includes("disable") || lower.includes("pause")) {
+        if (aiActive) {
+          setAiActive(false);
+          setChatMessages(prev => [...prev, { role: "ai", text: "⏸️ Auto-trading PAUSED. I'll keep monitoring but won't enter any new trades until you tell me to start again.", time: new Date().toLocaleTimeString() }]);
+        } else {
+          setChatMessages(prev => [...prev, { role: "ai", text: "ℹ️ Auto-trading is already OFF.", time: new Date().toLocaleTimeString() }]);
+        }
+        setChatLoading(false); return;
+      }
+
+      // STATUS CHECK
+      if (lower.includes("status") || lower.includes("what are you doing") || lower.includes("are you trading") || lower.includes("working")) {
+        const signal = aiResult?.action || "WAIT";
+        const conf = aiResult?.confidence || 0;
+        const reason = aiResult?.reasons?.[0] || "scanning";
+        const cooldownLeft = Brain.coolUntil > Date.now() ? Math.ceil((Brain.coolUntil - Date.now()) / 1000) : 0;
+        let statusMsg = aiActive ? "🟢 Auto-trading is ON.\n" : "🔴 Auto-trading is OFF.\n";
+        statusMsg += `Current signal: ${signal} (${Number(conf).toFixed(0)}% confidence)\n`;
+        statusMsg += `Top reason: ${reason}\n`;
+        statusMsg += `Open positions: ${positions.length}/${MAX_POSITIONS}\n`;
+        statusMsg += `Balance: $${fx(balance)}\n`;
+        if (cooldownLeft > 0) statusMsg += `⏳ Brain cooldown: ${cooldownLeft}s remaining (after a loss)\n`;
+        if (!isLive) statusMsg += `⚠️ Not connected to Binance — running on demo data\n`;
+        if (!hasLivePrice) statusMsg += `⚠️ No live price confirmed yet\n`;
+        setChatMessages(prev => [...prev, { role: "ai", text: statusMsg.trim(), time: new Date().toLocaleTimeString() }]);
+        setChatLoading(false); return;
+      }
+
+      // WHY NOT TRADING / WHY STOPPED
+      if (lower.includes("why") && (lower.includes("stop") || lower.includes("not trad") || lower.includes("no trade") || lower.includes("blocked") || lower.includes("waiting"))) {
+        const signal = aiResult?.action || "WAIT";
+        const reasons = aiResult?.reasons || [];
+        const cooldownLeft = Brain.coolUntil > Date.now() ? Math.ceil((Brain.coolUntil - Date.now()) / 1000) : 0;
+        let reply = "";
+        if (!aiActive) { reply = "❌ Auto-trading is turned OFF. Say 'start trading' to enable it."; }
+        else if (!isLive) { reply = "⚠️ Not connected to Binance live feed. I'm in demo mode — I don't trade on fake data for safety."; }
+        else if (!hasLivePrice) { reply = "⚠️ Waiting for first live price confirmation from Binance before I'm allowed to trade."; }
+        else if (cooldownLeft > 0) { reply = `🧊 Brain cooldown active — ${cooldownLeft}s remaining. After a loss I pause briefly to avoid revenge trading.`; }
+        else if (signal === "WAIT") {
+          reply = `📊 Signal says WAIT. Top reasons:\n${reasons.slice(0,5).map((r,i) => `${i+1}. ${r}`).join("\n")}`;
+        } else if (signal === "PAUSE") {
+          reply = `⛔ Session paused — daily loss limit reached. I stop trading to protect your capital and resume next session.`;
+        } else {
+          reply = `I'm actually seeing a ${signal} signal right now! If I'm not trading, check: positions=${positions.length}/${MAX_POSITIONS}, conf=${Number(aiResult?.confidence||0).toFixed(0)}% vs min=${MIN_CONF_TO_TRADE}%`;
+        }
+        setChatMessages(prev => [...prev, { role: "ai", text: reply, time: new Date().toLocaleTimeString() }]);
+        setChatLoading(false); return;
+      }
+
+      // CURRENT SIGNAL
+      if (lower.includes("signal") || lower.includes("what do you see") || lower.includes("trade now") || lower.includes("analysis")) {
+        const signal = aiResult?.action || "WAIT";
+        const conf = aiResult?.confidence || 0;
+        const bull = aiResult?.bullScore || "50";
+        const bear = aiResult?.bearScore || "50";
+        const reasons = (aiResult?.reasons || []).slice(0, 6);
+        const bias = aiResult?.indicators?.marketBias || "neutral";
+        const regime = aiResult?.analysis?.regime || "unknown";
+        const mtfTrend = aiResult?.analysis?.mtfTrend || "loading";
+        let reply = `📡 Current Signal: ${signal} | Confidence: ${Number(conf).toFixed(0)}%\n`;
+        reply += `Bull: ${bull}% | Bear: ${bear}%\n`;
+        reply += `Market bias: ${bias} | Regime: ${regime} | MTF: ${mtfTrend}\n`;
+        reply += `Reasons:\n${reasons.map((r,i) => `${i+1}. ${r}`).join("\n")}`;
+        setChatMessages(prev => [...prev, { role: "ai", text: reply, time: new Date().toLocaleTimeString() }]);
+        setChatLoading(false); return;
+      }
+
+      // P&L / PERFORMANCE
+      if (lower.includes("pnl") || lower.includes("profit") || lower.includes("performance") || lower.includes("balance") || lower.includes("how much") || lower.includes("money")) {
+        const totalPnl = balance - INITIAL_BALANCE;
+        const pnlPct = (totalPnl / INITIAL_BALANCE) * 100;
+        const wins = history.filter(h => h.pnl > 0).length;
+        const losses = history.filter(h => h.pnl <= 0).length;
+        const wr = wins + losses > 0 ? (wins / (wins + losses) * 100) : 0;
+        let reply = `💰 Balance: $${fx(balance)} (started at $${INITIAL_BALANCE})\n`;
+        reply += `Total P&L: ${totalPnl >= 0 ? "+" : ""}$${fx(totalPnl)} (${pnlPct >= 0 ? "+" : ""}${fx(pnlPct)}%)\n`;
+        reply += `Session P&L: ${sessionPnl >= 0 ? "+" : ""}$${fx(sessionPnl)}\n`;
+        reply += `Trade history: ${wins}W / ${losses}L = ${fx(wr, 0)}% win rate\n`;
+        reply += `Open positions: ${positions.length}`;
+        setChatMessages(prev => [...prev, { role: "ai", text: reply, time: new Date().toLocaleTimeString() }]);
+        setChatLoading(false); return;
+      }
+
+      // BRAIN STATUS
+      if (lower.includes("brain") || lower.includes("learning") || lower.includes("pattern") || lower.includes("blocked")) {
+        const bs = Brain.getStats();
+        const cooldownLeft = Brain.coolUntil > Date.now() ? Math.ceil((Brain.coolUntil - Date.now()) / 1000) : 0;
+        let reply = `🧠 Brain Status:\n`;
+        reply += `Patterns learned: ${bs.brainSize} (${bs.totalWins}W / ${bs.totalLosses}L)\n`;
+        reply += `This week: ${bs.weekLosses} losses recorded\n`;
+        reply += cooldownLeft > 0 ? `⏳ Cooldown: ${cooldownLeft}s\n` : `✅ No cooldown active\n`;
+        if (bs.topBlocked.length > 0) reply += `Most blocked pattern: ${bs.topBlocked[0][0].split("|").slice(0,3).join("|")} (${bs.topBlocked[0][1]}x)\n`;
+        setChatMessages(prev => [...prev, { role: "ai", text: reply.trim(), time: new Date().toLocaleTimeString() }]);
+        setChatLoading(false); return;
+      }
+
+      // RESET BRAIN
+      if ((lower.includes("reset") || lower.includes("clear") || lower.includes("wipe")) && lower.includes("brain")) {
+        Brain.reset();
+        setBrainStats(Brain.getStats());
+        setChatMessages(prev => [...prev, { role: "ai", text: "🗑️ Brain reset. All learned patterns cleared. I'll start fresh from today's trades.", time: new Date().toLocaleTimeString() }]);
+        setChatLoading(false); return;
+      }
+
+      // POSITIONS
+      if (lower.includes("position") || lower.includes("open trade") || lower.includes("holding")) {
+        if (positions.length === 0) {
+          setChatMessages(prev => [...prev, { role: "ai", text: "📭 No open positions right now. I'm scanning for the next setup.", time: new Date().toLocaleTimeString() }]);
+        } else {
+          let reply = `📌 Open Positions (${positions.length}):\n`;
+          positions.forEach(p => {
+            const pnl = p.side === "LONG" ? (price - p.entry) * p.qty : (p.entry - price) * p.qty;
+            const pnlPct = (pnl / p.cost) * 100;
+            reply += `• ${p.side} ${p.pairName} @ $${fx(p.entry)} | Now: $${fx(price)} | P&L: ${pnlPct >= 0 ? "+" : ""}${fx(pnlPct)}% ($${fx(pnl)})\n`;
+          });
+          setChatMessages(prev => [...prev, { role: "ai", text: reply.trim(), time: new Date().toLocaleTimeString() }]);
+        }
+        setChatLoading(false); return;
+      }
+
+      // HELP
+      if (lower.includes("help") || lower.includes("what can") || lower.includes("commands")) {
+        const reply = `🤖 Things you can ask me:\n• "start trading" / "stop trading"\n• "why did you stop?" / "why aren't you trading?"\n• "what's your current signal?"\n• "show my P&L" / "how much have I made?"\n• "brain status" / "reset brain"\n• "show open positions"\n• "status" — full health check\n• Or just ask anything — I'll use the AI to answer!`;
+        setChatMessages(prev => [...prev, { role: "ai", text: reply, time: new Date().toLocaleTimeString() }]);
+        setChatLoading(false); return;
+      }
+
+      // ─── Fallback: send to LLM for open-ended questions ───
+      if (groqKey || geminiKey) {
+        const contextSummary = `You are NEXUS v12, an AI crypto trading bot. Current state:
+- Auto-trading: ${aiActive ? "ON" : "OFF"}
+- Signal: ${aiResult?.action || "WAIT"} (${Number(aiResult?.confidence||0).toFixed(0)}% confidence)
+- Balance: $${fx(balance)} (started $${INITIAL_BALANCE}, P&L: ${balance >= INITIAL_BALANCE ? "+" : ""}$${fx(balance - INITIAL_BALANCE)})
+- Open positions: ${positions.length}/${MAX_POSITIONS}
+- BTC price: $${fx(price, 0)}
+- Brain patterns: ${Brain.wins.length + Brain.losses.length} (${Brain.wins.length}W/${Brain.losses.length}L)
+- Brain cooldown: ${Brain.coolUntil > Date.now() ? Math.ceil((Brain.coolUntil - Date.now()) / 1000) + "s remaining" : "none"}
+- Market regime: ${aiResult?.analysis?.regime || "unknown"}
+- MTF trend: ${aiResult?.analysis?.mtfTrend || "unknown"}
+- Top signal reason: ${aiResult?.reasons?.[0] || "scanning"}
+- Connected to Binance: ${isLive ? "YES" : "NO"}
+The user is asking: "${msg}"
+Answer in 2-4 sentences. Be direct, specific, and helpful. Use the exact numbers from the state above.`;
+
+        let responseText = "";
+        // Try Groq first
+        if (groqKey) {
+          try {
+            const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "Authorization": `Bearer ${groqKey}` },
+              body: JSON.stringify({ model: "llama-3.1-8b-instant", messages: [{ role: "user", content: contextSummary }], max_tokens: 200, temperature: 0.5 }),
+              signal: AbortSignal.timeout(10000),
+            });
+            if (res.ok) { const d = await res.json(); responseText = d?.choices?.[0]?.message?.content || ""; }
+          } catch {}
+        }
+        // Fallback to Gemini
+        if (!responseText && geminiKey) {
+          try {
+            const model = "gemini-2.0-flash-lite";
+            const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ contents: [{ parts: [{ text: contextSummary }] }], generationConfig: { temperature: 0.5, maxOutputTokens: 200 } }),
+              signal: AbortSignal.timeout(10000),
+            });
+            if (res.ok) { const d = await res.json(); responseText = d?.candidates?.[0]?.content?.parts?.[0]?.text || ""; }
+          } catch {}
+        }
+        if (responseText) {
+          setChatMessages(prev => [...prev, { role: "ai", text: responseText.trim(), time: new Date().toLocaleTimeString() }]);
+          setChatLoading(false); return;
+        }
+      }
+
+      // Final fallback
+      setChatMessages(prev => [...prev, { role: "ai", text: `I'm not sure how to answer that. Try asking: "status", "why stopped?", "current signal", "show P&L", or "help" for all commands.`, time: new Date().toLocaleTimeString() }]);
+    } catch(e) {
+      setChatMessages(prev => [...prev, { role: "ai", text: "Sorry, something went wrong. Try again.", time: new Date().toLocaleTimeString() }]);
+    } finally {
+      setChatLoading(false);
+      setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
+    }
+  }, [chatInput, aiActive, aiResult, balance, positions, history, sessionPnl, isLive, hasLivePrice, price, groqKey, geminiKey]);
+
   // ═══ LOADING SCREEN ═══
   if (!ready) return (
     <div style={{ background: K.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 14, fontFamily: "'SF Mono',monospace" }}>
@@ -5271,7 +5490,7 @@ export default function NexusV7() {
         {[
           ["chart", "Chart"], ["ai", "AI"], ["news", "News"], ["trade", "Trade"],
           ["pos", `Pos (${positions.length})`], ["hist", "History"], ["stats", "Stats"],
-          ["brain", "Brain"], ["journal", "Journal"], ["ml", "ML"], ["sessions", "Sessions"], ["settings", "Settings"], ["log", "Log"],
+          ["brain", "Brain"], ["journal", "Journal"], ["ml", "ML"], ["sessions", "Sessions"], ["settings", "Settings"], ["log", "Log"], ["chat", "💬 Chat"],
         ].map(([id, label]) => (
           <button key={id} onClick={() => setTab(id)} style={{ padding: "7px 10px", borderRadius: 6, background: tab === id ? K.warn + "10" : "transparent", border: `1px solid ${tab === id ? K.warn + "30" : "transparent"}`, color: tab === id ? K.gold : K.txM, fontSize: 9, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>{label}</button>
         ))}
@@ -6147,6 +6366,87 @@ CREATE POLICY "Allow all operations" ON nexus_data
                 <span style={{ color: K.txD }}>{l.msg}</span>
               </div>
             ))}
+          </div>
+        </div>}
+
+        {/* CHAT WITH AI */}
+        {tab === "chat" && <div style={S.card}>
+          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v12</div>
+          <div style={{ fontSize: 9, color: K.txD, marginBottom: 14 }}>Ask why it stopped, give commands, or ask anything about the market.</div>
+
+          {/* Quick command buttons */}
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
+            {[
+              ["▶ Start Trading", "start trading"],
+              ["⏸ Stop Trading", "stop trading"],
+              ["❓ Why stopped?", "why aren't you trading?"],
+              ["📡 Signal", "what's your current signal?"],
+              ["💰 P&L", "show my P&L"],
+              ["🧠 Brain", "brain status"],
+              ["📌 Positions", "show open positions"],
+              ["🆘 Help", "help"],
+            ].map(([label, cmd]) => (
+              <button key={cmd} onClick={() => sendChat(cmd)} style={{ padding: "5px 10px", borderRadius: 8, background: K.s3, border: `1px solid ${K.bd}`, color: K.txD, fontSize: 9, cursor: "pointer", fontFamily: "inherit", transition: "all .15s" }}
+                onMouseEnter={e => { e.target.style.borderColor = K.warn + "60"; e.target.style.color = K.gold; }}
+                onMouseLeave={e => { e.target.style.borderColor = K.bd; e.target.style.color = K.txD; }}>
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {/* Chat messages */}
+          <div style={{ height: 420, overflowY: "auto", background: K.bg, borderRadius: 10, border: `1px solid ${K.bd}`, padding: 14, marginBottom: 12, display: "flex", flexDirection: "column", gap: 10 }}>
+            {chatMessages.map((m, i) => (
+              <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: m.role === "user" ? "flex-end" : "flex-start" }}>
+                <div style={{
+                  maxWidth: "82%", padding: "10px 14px", borderRadius: m.role === "user" ? "14px 14px 4px 14px" : "14px 14px 14px 4px",
+                  background: m.role === "user" ? K.warn + "18" : K.s2,
+                  border: `1px solid ${m.role === "user" ? K.warn + "30" : K.bd}`,
+                  color: m.role === "user" ? K.gold : K.tx,
+                  fontSize: 11, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word",
+                }}>
+                  {m.role === "ai" && <span style={{ fontSize: 8, color: K.warn, fontWeight: 800, display: "block", marginBottom: 4, letterSpacing: 1 }}>NEXUS AI</span>}
+                  {m.text}
+                </div>
+                <div style={{ fontSize: 7, color: K.txM, marginTop: 3, paddingLeft: 4, paddingRight: 4 }}>{m.time}</div>
+              </div>
+            ))}
+            {chatLoading && (
+              <div style={{ display: "flex", alignItems: "flex-start" }}>
+                <div style={{ padding: "10px 14px", borderRadius: "14px 14px 14px 4px", background: K.s2, border: `1px solid ${K.bd}` }}>
+                  <span style={{ fontSize: 8, color: K.warn, fontWeight: 800, display: "block", marginBottom: 4, letterSpacing: 1 }}>NEXUS AI</span>
+                  <span style={{ color: K.txD, fontSize: 11 }}>
+                    <span style={{ animation: "pulse 1s infinite" }}>●</span>
+                    <span style={{ animation: "pulse 1s .2s infinite" }}> ●</span>
+                    <span style={{ animation: "pulse 1s .4s infinite" }}> ●</span>
+                  </span>
+                </div>
+              </div>
+            )}
+            <div ref={chatEndRef} />
+          </div>
+
+          {/* Input */}
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              value={chatInput}
+              onChange={e => setChatInput(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); } }}
+              placeholder="Ask me anything... (Enter to send)"
+              disabled={chatLoading}
+              style={{ flex: 1, padding: "10px 14px", borderRadius: 10, background: K.s2, border: `1px solid ${K.bd}`, color: K.tx, fontSize: 11, fontFamily: "inherit", outline: "none", transition: "border .2s" }}
+              onFocus={e => e.target.style.borderColor = K.warn + "60"}
+              onBlur={e => e.target.style.borderColor = K.bd}
+            />
+            <button
+              onClick={() => sendChat()}
+              disabled={chatLoading || !chatInput.trim()}
+              style={{ padding: "10px 20px", borderRadius: 10, background: chatInput.trim() ? K.warn + "20" : K.s3, border: `1px solid ${chatInput.trim() ? K.warn + "40" : K.bd}`, color: chatInput.trim() ? K.gold : K.txD, fontSize: 10, fontWeight: 700, cursor: chatInput.trim() ? "pointer" : "not-allowed", fontFamily: "inherit", transition: "all .2s" }}>
+              SEND
+            </button>
+          </div>
+          <div style={{ fontSize: 8, color: K.txM, marginTop: 8, textAlign: "center" }}>
+            {(groqKey || geminiKey) ? "✓ LLM connected — I can answer open-ended questions too" : "⚠ Add a Groq/Gemini key in Settings for full AI chat capability"}
           </div>
         </div>}
 
