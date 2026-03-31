@@ -1,7 +1,19 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v12.0 — 5 ROOT CAUSES FROM v11 ELIMINATED (Mar 30 2026)
+// NEXUS v13.0 — PRO UPGRADE (Mar 31 2026)
+// ✦ PRO FIX 1: Confluence bonus system — 3+ aligned signals get multiplicative boost
+// ✦ PRO FIX 2: Kelly Criterion cap — sizes position based on actual edge (half-Kelly)
+// ✦ PRO FIX 3: Confidence-scaled sizing — high conf = bigger bet, proportionally
+// ✦ PRO FIX 4: Wider TP multipliers — trending 7.5x (was 6.0), squeeze 9x (was 7.0)
+// ✦ PRO FIX 5: Tighter profit trail on MTF-confirmed trades — keep 85% vs 75%
+// ✦ PRO FIX 6: LLM signal interval — faster on MACD cross / strong signals (20-45s vs 45-180s)
+// ✦ PRO FIX 7: LLM change detection — 0.2% price trigger (was 0.3%), 10pt conf (was 15)
+// ✦ PRO FIX 8: Richer LLM signal prompt — full market context, elite trader framing
+// ✦ PRO FIX 9: LLM token limit 250 (was 150), temp 0.25 (was 0.3) for sharper decisions
+// ✦ PRO FIX 10: Chat AI — 70b model, 400 tokens, full account context, pro analyst persona
+// ✦ PRO FIX 11: Chat keyword traps fixed — "gonna/going" no longer triggers start trading
+// ✦ PRO FIX 12: "How much will you make?" now routes to LLM for real predictive answer
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // ✦ ROOT FIX 1: Deploy TS reset to Mar 30 2026 — v11 ran 14 days, brain
 //               accumulated enough post-deploy losses to re-trigger blocks
@@ -1129,18 +1141,18 @@ const AdaptiveTPSL = {
       let slMult = 2.2;
       let tpMult = 5.0;
 
-      // Adaptive based on regime — v11: SL must be wider than normal candle noise
+      // Adaptive based on regime — v13: wider TPs to let real winners run
       if (regime === "trending") {
-        tpMult = 6.0;  // Trending: let winners run far
+        tpMult = 7.5;  // v13: was 6.0 — trending moves are large, don't leave money on table
         slMult = 2.5;  // Wide SL — trending means bigger swings
       } else if (regime === "volatile") {
-        tpMult = 5.5;  // v11: raised to maintain R:R with wider SL
+        tpMult = 6.0;  // v13: was 5.5 — volatility creates big moves, capture them
         slMult = 3.0;  // Very wide SL for volatility
       } else if (regime === "ranging") {
         tpMult = 4.5;  // v11: raised from 3.0 — needs to clear fees + wider SL
         slMult = 2.2;  // v11: was 1.2 — THE #1 CAUSE of all stop losses. 1.2x ATR = 0.36% = noise
       } else if (regime === "squeeze") {
-        tpMult = 7.0;  // Breakout potential: wide TP
+        tpMult = 9.0;  // v13: was 7.0 — breakout from squeeze = large move, aim bigger
         slMult = 2.0;  // Moderate SL
       }
 
@@ -1221,29 +1233,37 @@ const LLMEngine = {
   // Adaptive interval based on market state
   getNextInterval(aiResult) {
     const regime = aiResult?.analysis?.regime || "ranging";
-    if (regime === "volatile" || regime === "breakout") return 45000;
-    if (aiResult?.action !== "WAIT") return 60000;
-    if (regime === "trending") return 90000;
-    return 180000; // Ranging/idle — save calls
+    const conf = aiResult?.confidence || 0;
+    const action = aiResult?.action || "WAIT";
+    const macdCross = aiResult?.indicators?.macdCross || "none";
+    // High urgency: active signal with high confidence or MACD cross
+    if (macdCross === "bullCross" || macdCross === "bearCross") return 20000; // MACD cross = immediate recheck
+    if (action !== "WAIT" && conf >= 55) return 25000; // Strong signal — stay sharp
+    if (regime === "volatile" || regime === "squeeze") return 35000; // Volatile = frequent updates
+    if (action !== "WAIT" && conf >= MIN_CONF_TO_TRADE) return 45000;
+    if (regime === "trending") return 75000;
+    return 150000; // Ranging/idle — save calls
   },
 
   // Smart change detection — THE KEY OPTIMIZATION (60-80% call reduction)
   _hasChanged(aiResult, price, fgData, macroData) {
     const s = this._lastSnapshot;
     if (!s) return true; // First call always runs
-    if (Math.abs(price - s.price) / s.price > 0.003) return true; // >0.3% price move
+    if (Math.abs(price - s.price) / s.price > 0.002) return true; // >0.2% price move (was 0.3%)
     if (aiResult?.action !== s.action) return true; // Signal flipped
-    if (Math.abs((aiResult?.confidence || 0) - s.confidence) > 15) return true; // Big confidence shift
+    if (Math.abs((aiResult?.confidence || 0) - s.confidence) > 10) return true; // Confidence shift > 10 (was 15)
     if (aiResult?.analysis?.regime !== s.regime) return true; // Regime changed
-    if (Math.abs((fgData?.value || 0) - s.fg) > 10) return true; // Fear & Greed shifted
+    if (Math.abs((fgData?.value || 0) - s.fg) > 8) return true; // F&G shifted (was 10)
     if (macroData?.regime !== s.macroRegime) return true; // Macro changed
     const rsi = aiResult?.indicators?.rsi || 50;
     if ((rsi > 70 && s.rsi <= 70) || (rsi < 30 && s.rsi >= 30) || (rsi <= 70 && s.rsi > 70) || (rsi >= 30 && s.rsi < 30)) return true; // RSI crossed key levels
+    const macdCross = aiResult?.indicators?.macdCross || "none";
+    if (macdCross !== "none" && macdCross !== s.macdCross) return true; // MACD just crossed
     return false; // Nothing meaningful changed — serve cache
   },
 
   _saveSnapshot(aiResult, price, fgData, macroData) {
-    this._lastSnapshot = { price, action: aiResult?.action, confidence: aiResult?.confidence || 0, regime: aiResult?.analysis?.regime, fg: fgData?.value || 0, macroRegime: macroData?.regime, rsi: aiResult?.indicators?.rsi || 50, time: Date.now() };
+    this._lastSnapshot = { price, action: aiResult?.action, confidence: aiResult?.confidence || 0, regime: aiResult?.analysis?.regime, fg: fgData?.value || 0, macroRegime: macroData?.regime, rsi: aiResult?.indicators?.rsi || 50, macdCross: aiResult?.indicators?.macdCross || "none", time: Date.now() };
   },
 
   buildPrompt(aiResult, candles, currentPrice, symbol, fgData, redditData, macroData, brainStats, balance, history, mtfData) {
@@ -1257,17 +1277,37 @@ const LLMEngine = {
       const mtf = mtfData && mtfData.combined && mtfData.combined.valid ? mtfData.combined : null;
       const mtfStr = mtf ? `MTF:${mtf.trend} ${mtf.strength}% ${mtf.aligned?"ALIGNED":""} (${(mtfData.combined.details||[]).map(d=>`${d.tf}:${d.dir}`).join(" ")})` : "MTF:loading";
       const fundSig = FundingRateEngine.getSignal(symbol);
-      const fundStr = fundSig.live ? `Fund:${fundSig.crowded} ${(fundSig.rate*100).toFixed(3)}%` : "Fund:?";
+      const fundStr = fundSig.live ? `Fund:${fundSig.crowded} rate=${( fundSig.rate*100).toFixed(3)}%` : "Fund:unavailable";
       const obData = OrderBookEngine._cache[symbol];
-      const obStr = obData?.live ? `Book:${obData.pressure} ${(obData.imbalance*100).toFixed(0)}%` : "Book:?";
-      return `BTC trading analyst. JSON only.
+      const obStr = obData?.live ? `OrderBook:${obData.pressure} imbalance=${(obData.imbalance*100).toFixed(0)}%` : "OrderBook:unavailable";
+      const allWins = (history||[]).filter(h=>h.net>0).length;
+      const allLoss = (history||[]).filter(h=>h.net<=0).length;
+      const overallWR = allWins+allLoss > 0 ? ((allWins/(allWins+allLoss))*100).toFixed(0) : "?";
+      const regime = aiResult?.analysis?.regime || "unknown";
+      const rsi = ind.rsi?.toFixed(1) || "?";
+      const macd = ind.macd?.toFixed(2) || "?";
+      const bbPos = ind.bbPos?.toFixed(2) || "?";
+      const volR = ind.volRatio?.toFixed(2) || "?";
+      const atrPct = ind.atrPct?.toFixed(2) || "?";
+      const ema9vs21 = currentPrice > (ind.ema9||0) && (ind.ema9||0) > (ind.ema21||0) ? "BULL_STACK" : currentPrice < (ind.ema9||0) && (ind.ema9||0) < (ind.ema21||0) ? "BEAR_STACK" : "MIXED";
+      const candlePattern = aiResult?.analysis?.candlePattern || "none";
+      const signal = aiResult?.action || "WAIT";
+      const conf = aiResult?.confidence?.toFixed(0) || 0;
+      const reasons = (aiResult?.reasons||[]).slice(0,4).join(" | ");
 
-${symbol} $${currentPrice.toFixed(0)} RSI:${ind.rsi?.toFixed(0)||"?"} MACD:${ind.macd?.toFixed(1)||"?"} EMA9v21:${currentPrice>(ind.ema9||0)?"above":"below"} BB:${ind.bbPos?.toFixed(1)||"?"} Vol:${ind.volRatio?.toFixed(1)||"?"}x ${aiResult?.analysis?.regime||"?"}
-Signal:${aiResult?.action||"WAIT"} ${aiResult?.confidence?.toFixed(0)||0}% | F&G:${fg.value||"?"} ${fg.label||""} | Macro:${macro.regime||"?"} | Bias:${ind.marketBias||"neutral"} | ${mtfStr} | ${fundStr} | ${obStr} | Bal:$${balance?.toFixed(0)||100} ${recentWins}W/${recentLosses}L
-${brainStats?.brainSize > 0 ? `Brain:${brainStats.brainSize} WR:${brainStats.totalWins+brainStats.totalLosses>0?((brainStats.totalWins/(brainStats.totalWins+brainStats.totalLosses))*100).toFixed(0):"0"}%` : ""}
-Fee:0.4% RT. Trade ONLY if move>0.6%. Extreme funding = contrarian signal (overcrowded side gets liquidated). Book imbalance >20% = directional pressure. In bear markets, prefer shorts. When MTF ALIGNED, trade WITH trend.
+      return `You are an elite BTC futures trader with 10 years experience. Analyze this setup and respond ONLY with valid JSON.
 
-{"action":"LONG|SHORT|WAIT","confidence":0-100,"reasoning":"1 sentence","risks":"brief","conviction":"HIGH|MEDIUM|LOW","override":false,"adjustConfidence":0}`;
+MARKET: ${symbol} @ $${currentPrice.toFixed(0)} | Regime: ${regime} | ATR: ${atrPct}%
+TECHNICALS: RSI=${rsi} MACD=${macd} EMA=${ema9vs21} BB=${bbPos} Vol=${volR}x
+CANDLE: ${candlePattern} | ${mtfStr}
+SENTIMENT: F&G=${fg.value||"?"}(${fg.label||"?"}) | Reddit=${redditData?.label||"?"} | Macro=${macro.regime||"?"}
+ORDERFLOW: ${fundStr} | ${obStr}
+BOT: Signal=${signal}@${conf}% | Recent=${recentWins}W/${recentLosses}L | AllTime=${overallWR}%WR | Bal=$${balance?.toFixed(0)||100}
+REASONS: ${reasons}
+
+Rules: Fee=0.4%RT. Min move 0.6% to profit. Extreme funding=contrarian(longs get liquidated). Book imbal>20%=directional. MTF ALIGNED=trade with trend. RSI>75 in ranging=short opportunity. RSI<25=long opportunity. MACD cross=strong signal. Volume spike(>2x) confirms breakout.
+
+{"action":"LONG|SHORT|WAIT","confidence":0-100,"reasoning":"specific 1-sentence analysis citing key indicators","risks":"main risk","conviction":"HIGH|MEDIUM|LOW","override":false,"adjustConfidence":-20_to_20}`;
     } catch { return null; }
   },
 
@@ -1278,7 +1318,7 @@ Fee:0.4% RT. Trade ONLY if move>0.6%. Extreme funding = contrarian signal (overc
     const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
-      body: JSON.stringify({ model, messages: [{ role: "system", content: "You are a Bitcoin trading analyst. Respond ONLY with valid JSON, no markdown." }, { role: "user", content: prompt }], temperature: 0.3, max_tokens: 150, response_format: { type: "json_object" } }),
+      body: JSON.stringify({ model, messages: [{ role: "system", content: "You are an elite Bitcoin futures trader. Analyze setups with precision. Respond ONLY with valid JSON, no markdown, no explanation outside JSON." }, { role: "user", content: prompt }], temperature: 0.25, max_tokens: 250, response_format: { type: "json_object" } }),
     });
     if (!res.ok) {
       const errBody = await res.text().catch(() => "");
@@ -1295,7 +1335,7 @@ Fee:0.4% RT. Trade ONLY if move>0.6%. Extreme funding = contrarian signal (overc
     const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.3, maxOutputTokens: 150 } }),
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.25, maxOutputTokens: 250 } }),
     });
     if (!res.ok) throw { code: res.status, provider: "gemini" };
     const data = await res.json();
@@ -4261,6 +4301,39 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
 
     if (fakeAlert.isSuspicious) { bull = Math.round(bull * 0.6); bear = Math.round(bear * 0.6); reasons.push(`Manipulation detected (${fakeAlert.score}/100)`); }
 
+    // ═══ PRO: CONFLUENCE BONUS — Multiple strong signals aligning = real edge ═══
+    // Count how many high-conviction factors are firing in the dominant direction
+    const dominantBull = bull > bear;
+    let confluenceCount = 0;
+    if (dominantBull) {
+      if (curRSI < 32) confluenceCount++;
+      if (macdCross === "bullCross" || (lastHist > 0 && lastHist > prevHist * 1.3)) confluenceCount++;
+      if (bbZone === "lower") confluenceCount++;
+      if (volRatio > 1.8 && closes[L-1] > closes[L-2]) confluenceCount++;
+      if (mtf && mtf.trend === "bullish" && mtf.aligned) confluenceCount++;
+      if (curEma9 > curEma21 && curEma21 > curEma50) confluenceCount++;  // full EMA stack
+      if (curSRSI < 20) confluenceCount++;
+      if (nearSupport) confluenceCount++;
+    } else {
+      if (curRSI > 68) confluenceCount++;
+      if (macdCross === "bearCross" || (lastHist < 0 && lastHist < prevHist * 1.3)) confluenceCount++;
+      if (bbZone === "upper") confluenceCount++;
+      if (volRatio > 1.8 && closes[L-1] < closes[L-2]) confluenceCount++;
+      if (mtf && mtf.trend === "bearish" && mtf.aligned) confluenceCount++;
+      if (curEma9 < curEma21 && curEma21 < curEma50) confluenceCount++;  // full EMA stack down
+      if (curSRSI > 80) confluenceCount++;
+      if (nearResistance) confluenceCount++;
+    }
+    if (confluenceCount >= 4) {
+      const bonus = Math.round(confluenceCount * 5); // 4 signals=+20, 5=+25, 6=+30 max
+      if (dominantBull) { bull += bonus; reasons.push(`🔥 ${confluenceCount}-factor confluence +${bonus}`); }
+      else { bear += bonus; reasons.push(`🔥 ${confluenceCount}-factor confluence +${bonus}`); }
+    } else if (confluenceCount === 3) {
+      const bonus = 10;
+      if (dominantBull) bull += bonus; else bear += bonus;
+      reasons.push(`3-factor confluence +${bonus}`);
+    }
+
     const total = bull + bear || 1;
     let bullPct = (bull / total) * 100;
     let bearPct = (bear / total) * 100;
@@ -4508,7 +4581,7 @@ export default function NexusV7() {
 
   // ═══ CHAT WITH AI STATE ═══
   const [chatMessages, setChatMessages] = useState([
-    { role: "ai", text: "Hey! I'm NEXUS v12. Ask me anything — why I stopped, my current signal, P&L, or tell me to start/stop trading. I'll explain everything in plain English.", time: new Date().toLocaleTimeString() }
+    { role: "ai", text: "Hey! I'm NEXUS v13. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
   ]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
@@ -4666,7 +4739,7 @@ export default function NexusV7() {
       console.warn(`[NEXUS] ⚠️ FALLBACK PRICE SET: $${demo.base} — SL/TP BLOCKED until live Binance price confirms (hasLivePrice=false)`);
       setChange24h((Math.random() - 0.4) * 5);
       setReady(true);
-      addLog("AI", "NEXUS v12 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
+      addLog("AI", "NEXUS v13 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
       addLog("AI", `Config: ${MAX_POSITIONS} max positions | ${MIN_STACK_DISTANCE_PCT}% min stack dist | ${MAX_TRADES_PER_SESSION} trades/session | MTF gate +3 | Dedup 15s | Gap 3s`);
       console.log("[NEXUS] 🚀 STARTUP: Balance=$" + fx(saved.balance || INITIAL_BALANCE) + " | Positions:" + (saved.positions?.length || 0) + " | History:" + (saved.history?.length || 0) + " | hasLivePrice=false (waiting for Binance)");
       if (saved.positions?.length > 0) {
@@ -5199,6 +5272,33 @@ export default function NexusV7() {
         stackedAmount = Math.max(5, stackedAmount * (1 + regimeConfig.sizeBonus));
       }
 
+      // ═══ PRO: KELLY CRITERION CAP — Don't overbet even on hot streaks ═══
+      // Kelly fraction = (WR * avgWin - (1-WR) * avgLoss) / avgWin
+      // We use half-Kelly for safety (conservative sizing)
+      const recentH = history.slice(0, 30);
+      const kellyWins = recentH.filter(h => h.net > 0);
+      const kellyLosses = recentH.filter(h => h.net <= 0);
+      if (kellyWins.length + kellyLosses.length >= 10) {
+        const wr = kellyWins.length / (kellyWins.length + kellyLosses.length);
+        const avgW = kellyWins.reduce((s,h) => s + h.net, 0) / kellyWins.length;
+        const avgL = Math.abs(kellyLosses.reduce((s,h) => s + h.net, 0) / kellyLosses.length) || 1;
+        const kellyFrac = (wr * avgW - (1 - wr) * avgL) / avgW;
+        const halfKelly = Math.max(0.02, Math.min(0.25, kellyFrac * 0.5)); // 2–25% of balance
+        const kellyMax = balance * halfKelly;
+        if (stackedAmount > kellyMax) {
+          console.log(`[NEXUS] 🎯 Kelly cap: $${stackedAmount.toFixed(2)} → $${kellyMax.toFixed(2)} (WR=${(wr*100).toFixed(0)}% K=${(kellyFrac*100).toFixed(1)}%)`);
+          stackedAmount = Math.max(5, kellyMax);
+        }
+      }
+
+      // ═══ PRO: CONFIDENCE-SCALED SIZING — higher conf = bigger bet ═══
+      // Linearly scale between 70% and 130% based on confidence vs baseline
+      const confScale = clamp(0.7 + (tradeConf - MIN_CONF_TO_TRADE) / (95 - MIN_CONF_TO_TRADE) * 0.6, 0.7, 1.3);
+      if (Math.abs(confScale - 1.0) > 0.05) {
+        stackedAmount = Math.max(5, stackedAmount * confScale);
+        console.log(`[NEXUS] 📊 Conf scale ${(confScale*100).toFixed(0)}% (conf=${tradeConf.toFixed(0)}%): $${stackedAmount.toFixed(2)}`);
+      }
+
       if (stackedAmount < 5) return;
 
       console.log(`[NEXUS] ✅ ALL GATES PASSED — EXECUTING: ${aiResult.action} ${pair.name} | Conf:${tradeConf.toFixed(0)}% | Amount:$${stackedAmount.toFixed(2)} | Stack:${stackLevel+1}/${MAX_POSITIONS} | SL:${aiResult.sl||'none'} TP:${aiResult.tp||'none'}`);
@@ -5277,9 +5377,9 @@ export default function NexusV7() {
             if (p.side === "SHORT" && p.sl > be) { p.sl = be; addLog("AI", `Trail SL to breakeven+buffer ${p.pairName}${mtfAgainst ? " (MTF opposing)" : ""}`); console.log(`[NEXUS] 🔄 TRAIL BE: ${p.pairName} SL→$${be.toFixed(2)} (with 0.3% buffer)`); }
           }
 
-          // === PROFIT TRAILING === v11: widened to let winners run
-          const trailThreshold = mtfConfirms ? 5.5 : mtfAgainst ? 3.5 : 4.5; // v11: was 4.5/2.5/3.5
-          const trailKeep = mtfConfirms ? 0.25 : mtfAgainst ? 0.45 : 0.35; // v11: was 0.3/0.55/0.4
+          // === PROFIT TRAILING === v13: tighter trail on confirmed moves, let winners breathe
+          const trailThreshold = mtfConfirms ? 5.0 : mtfAgainst ? 3.0 : 4.0; // v13: tighter triggers
+          const trailKeep = mtfConfirms ? 0.15 : mtfAgainst ? 0.45 : 0.30; // v13: MTF confirmed = keep 85% of profit
           if (pnlPct > trailThreshold && p.sl) {
             const trail = p.side === "LONG" ? price - (price - p.entry) * trailKeep : price + (p.entry - price) * trailKeep;
             if (p.side === "LONG" && trail > p.sl) { p.sl = trail; console.log(`[NEXUS] 🔄 PROFIT TRAIL: ${p.pairName} SL→$${trail.toFixed(2)} (keeping ${(trailKeep*100).toFixed(0)}%)`); }
@@ -5604,7 +5704,7 @@ export default function NexusV7() {
       const lower = msg.toLowerCase();
 
       // START TRADING
-      if (lower.includes("start") || lower.includes("turn on") || lower.includes("enable") || lower.includes("go")) {
+      if (lower.includes("start trading") || lower.includes("turn on") || lower.includes("enable trading") || lower === "go" || lower === "start") {
         if (!aiActive) {
           setAiActive(true);
           setChatMessages(prev => [...prev, { role: "ai", text: "✅ Auto-trading ENABLED. I'm now scanning for signals every tick. I'll enter a trade when I see a high-confidence setup.", time: new Date().toLocaleTimeString() }]);
@@ -5683,7 +5783,7 @@ export default function NexusV7() {
       }
 
       // P&L / PERFORMANCE
-      if (lower.includes("pnl") || lower.includes("profit") || lower.includes("performance") || lower.includes("balance") || lower.includes("how much") || lower.includes("money")) {
+      if (lower.includes("pnl") || lower.includes("profit") || lower.includes("performance") || lower.includes("balance") || lower === "how much have i made" || lower === "show pnl" || lower === "show my pnl") {
         const totalPnl = balance - INITIAL_BALANCE;
         const pnlPct = (totalPnl / INITIAL_BALANCE) * 100;
         const wins = history.filter(h => h.pnl > 0).length;
@@ -5744,30 +5844,48 @@ export default function NexusV7() {
 
       // ─── Fallback: send to LLM for open-ended questions ───
       if (groqKey || geminiKey) {
-        const contextSummary = `You are NEXUS v12, an AI crypto trading bot. Current state:
+        const _wins = history.filter(h => h.pnl > 0);
+        const _losses = history.filter(h => h.pnl <= 0);
+        const _wr = _wins.length + _losses.length > 0 ? (_wins.length / (_wins.length + _losses.length) * 100).toFixed(1) : "0";
+        const _avgWin = _wins.length > 0 ? (_wins.reduce((s,h) => s + h.pnl, 0) / _wins.length).toFixed(2) : "0";
+        const _avgLoss = _losses.length > 0 ? Math.abs(_losses.reduce((s,h) => s + h.pnl, 0) / _losses.length).toFixed(2) : "0";
+        const _totalPnl = balance - INITIAL_BALANCE;
+        const contextSummary = `You are NEXUS, a professional AI crypto trading analyst embedded inside a live BTC trading bot. You are sharp, direct, and opinionated — like a pro trader who knows their numbers cold.
+
+LIVE BOT STATE:
 - Auto-trading: ${aiActive ? "ON" : "OFF"}
-- Signal: ${aiResult?.action || "WAIT"} (${Number(aiResult?.confidence||0).toFixed(0)}% confidence)
-- Balance: $${fx(balance)} (started $${INITIAL_BALANCE}, P&L: ${balance >= INITIAL_BALANCE ? "+" : ""}$${fx(balance - INITIAL_BALANCE)})
+- Current signal: ${aiResult?.action || "WAIT"} at ${Number(aiResult?.confidence||0).toFixed(0)}% confidence
+- Market regime: ${aiResult?.analysis?.regime || "unknown"} | MTF trend: ${aiResult?.analysis?.mtfTrend || "unknown"}
+- Bull score: ${aiResult?.bullScore || 50}% | Bear score: ${aiResult?.bearScore || 50}%
+- Top reason: ${aiResult?.reasons?.[0] || "scanning"}
+
+ACCOUNT:
+- Balance: $${fx(balance)} (started $${INITIAL_BALANCE})
+- Total P&L: ${_totalPnl >= 0 ? "+" : ""}$${fx(_totalPnl)} (${((_totalPnl/INITIAL_BALANCE)*100).toFixed(1)}%)
+- Session P&L: ${sessionPnl >= 0 ? "+" : ""}$${fx(sessionPnl)}
+- Win rate: ${_wr}% (${_wins.length}W / ${_losses.length}L) | Avg win: $${_avgWin} | Avg loss: $${_avgLoss}
 - Open positions: ${positions.length}/${MAX_POSITIONS}
 - BTC price: $${fx(price, 0)}
-- Brain patterns: ${Brain.wins.length + Brain.losses.length} (${Brain.wins.length}W/${Brain.losses.length}L)
-- Brain cooldown: ${Brain.coolUntil > Date.now() ? Math.ceil((Brain.coolUntil - Date.now()) / 1000) + "s remaining" : "none"}
-- Market regime: ${aiResult?.analysis?.regime || "unknown"}
-- MTF trend: ${aiResult?.analysis?.mtfTrend || "unknown"}
-- Top signal reason: ${aiResult?.reasons?.[0] || "scanning"}
-- Connected to Binance: ${isLive ? "YES" : "NO"}
-The user is asking: "${msg}"
-Answer in 2-4 sentences. Be direct, specific, and helpful. Use the exact numbers from the state above.`;
+
+BRAIN:
+- Patterns: ${Brain.wins.length + Brain.losses.length} total (${Brain.wins.length}W / ${Brain.losses.length}L)
+- Cooldown: ${Brain.coolUntil > Date.now() ? Math.ceil((Brain.coolUntil - Date.now()) / 1000) + "s remaining" : "none"}
+
+CONNECTIVITY: Binance ${isLive ? "LIVE ✓" : "DISCONNECTED"}
+
+USER: "${msg}"
+
+Respond like a sharp pro trader — direct, specific, cite the exact numbers above. For predictions/earnings questions, calculate a reasoned estimate from win rate, avg win/loss, and trade frequency. For opinions, give one. 3-5 sentences max. No fluff.`;
 
         let responseText = "";
-        // Try Groq first
+        // Try Groq first (use 70b for smarter answers)
         if (groqKey) {
           try {
             const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
               method: "POST",
               headers: { "Content-Type": "application/json", "Authorization": `Bearer ${groqKey}` },
-              body: JSON.stringify({ model: "llama-3.1-8b-instant", messages: [{ role: "user", content: contextSummary }], max_tokens: 200, temperature: 0.5 }),
-              signal: AbortSignal.timeout(10000),
+              body: JSON.stringify({ model: "llama-3.3-70b-versatile", messages: [{ role: "user", content: contextSummary }], max_tokens: 400, temperature: 0.6 }),
+              signal: AbortSignal.timeout(12000),
             });
             if (res.ok) { const d = await res.json(); responseText = d?.choices?.[0]?.message?.content || ""; }
           } catch {}
@@ -5779,8 +5897,8 @@ Answer in 2-4 sentences. Be direct, specific, and helpful. Use the exact numbers
             const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ contents: [{ parts: [{ text: contextSummary }] }], generationConfig: { temperature: 0.5, maxOutputTokens: 200 } }),
-              signal: AbortSignal.timeout(10000),
+              body: JSON.stringify({ contents: [{ parts: [{ text: contextSummary }] }], generationConfig: { temperature: 0.6, maxOutputTokens: 400 } }),
+              signal: AbortSignal.timeout(12000),
             });
             if (res.ok) { const d = await res.json(); responseText = d?.candidates?.[0]?.content?.parts?.[0]?.text || ""; }
           } catch {}
@@ -5807,7 +5925,7 @@ Answer in 2-4 sentences. Be direct, specific, and helpful. Use the exact numbers
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
       <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }}/>
-      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v12 | 140 IQ ENGINE | LOADING</div>
+      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13 | 140 IQ ENGINE | LOADING</div>
     </div>
   );
 
@@ -5821,7 +5939,7 @@ Answer in 2-4 sentences. Be direct, specific, and helpful. Use the exact numbers
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v12 IQ</div>
+            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13 IQ</div>
             <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>140 IQ | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
@@ -6840,7 +6958,7 @@ CREATE POLICY "Allow all operations" ON nexus_data
 
         {/* CHAT WITH AI */}
         {tab === "chat" && <div style={S.card}>
-          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v12</div>
+          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13</div>
           <div style={{ fontSize: 9, color: K.txD, marginBottom: 14 }}>Ask why it stopped, give commands, or ask anything about the market.</div>
 
           {/* Quick command buttons */}
