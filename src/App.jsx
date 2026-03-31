@@ -5850,14 +5850,24 @@ export default function NexusV7() {
         const _avgWin = _wins.length > 0 ? (_wins.reduce((s,h) => s + h.pnl, 0) / _wins.length).toFixed(2) : "0";
         const _avgLoss = _losses.length > 0 ? Math.abs(_losses.reduce((s,h) => s + h.pnl, 0) / _losses.length).toFixed(2) : "0";
         const _totalPnl = balance - INITIAL_BALANCE;
+        const _allReasons = (aiResult?.reasons || []).slice(0, 10).map((r,i) => `  ${i+1}. ${r}`).join("\n") || "  (none)";
+        const _ind = aiResult?.indicators || {};
+        const _brainBlock = Brain.shouldBlock(_ind, aiResult?.action || "WAIT", pair?.sym || "BTCUSDT");
         const contextSummary = `You are NEXUS, a professional AI crypto trading analyst embedded inside a live BTC trading bot. You are sharp, direct, and opinionated — like a pro trader who knows their numbers cold.
 
 LIVE BOT STATE:
 - Auto-trading: ${aiActive ? "ON" : "OFF"}
 - Current signal: ${aiResult?.action || "WAIT"} at ${Number(aiResult?.confidence||0).toFixed(0)}% confidence
+- Min confidence to trade: ${MIN_CONF_TO_TRADE}% (HARDCODED — do NOT invent a different threshold)
+- Min R:R required: 1.5:1 after fees (HARDCODED — do NOT invent a different value)
 - Market regime: ${aiResult?.analysis?.regime || "unknown"} | MTF trend: ${aiResult?.analysis?.mtfTrend || "unknown"}
 - Bull score: ${aiResult?.bullScore || 50}% | Bear score: ${aiResult?.bearScore || 50}%
-- Top reason: ${aiResult?.reasons?.[0] || "scanning"}
+- RSI: ${_ind.rsi?.toFixed(1) || "?"} | MACD: ${_ind.macdDir || "?"} | Vol ratio: ${_ind.volRatio?.toFixed(2) || "?"}x
+- Brain block: ${_brainBlock.blocked ? "YES — " + _brainBlock.reason : "NO"}
+- Brain cooldown: ${Brain.coolUntil > Date.now() ? Math.ceil((Brain.coolUntil - Date.now()) / 1000) + "s remaining" : "none"}
+
+ALL SIGNAL REASONS (these are the REAL reasons — cite only these, never invent others):
+${_allReasons}
 
 ACCOUNT:
 - Balance: $${fx(balance)} (started $${INITIAL_BALANCE})
@@ -5869,13 +5879,18 @@ ACCOUNT:
 
 BRAIN:
 - Patterns: ${Brain.wins.length + Brain.losses.length} total (${Brain.wins.length}W / ${Brain.losses.length}L)
-- Cooldown: ${Brain.coolUntil > Date.now() ? Math.ceil((Brain.coolUntil - Date.now()) / 1000) + "s remaining" : "none"}
 
 CONNECTIVITY: Binance ${isLive ? "LIVE ✓" : "DISCONNECTED"}
 
+CRITICAL RULES — you MUST follow:
+1. NEVER invent thresholds. The confidence threshold is exactly ${MIN_CONF_TO_TRADE}%. The R:R minimum is exactly 1.5:1.
+2. ONLY cite reasons from the ALL SIGNAL REASONS list above — never make up reasons.
+3. If the signal confidence is >= ${MIN_CONF_TO_TRADE}%, do NOT say it's below threshold.
+4. Be honest: if you don't know why something happened, say so.
+
 USER: "${msg}"
 
-Respond like a sharp pro trader — direct, specific, cite the exact numbers above. For predictions/earnings questions, calculate a reasoned estimate from win rate, avg win/loss, and trade frequency. For opinions, give one. 3-5 sentences max. No fluff.`;
+Respond like a sharp pro trader — direct, specific, cite exact numbers. For earnings predictions, calculate from win rate and avg win/loss. 3-5 sentences max. No fluff.`;
 
         let responseText = "";
         // Try Groq first (use 70b for smarter answers)
