@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v13.1 — Chat Intelligence Fix (Apr 3 2026)
+// NEXUS v13.2 — LLM Override + Lower Threshold (Apr 3 2026)
 // ✦ PRO FIX 1: Confluence bonus system — 3+ aligned signals get multiplicative boost
 // ✦ PRO FIX 2: Kelly Criterion cap — sizes position based on actual edge (half-Kelly)
 // ✦ PRO FIX 3: Confidence-scaled sizing — high conf = bigger bet, proportionally
@@ -63,7 +63,7 @@ const STACK_SIZE_DECAY = [1, 0.8, 0.6, 0.45, 0.3]; // Position size multiplier: 
 const COOL_AFTER_LOSS_BASE = 30000;    // v10: 30s base cooldown (was 60s — too slow)
 const COOL_AFTER_LOSS_MAX = 180000;    // v10: 3min max cooldown (was 5min — killed momentum)
 const MAX_TRADES_PER_SESSION = 20;
-const MIN_CONF_TO_TRADE = 30; // v10 FIX: Was 42 — realistic signals reach 28-48%, old threshold blocked everything
+const MIN_CONF_TO_TRADE = 25; // v13.2 FIX: Was 30 — lowered to allow 25-29% conf signals through; LLM override also added
 // ═══ PRICE SANITY — Prevent fake PnL from stale/fallback prices ═══
 const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real
 const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real
@@ -4581,7 +4581,7 @@ export default function NexusV7() {
 
   // ═══ CHAT WITH AI STATE ═══
   const [chatMessages, setChatMessages] = useState([
-    { role: "ai", text: "Hey! I'm NEXUS v13.1. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
+    { role: "ai", text: "Hey! I'm NEXUS v13.2. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
   ]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
@@ -4739,7 +4739,7 @@ export default function NexusV7() {
       console.warn(`[NEXUS] ⚠️ FALLBACK PRICE SET: $${demo.base} — SL/TP BLOCKED until live Binance price confirms (hasLivePrice=false)`);
       setChange24h((Math.random() - 0.4) * 5);
       setReady(true);
-      addLog("AI", "NEXUS v13.1 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
+      addLog("AI", "NEXUS v13.2 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
       addLog("AI", `Config: ${MAX_POSITIONS} max positions | ${MIN_STACK_DISTANCE_PCT}% min stack dist | ${MAX_TRADES_PER_SESSION} trades/session | MTF gate +3 | Dedup 15s | Gap 3s`);
       console.log("[NEXUS] 🚀 STARTUP: Balance=$" + fx(saved.balance || INITIAL_BALANCE) + " | Positions:" + (saved.positions?.length || 0) + " | History:" + (saved.history?.length || 0) + " | hasLivePrice=false (waiting for Binance)");
       if (saved.positions?.length > 0) {
@@ -5059,7 +5059,19 @@ export default function NexusV7() {
       // ═══ DEMO GUARD: Never auto-trade on fake/offline data ═══
       if (!isLive) { console.log("[NEXUS] ⏸ Trade skip: not live"); return; }
       if (!hasLivePrice) { console.log("[NEXUS] ⏸ Trade skip: no live price confirmed"); return; }
-      if (aiResult.action === "WAIT" || aiResult.action === "PAUSE") { console.log(`[NEXUS] ⏸ AI says ${aiResult.action} (conf: ${Number(aiResult.confidence).toFixed(1)}%) | Reasons: ${(aiResult.reasons||[]).slice(0,3).join('; ')}`); return; }
+      // ═══ v13.2: LLM HIGH CONVICTION BYPASS ═══
+      // If LLM says LONG/SHORT with HIGH conviction + 75%+ confidence, allow trade
+      // even if rule engine says WAIT — LLM sees things rules miss (BB bounces, RSI extremes)
+      const llmHighConvOverride = (geminiKey || groqKey) && llmResult?.live && llmResult.override &&
+        (llmResult.action === "LONG" || llmResult.action === "SHORT") &&
+        llmResult.conviction === "HIGH" && llmResult.confidence >= 75;
+      if (llmHighConvOverride) {
+        console.log(`[NEXUS] 🤖 LLM HIGH CONV BYPASS: ${llmResult.action} ${llmResult.confidence}% (rule engine said ${aiResult.action})`);
+        addLog("LLM", `HIGH CONV BYPASS: ${llmResult.action} ${llmResult.confidence}% — overriding rule engine WAIT`);
+        // Patch aiResult direction so downstream trade logic uses LLM's direction
+        aiResult = { ...aiResult, action: llmResult.action, confidence: Math.max(aiResult.confidence, llmResult.confidence * 0.7) };
+      }
+      if (!llmHighConvOverride && (aiResult.action === "WAIT" || aiResult.action === "PAUSE")) { console.log(`[NEXUS] ⏸ AI says ${aiResult.action} (conf: ${Number(aiResult.confidence).toFixed(1)}%) | Reasons: ${(aiResult.reasons||[]).slice(0,3).join('; ')}`); return; }
       if ((geminiKey || groqKey) && llmResult?.live && llmResult.override && llmResult.action === "WAIT" && llmResult.conviction === "HIGH" && llmResult.confidence >= 70) { console.log("[NEXUS] ⏸ LLM override: WAIT (HIGH conviction " + llmResult.confidence + "%)"); return; }
       // v10: LLM WAIT veto now requires HIGH conviction AND 70%+ confidence — was blocking too many valid trades
       // ═══ POSITION STACKING GUARDS ═══
@@ -5978,7 +5990,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
       <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }}/>
-      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13.1 | 140 IQ ENGINE | LOADING</div>
+      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13.2 | 140 IQ ENGINE | LOADING</div>
     </div>
   );
 
@@ -5992,7 +6004,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13.1 IQ</div>
+            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13.2 IQ</div>
             <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>140 IQ | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
@@ -7011,7 +7023,7 @@ CREATE POLICY "Allow all operations" ON nexus_data
 
         {/* CHAT WITH AI */}
         {tab === "chat" && <div style={S.card}>
-          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13.1</div>
+          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13.2</div>
           <div style={{ fontSize: 9, color: K.txD, marginBottom: 14 }}>Ask why it stopped, give commands, or ask anything about the market.</div>
 
           {/* Quick command buttons */}
