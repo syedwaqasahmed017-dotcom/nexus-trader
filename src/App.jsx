@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v13.0 — PRO UPGRADE (Mar 31 2026)
+// NEXUS v13.1 — Chat Intelligence Fix (Apr 3 2026)
 // ✦ PRO FIX 1: Confluence bonus system — 3+ aligned signals get multiplicative boost
 // ✦ PRO FIX 2: Kelly Criterion cap — sizes position based on actual edge (half-Kelly)
 // ✦ PRO FIX 3: Confidence-scaled sizing — high conf = bigger bet, proportionally
@@ -4581,7 +4581,7 @@ export default function NexusV7() {
 
   // ═══ CHAT WITH AI STATE ═══
   const [chatMessages, setChatMessages] = useState([
-    { role: "ai", text: "Hey! I'm NEXUS v13. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
+    { role: "ai", text: "Hey! I'm NEXUS v13.1. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
   ]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
@@ -4739,7 +4739,7 @@ export default function NexusV7() {
       console.warn(`[NEXUS] ⚠️ FALLBACK PRICE SET: $${demo.base} — SL/TP BLOCKED until live Binance price confirms (hasLivePrice=false)`);
       setChange24h((Math.random() - 0.4) * 5);
       setReady(true);
-      addLog("AI", "NEXUS v13 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
+      addLog("AI", "NEXUS v13.1 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
       addLog("AI", `Config: ${MAX_POSITIONS} max positions | ${MIN_STACK_DISTANCE_PCT}% min stack dist | ${MAX_TRADES_PER_SESSION} trades/session | MTF gate +3 | Dedup 15s | Gap 3s`);
       console.log("[NEXUS] 🚀 STARTUP: Balance=$" + fx(saved.balance || INITIAL_BALANCE) + " | Positions:" + (saved.positions?.length || 0) + " | History:" + (saved.history?.length || 0) + " | hasLivePrice=false (waiting for Binance)");
       if (saved.positions?.length > 0) {
@@ -5842,6 +5842,44 @@ export default function NexusV7() {
         setChatLoading(false); return;
       }
 
+      // LOSSES / WINS / WHY LOSING
+      if (lower.includes("loss") || lower.includes("losing") || lower.includes("why losing") || lower.includes("so many loss") || (lower.includes("why") && lower.includes("loss")) || lower.includes("win rate") || lower.includes("how am i doing")) {
+        const wins = history.filter(h => h.pnl > 0);
+        const losses = history.filter(h => h.pnl <= 0);
+        const wr = wins.length + losses.length > 0 ? (wins.length / (wins.length + losses.length) * 100).toFixed(1) : "0";
+        const avgWin = wins.length > 0 ? (wins.reduce((s,h) => s + h.pnl, 0) / wins.length).toFixed(2) : "0";
+        const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((s,h) => s + h.pnl, 0) / losses.length).toFixed(2) : "0";
+        const totalPnl = balance - INITIAL_BALANCE;
+        const recentTrades = history.slice(-10);
+        const recentLosses = recentTrades.filter(h => h.pnl <= 0).length;
+        const sessionWins = history.filter(h => h.pnl > 0 && h.exitTime && Date.now() - new Date(h.exitTime).getTime() < 86400000).length;
+        const sessionLosses = history.filter(h => h.pnl <= 0 && h.exitTime && Date.now() - new Date(h.exitTime).getTime() < 86400000).length;
+        const profitFactor = losses.reduce((s,h) => s + Math.abs(h.pnl), 0) > 0
+          ? (wins.reduce((s,h) => s + h.pnl, 0) / Math.abs(losses.reduce((s,h) => s + h.pnl, 0))).toFixed(2)
+          : "∞";
+
+        let reply = `📊 Performance Analysis:\n`;
+        reply += `Win rate: ${wr}% (${wins.length}W / ${losses.length}L)\n`;
+        reply += `Avg win: +$${avgWin} | Avg loss: -$${avgLoss}\n`;
+        reply += `Profit factor: ${profitFactor} | Total P&L: ${totalPnl >= 0 ? "+" : ""}$${fx(totalPnl)}\n`;
+        reply += `Last 10 trades: ${recentTrades.length - recentLosses}W / ${recentLosses}L\n`;
+        reply += `Today: ${sessionWins}W / ${sessionLosses}L\n\n`;
+
+        if (wins.length + losses.length === 0) {
+          reply += `No trades recorded yet — I haven't had a chance to build a track record.`;
+        } else if (parseFloat(wr) < 40) {
+          reply += `Win rate is low. Likely causes: choppy/sideways market, spread eating into tight setups, or the signal threshold needs raising. Current min confidence: ${MIN_CONF_TO_TRADE}%.`;
+        } else if (parseFloat(avgLoss) > parseFloat(avgWin) * 1.5) {
+          reply += `Win rate is ok but losses are too large vs wins. Check if stop losses are being hit too early or TP targets are too aggressive.`;
+        } else if (recentLosses >= 7) {
+          reply += `Recent streak of losses — market may have shifted regime. Brain may be in cooldown to protect capital.`;
+        } else {
+          reply += `Performance looks within normal range. Crypto markets have noisy periods — the brain learns and adapts over time.`;
+        }
+        setChatMessages(prev => [...prev, { role: "ai", text: reply.trim(), time: new Date().toLocaleTimeString() }]);
+        setChatLoading(false); return;
+      }
+
       // ─── Fallback: send to LLM for open-ended questions ───
       if (groqKey || geminiKey) {
         const _wins = history.filter(h => h.pnl > 0);
@@ -5925,7 +5963,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
       }
 
       // Final fallback
-      setChatMessages(prev => [...prev, { role: "ai", text: `I'm not sure how to answer that. Try asking: "status", "why stopped?", "current signal", "show P&L", or "help" for all commands.`, time: new Date().toLocaleTimeString() }]);
+      setChatMessages(prev => [...prev, { role: "ai", text: `I couldn't get an AI response right now (API may be rate-limited or key missing). Try: "status", "why stopped?", "current signal", "show P&L", "losses", or "help".`, time: new Date().toLocaleTimeString() }]);
     } catch(e) {
       setChatMessages(prev => [...prev, { role: "ai", text: "Sorry, something went wrong. Try again.", time: new Date().toLocaleTimeString() }]);
     } finally {
@@ -5940,7 +5978,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
       <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }}/>
-      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13 | 140 IQ ENGINE | LOADING</div>
+      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13.1 | 140 IQ ENGINE | LOADING</div>
     </div>
   );
 
@@ -5954,7 +5992,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13 IQ</div>
+            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13.1 IQ</div>
             <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>140 IQ | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
@@ -6973,7 +7011,7 @@ CREATE POLICY "Allow all operations" ON nexus_data
 
         {/* CHAT WITH AI */}
         {tab === "chat" && <div style={S.card}>
-          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13</div>
+          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13.1</div>
           <div style={{ fontSize: 9, color: K.txD, marginBottom: 14 }}>Ask why it stopped, give commands, or ask anything about the market.</div>
 
           {/* Quick command buttons */}
