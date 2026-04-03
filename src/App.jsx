@@ -5786,8 +5786,8 @@ export default function NexusV7() {
       if (lower.includes("pnl") || lower.includes("profit") || lower.includes("performance") || lower.includes("balance") || lower === "how much have i made" || lower === "show pnl" || lower === "show my pnl") {
         const totalPnl = balance - INITIAL_BALANCE;
         const pnlPct = (totalPnl / INITIAL_BALANCE) * 100;
-        const wins = history.filter(h => h.pnl > 0).length;
-        const losses = history.filter(h => h.pnl <= 0).length;
+        const wins = history.filter(h => (h.net ?? h.pnl ?? 0) > 0).length;
+        const losses = history.filter(h => (h.net ?? h.pnl ?? 0) <= 0).length;
         const wr = wins + losses > 0 ? (wins / (wins + losses) * 100) : 0;
         let reply = `💰 Balance: $${fx(balance)} (started at $${INITIAL_BALANCE})\n`;
         reply += `Total P&L: ${totalPnl >= 0 ? "+" : ""}$${fx(totalPnl)} (${pnlPct >= 0 ? "+" : ""}${fx(pnlPct)}%)\n`;
@@ -5844,18 +5844,18 @@ export default function NexusV7() {
 
       // LOSSES / WINS / WHY LOSING
       if (lower.includes("loss") || lower.includes("losing") || lower.includes("why losing") || lower.includes("so many loss") || (lower.includes("why") && lower.includes("loss")) || lower.includes("win rate") || lower.includes("how am i doing")) {
-        const wins = history.filter(h => h.pnl > 0);
-        const losses = history.filter(h => h.pnl <= 0);
+        const wins = history.filter(h => (h.net ?? h.pnl ?? 0) > 0);
+        const losses = history.filter(h => (h.net ?? h.pnl ?? 0) <= 0);
         const wr = wins.length + losses.length > 0 ? (wins.length / (wins.length + losses.length) * 100).toFixed(1) : "0";
-        const avgWin = wins.length > 0 ? (wins.reduce((s,h) => s + h.pnl, 0) / wins.length).toFixed(2) : "0";
-        const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((s,h) => s + h.pnl, 0) / losses.length).toFixed(2) : "0";
+        const avgWin = wins.length > 0 ? (wins.reduce((s,h) => s + (h.net ?? h.pnl ?? 0), 0) / wins.length).toFixed(2) : "0";
+        const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((s,h) => s + (h.net ?? h.pnl ?? 0), 0) / losses.length).toFixed(2) : "0";
         const totalPnl = balance - INITIAL_BALANCE;
         const recentTrades = history.slice(-10);
-        const recentLosses = recentTrades.filter(h => h.pnl <= 0).length;
-        const sessionWins = history.filter(h => h.pnl > 0 && h.exitTime && Date.now() - new Date(h.exitTime).getTime() < 86400000).length;
-        const sessionLosses = history.filter(h => h.pnl <= 0 && h.exitTime && Date.now() - new Date(h.exitTime).getTime() < 86400000).length;
-        const profitFactor = losses.reduce((s,h) => s + Math.abs(h.pnl), 0) > 0
-          ? (wins.reduce((s,h) => s + h.pnl, 0) / Math.abs(losses.reduce((s,h) => s + h.pnl, 0))).toFixed(2)
+        const recentLosses = recentTrades.filter(h => (h.net ?? h.pnl ?? 0) <= 0).length;
+        const sessionWins = history.filter(h => (h.net ?? h.pnl ?? 0) > 0 && h.exitTime && Date.now() - new Date(h.exitTime).getTime() < 86400000).length;
+        const sessionLosses = history.filter(h => (h.net ?? h.pnl ?? 0) <= 0 && h.exitTime && Date.now() - new Date(h.exitTime).getTime() < 86400000).length;
+        const profitFactor = losses.reduce((s,h) => s + Math.abs(h.net ?? h.pnl ?? 0), 0) > 0
+          ? (wins.reduce((s,h) => s + (h.net ?? h.pnl ?? 0), 0) / Math.abs(losses.reduce((s,h) => s + (h.net ?? h.pnl ?? 0), 0))).toFixed(2)
           : "∞";
 
         let reply = `📊 Performance Analysis:\n`;
