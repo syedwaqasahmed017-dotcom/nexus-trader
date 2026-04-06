@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v13.2 — LLM Override + Lower Threshold (Apr 3 2026)
+// NEXUS v13.3 — Chat AI h.net fix + Brain TS reset (Apr 6 2026)
 // ✦ PRO FIX 1: Confluence bonus system — 3+ aligned signals get multiplicative boost
 // ✦ PRO FIX 2: Kelly Criterion cap — sizes position based on actual edge (half-Kelly)
 // ✦ PRO FIX 3: Confidence-scaled sizing — high conf = bigger bet, proportionally
@@ -3149,8 +3149,8 @@ const Brain = {
       const now = Date.now();
       // ═══ v12 DEPLOY TIMESTAMP — Only consider losses AFTER this deploy ═══
       // Old losses were from broken thresholds/gates — don't let them block new trades
-      const V12_DEPLOY_TS = 1743292800000; // March 30, 2026 00:00 UTC — v12 wipes all pre-fix brain losses
-      const filterTs = (entries, maxAge) => entries.filter(e => e.ts > V12_DEPLOY_TS && now - e.ts < maxAge);
+      const V13_DEPLOY_TS = 1775433600000; // April 6, 2026 00:00 UTC — v13.3 wipes pre-fix brain losses
+      const filterTs = (entries, maxAge) => entries.filter(e => e.ts > V13_DEPLOY_TS && now - e.ts < maxAge);
 
       // CHECK 1: Cooldown timer (severity-scaled in recordLoss)
       if (now < this.coolUntil) return { blocked: true, reason: `Cooling down (${Math.ceil((this.coolUntil - now) / 1000)}s)`, severity: "COOL" };
@@ -3203,8 +3203,8 @@ const Brain = {
       // CHECK 10: Session-specific pattern failure — v12: needs 5, WITH time window (was missing time expiry → accumulated forever)
       const sessionName = Sessions.getCurrent().primary.name;
       const simKey = fp.split("|").slice(0, 4).join("|");
-      const sessionLosses = this.losses.filter(e => e.ts > V12_DEPLOY_TS && now - e.ts < WEEK && e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
-      const sessionWins = this.wins.filter(e => e.ts > V12_DEPLOY_TS && now - e.ts < WEEK && e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
+      const sessionLosses = this.losses.filter(e => e.ts > V13_DEPLOY_TS && now - e.ts < WEEK && e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
+      const sessionWins = this.wins.filter(e => e.ts > V13_DEPLOY_TS && now - e.ts < WEEK && e.session === sessionName && (e.mfp === mfp || e.fp.startsWith(simKey)));
       if (sessionLosses.length >= 5 && sessionWins.length < sessionLosses.length * 0.35) {
         return { blocked: true, reason: `Pattern fails in ${sessionName} (${sessionWins.length}W/${sessionLosses.length}L)`, severity: "MED" };
       }
@@ -3217,9 +3217,9 @@ const Brain = {
     try {
       const WEEK = 7 * 864e5;
       const now = Date.now();
-      const V12_DEPLOY_TS = 1743292800000; // March 30, 2026 00:00 UTC — v12
-      const recentLosses = this.losses.filter(e => e.ts > V12_DEPLOY_TS && e.action === action && now - e.ts < WEEK);
-      const recentWins = this.wins.filter(e => e.ts > V12_DEPLOY_TS && e.action === action && now - e.ts < WEEK);
+      const V13_DEPLOY_TS = 1775433600000; // April 6, 2026 00:00 UTC — v13.3
+      const recentLosses = this.losses.filter(e => e.ts > V13_DEPLOY_TS && e.action === action && now - e.ts < WEEK);
+      const recentWins = this.wins.filter(e => e.ts > V13_DEPLOY_TS && e.action === action && now - e.ts < WEEK);
       if (recentLosses.length < 5) return null; // v10: was 3
 
       const exitReasons = {};
@@ -3303,9 +3303,9 @@ const Brain = {
       const THREE_WEEKS = 21 * 864e5;
       const WEEK = 7 * 864e5;
       const now = Date.now();
-      const V12_DEPLOY_TS = 1743292800000; // March 30, 2026
-      const regimeLosses = this.losses.filter(e => e.ts > V12_DEPLOY_TS && e.rk === rk && now - e.ts < THREE_WEEKS).length;
-      const regimeWins = this.wins.filter(e => e.ts > V12_DEPLOY_TS && e.rk === rk && now - e.ts < THREE_WEEKS).length;
+      const V13_DEPLOY_TS = 1775433600000; // April 6, 2026
+      const regimeLosses = this.losses.filter(e => e.ts > V13_DEPLOY_TS && e.rk === rk && now - e.ts < THREE_WEEKS).length;
+      const regimeWins = this.wins.filter(e => e.ts > V13_DEPLOY_TS && e.rk === rk && now - e.ts < THREE_WEEKS).length;
       const regimeTotal = regimeLosses + regimeWins;
       if (regimeTotal >= 5) {
         const regimeWR = (regimeWins / regimeTotal) * 100;
@@ -3314,10 +3314,10 @@ const Brain = {
       }
 
       // ═══ v12: Exit-reason penalty — only post-deploy, capped ═══
-      const timeExitLosses = this.losses.filter(e => e.ts > V12_DEPLOY_TS && e.action === action && (e.exitReason || "").includes("Time Exit") && now - e.ts < WEEK).length;
+      const timeExitLosses = this.losses.filter(e => e.ts > V13_DEPLOY_TS && e.action === action && (e.exitReason || "").includes("Time Exit") && now - e.ts < WEEK).length;
       if (timeExitLosses >= 6) mod -= Math.min(8, timeExitLosses * 1.0);
 
-      const slLosses = this.losses.filter(e => e.ts > V12_DEPLOY_TS && e.action === action && e.exitReason === "Stop Loss" && now - e.ts < WEEK).length;
+      const slLosses = this.losses.filter(e => e.ts > V13_DEPLOY_TS && e.action === action && e.exitReason === "Stop Loss" && now - e.ts < WEEK).length;
       if (slLosses >= 7) mod -= Math.min(8, slLosses * 0.8);
 
       // ═══ v12 HARD CAP: total modifier can never drop below -15 ═══
@@ -4581,7 +4581,7 @@ export default function NexusV7() {
 
   // ═══ CHAT WITH AI STATE ═══
   const [chatMessages, setChatMessages] = useState([
-    { role: "ai", text: "Hey! I'm NEXUS v13.2. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
+    { role: "ai", text: "Hey! I'm NEXUS v13.3. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
   ]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
@@ -4739,7 +4739,7 @@ export default function NexusV7() {
       console.warn(`[NEXUS] ⚠️ FALLBACK PRICE SET: $${demo.base} — SL/TP BLOCKED until live Binance price confirms (hasLivePrice=false)`);
       setChange24h((Math.random() - 0.4) * 5);
       setReady(true);
-      addLog("AI", "NEXUS v13.2 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
+      addLog("AI", "NEXUS v13.3 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
       addLog("AI", `Config: ${MAX_POSITIONS} max positions | ${MIN_STACK_DISTANCE_PCT}% min stack dist | ${MAX_TRADES_PER_SESSION} trades/session | MTF gate +3 | Dedup 15s | Gap 3s`);
       console.log("[NEXUS] 🚀 STARTUP: Balance=$" + fx(saved.balance || INITIAL_BALANCE) + " | Positions:" + (saved.positions?.length || 0) + " | History:" + (saved.history?.length || 0) + " | hasLivePrice=false (waiting for Binance)");
       if (saved.positions?.length > 0) {
@@ -5894,11 +5894,12 @@ export default function NexusV7() {
 
       // ─── Fallback: send to LLM for open-ended questions ───
       if (groqKey || geminiKey) {
-        const _wins = history.filter(h => h.pnl > 0);
-        const _losses = history.filter(h => h.pnl <= 0);
+        const _liveHistory = (DB.get("state7", {}).history || history || []);
+        const _wins = _liveHistory.filter(h => (h.net ?? h.pnl ?? 0) > 0);
+        const _losses = _liveHistory.filter(h => (h.net ?? h.pnl ?? 0) <= 0);
         const _wr = _wins.length + _losses.length > 0 ? (_wins.length / (_wins.length + _losses.length) * 100).toFixed(1) : "0";
-        const _avgWin = _wins.length > 0 ? (_wins.reduce((s,h) => s + h.pnl, 0) / _wins.length).toFixed(2) : "0";
-        const _avgLoss = _losses.length > 0 ? Math.abs(_losses.reduce((s,h) => s + h.pnl, 0) / _losses.length).toFixed(2) : "0";
+        const _avgWin = _wins.length > 0 ? (_wins.reduce((s,h) => s + (h.net ?? h.pnl ?? 0), 0) / _wins.length).toFixed(2) : "0";
+        const _avgLoss = _losses.length > 0 ? Math.abs(_losses.reduce((s,h) => s + (h.net ?? h.pnl ?? 0), 0) / _losses.length).toFixed(2) : "0";
         const _totalPnl = balance - INITIAL_BALANCE;
         const _allReasons = (aiResult?.reasons || []).slice(0, 10).map((r,i) => `  ${i+1}. ${r}`).join("\n") || "  (none)";
         const _ind = aiResult?.indicators || {};
@@ -5990,7 +5991,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
       <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }}/>
-      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13.2 | 140 IQ ENGINE | LOADING</div>
+      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13.3 | 140 IQ ENGINE | LOADING</div>
     </div>
   );
 
@@ -6004,7 +6005,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13.2 IQ</div>
+            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13.3 IQ</div>
             <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>140 IQ | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
@@ -7023,7 +7024,7 @@ CREATE POLICY "Allow all operations" ON nexus_data
 
         {/* CHAT WITH AI */}
         {tab === "chat" && <div style={S.card}>
-          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13.2</div>
+          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13.3</div>
           <div style={{ fontSize: 9, color: K.txD, marginBottom: 14 }}>Ask why it stopped, give commands, or ask anything about the market.</div>
 
           {/* Quick command buttons */}
