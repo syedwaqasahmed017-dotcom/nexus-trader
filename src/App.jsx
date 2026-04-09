@@ -1,7 +1,11 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v13.3 — Chat AI h.net fix + Brain TS reset (Apr 6 2026)
+// NEXUS v13.4 — SL floor raised + rapid direction-ban learning (Apr 9 2026)
+// ✦ v13.4 FIX 1: SL floor raised 1.0% → 1.5% — 1% was still inside BTC noise band
+// ✦ v13.4 FIX 2: Rapid direction-ban — 3 SL hits in 30min bans that direction for 20min
+// ✦ v13.4 FIX 3: Brain records directionBan timestamp per action on rapid-SL streak
+// ✦ v13.4 FIX 4: AdaptiveTPSL low-sample widening — widen SL 20% after 2+ regime losses (was 5 min)
 // ✦ PRO FIX 1: Confluence bonus system — 3+ aligned signals get multiplicative boost
 // ✦ PRO FIX 2: Kelly Criterion cap — sizes position based on actual edge (half-Kelly)
 // ✦ PRO FIX 3: Confidence-scaled sizing — high conf = bigger bet, proportionally
@@ -1168,6 +1172,12 @@ const AdaptiveTPSL = {
           slMult *= 1.15; // Wider SL to give more room
         }
       }
+      // ═══ v13.4 EARLY-LOSS WIDENING — don't wait for 5 samples before adapting ═══
+      // If 2+ losses with 0 wins in this regime, widen SL immediately — we're in hostile regime
+      if (total < 5 && regimeLosses.length >= 2 && regimeWins.length === 0) {
+        slMult *= 1.2; // 20% wider SL — we're getting stopped out, give it more room
+        tpMult *= 0.9; // Slightly tighter TP — take what you can get
+      }
 
       // Calculate actual prices
       let sl, tp;
@@ -1184,10 +1194,11 @@ const AdaptiveTPSL = {
       if (action === "LONG" && tp - price < minTpDist) tp = price + minTpDist;
       if (action === "SHORT" && price - tp < minTpDist) tp = price - minTpDist;
 
-      // ═══ v11 CRITICAL: ENFORCE MINIMUM SL DISTANCE — 1.0% of price ═══
-      // This was in v9.1/v9.2 but got LOST in v10 — caused ALL stop loss massacres
-      // BTC 1-min candles regularly move 0.3-0.5%. SL must be wider than noise.
-      const MIN_SL_PCT = 1.0;
+      // ═══ v13.4 CRITICAL: ENFORCE MINIMUM SL DISTANCE — 1.5% of price ═══
+      // v13.4: raised from 1.0% → 1.5%. Screenshot showed 6 consecutive LONGs all
+      // hitting SL at 1.25-1.53%, meaning 1.0% floor was STILL inside BTC noise.
+      // At $71k BTC, 1.5% = ~$1,065 wiggle room — the real noise band on 15m.
+      const MIN_SL_PCT = 1.5;
       const minSlDist = price * (MIN_SL_PCT / 100);
       if (action === "LONG" && price - sl < minSlDist) { sl = price - minSlDist; }
       if (action === "SHORT" && sl - price < minSlDist) { sl = price + minSlDist; }
@@ -3028,7 +3039,51 @@ const Brain = {
       }
     } catch {}
   },
-  // ═══ v7.5 FINGERPRINT: 13-dim exact (unchanged for backward compat) ═══
+  // ═══ v13.4 RAPID DIRECTION BAN — If 3 SL hits in same direction in 30min, ban that direction 20min ═══
+  // This catches the "6 consecutive LONG stop-losses in 20 minutes" failure mode.
+  // Brain pattern blocks are fingerprint-based (need 4 exact matches), but each SL entry
+  // has slightly different indicators = different fingerprint = brain never blocks fast enough.
+  // This adds a simple time-based direction ban that triggers on SL streak velocity.
+  _directionBan: {},  // { LONG: banUntilTs, SHORT: banUntilTs }
+  _recentSLHits: [],  // [{ action, ts }] — rolling 30min window
+  BAN_DURATION_MS: 20 * 60 * 1000,   // 20 minutes ban after rapid SL streak
+  BAN_TRIGGER_COUNT: 3,               // 3 SL hits in...
+  BAN_WINDOW_MS: 30 * 60 * 1000,     // ...30 minutes triggers ban
+
+  isDirectionBanned(action) {
+    try {
+      const ban = (this._directionBan || {})[action];
+      return ban && Date.now() < ban;
+    } catch { return false; }
+  },
+
+  getDirectionBanRemaining(action) {
+    try {
+      const ban = (this._directionBan || {})[action];
+      if (!ban || Date.now() >= ban) return 0;
+      return Math.ceil((ban - Date.now()) / 60000);
+    } catch { return 0; }
+  },
+
+  recordSLHit(action) {
+    try {
+      if (!this._recentSLHits) this._recentSLHits = [];
+      if (!this._directionBan) this._directionBan = {};
+      const now = Date.now();
+      // Add this hit
+      this._recentSLHits.push({ action, ts: now });
+      // Prune old hits outside 30min window
+      this._recentSLHits = this._recentSLHits.filter(h => now - h.ts < this.BAN_WINDOW_MS);
+      // Count recent hits for this direction
+      const directionHits = this._recentSLHits.filter(h => h.action === action).length;
+      if (directionHits >= this.BAN_TRIGGER_COUNT) {
+        this._directionBan[action] = now + this.BAN_DURATION_MS;
+        console.log(`[BRAIN] 🚫 DIRECTION BAN: ${action} banned for 20min — ${directionHits} SL hits in 30min`);
+        return true; // banned
+      }
+      return false;
+    } catch { return false; }
+  },
   fingerprint(indicators, action, symbol) {
     try {
       const i = indicators || {};
@@ -3377,7 +3432,7 @@ const Brain = {
       };
     } catch { return { totalLosses: 0, totalWins: 0, weekLosses: 0, totalLossPrevented: 0, totalWinValue: 0, topBlocked: [], brainSize: 0, exitReasonStats: {} }; }
   },
-  reset() { this.losses = []; this.wins = []; this.coolUntil = 0; this.sessionTrades = {}; this.save(); },
+  reset() { this.losses = []; this.wins = []; this.coolUntil = 0; this.sessionTrades = {}; this._directionBan = {}; this.save(); },
   purgeDemo() {
     try {
       const before = this.wins.length + this.losses.length;
@@ -4581,7 +4636,7 @@ export default function NexusV7() {
 
   // ═══ CHAT WITH AI STATE ═══
   const [chatMessages, setChatMessages] = useState([
-    { role: "ai", text: "Hey! I'm NEXUS v13.3. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
+    { role: "ai", text: "Hey! I'm NEXUS v13.4. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
   ]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
@@ -4739,7 +4794,7 @@ export default function NexusV7() {
       console.warn(`[NEXUS] ⚠️ FALLBACK PRICE SET: $${demo.base} — SL/TP BLOCKED until live Binance price confirms (hasLivePrice=false)`);
       setChange24h((Math.random() - 0.4) * 5);
       setReady(true);
-      addLog("AI", "NEXUS v13.3 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
+      addLog("AI", "NEXUS v13.4 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
       addLog("AI", `Config: ${MAX_POSITIONS} max positions | ${MIN_STACK_DISTANCE_PCT}% min stack dist | ${MAX_TRADES_PER_SESSION} trades/session | MTF gate +3 | Dedup 15s | Gap 3s`);
       console.log("[NEXUS] 🚀 STARTUP: Balance=$" + fx(saved.balance || INITIAL_BALANCE) + " | Positions:" + (saved.positions?.length || 0) + " | History:" + (saved.history?.length || 0) + " | hasLivePrice=false (waiting for Binance)");
       if (saved.positions?.length > 0) {
@@ -5104,6 +5159,13 @@ export default function NexusV7() {
         const remaining = Math.ceil((cooldownUntil - Date.now()) / 60000);
         console.log(`[NEXUS] ⏸ Loss cooldown: ${remaining}min remaining`);
         return; // silently skip — cooldown active
+      }
+
+      // ═══ v13.4 RAPID DIRECTION BAN — stop re-entering banned direction ═══
+      if (Brain.isDirectionBanned(aiResult.action)) {
+        const remaining = Brain.getDirectionBanRemaining(aiResult.action);
+        console.log(`[NEXUS] 🚫 Direction ban: ${aiResult.action} banned ${remaining}min (rapid SL streak)`);
+        return;
       }
 
       // ═══ DATA INTEGRITY SHIELD — Block trades on stale data ═══
@@ -5633,6 +5695,11 @@ export default function NexusV7() {
         // ═══ DEMO GUARD: Never pollute Brain with offline/demo data ═══
         const holdMins = p.entryTime ? (Date.now() - new Date(p.entryTime).getTime()) / 60000 : 0;
         if (!isDemo) Brain.recordLoss({ symbol: p.pair, action: p.side, indicators: p.indicators, loss: Math.abs(netPnl), exitReason: reason, holdMins });
+        // ═══ v13.4 RAPID DIRECTION BAN — track SL hits by direction ═══
+        if (!isDemo && reason === "Stop Loss") {
+          const banned = Brain.recordSLHit(p.side);
+          if (banned) addLog("BRAIN", `🚫 DIRECTION BAN: ${p.side} banned 20min — 3 SL hits in 30min`);
+        }
         addLog("LOSS", `${p.side} ${p.pairName} | ${fMoney(netPnl)} (${fPct(pct)}) | ${reason}${isDemo ? " [DEMO]" : ""}`);
         setConsecutiveLosses(prev => {
           const newStreak = prev + 1;
@@ -5991,7 +6058,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
       <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }}/>
-      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13.3 | 140 IQ ENGINE | LOADING</div>
+      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13.4 | 140 IQ ENGINE | LOADING</div>
     </div>
   );
 
@@ -6005,7 +6072,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13.3 IQ</div>
+            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13.4 IQ</div>
             <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>140 IQ | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
@@ -7024,7 +7091,7 @@ CREATE POLICY "Allow all operations" ON nexus_data
 
         {/* CHAT WITH AI */}
         {tab === "chat" && <div style={S.card}>
-          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13.3</div>
+          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13.4</div>
           <div style={{ fontSize: 9, color: K.txD, marginBottom: 14 }}>Ask why it stopped, give commands, or ask anything about the market.</div>
 
           {/* Quick command buttons */}
