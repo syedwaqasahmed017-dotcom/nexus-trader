@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v13.5 — SL floor + LLM doctrine upgrade — AI knows when to enter, hold & exit (Apr 10 2026)
+// NEXUS v13.5 — Token-efficient LLM + Gemini primary + situational alerts (Apr 10 2026)
 // ✦ v13.4 FIX 1: SL floor raised 1.0% → 1.5% — 1% was still inside BTC noise band
 // ✦ v13.4 FIX 2: Rapid direction-ban — 3 SL hits in 30min bans that direction for 20min
 // ✦ v13.4 FIX 3: Brain records directionBan timestamp per action on rapid-SL streak
@@ -1237,8 +1237,8 @@ const LLMEngine = {
   _modelIdx: 0,
 
   _providers: {
-    groq: { name: "Groq", model: "llama-3.3-70b-versatile", fallback: "llama-3.1-8b-instant", minInterval: 45000 },
-    gemini: { name: "Gemini", model: "gemini-2.0-flash-lite", fallback: "gemini-2.0-flash", minInterval: 60000 },
+    groq: { name: "Groq", model: "llama-3.3-70b-versatile", fallback: "llama-3.1-8b-instant", minInterval: 120000 },
+    gemini: { name: "Gemini", model: "gemini-2.0-flash-lite", fallback: "gemini-2.0-flash", minInterval: 90000 },
   },
 
   // Adaptive interval based on market state
@@ -1286,73 +1286,51 @@ const LLMEngine = {
       const ind = aiResult?.indicators || {};
       const fg = fgData || {};
       const macro = macroData || {};
-      const mtf = mtfData && mtfData.combined && mtfData.combined.valid ? mtfData.combined : null;
-      const mtfStr = mtf ? `MTF:${mtf.trend} ${mtf.strength}% ${mtf.aligned?"ALIGNED":"MIXED"} (${(mtfData.combined.details||[]).map(d=>`${d.tf}:${d.dir}`).join(" ")})` : "MTF:loading";
+      const mtf = mtfData?.combined?.valid ? mtfData.combined : null;
+      const mtfStr = mtf ? `${mtf.trend} ${mtf.strength}% ${mtf.aligned?"ALIGNED":"mixed"}` : "loading";
       const fundSig = FundingRateEngine.getSignal(symbol);
-      const fundStr = fundSig.live ? `Fund:${fundSig.crowded} rate=${(fundSig.rate*100).toFixed(3)}%` : "Fund:unavailable";
       const obData = OrderBookEngine._cache[symbol];
-      const obStr = obData?.live ? `OrderBook:${obData.pressure} imbalance=${(obData.imbalance*100).toFixed(0)}%` : "OrderBook:unavailable";
       const allWins = (history||[]).filter(h=>h.net>0).length;
       const allLoss = (history||[]).filter(h=>h.net<=0).length;
       const overallWR = allWins+allLoss > 0 ? ((allWins/(allWins+allLoss))*100).toFixed(0) : "?";
-      const regime = aiResult?.analysis?.regime || "unknown";
-      const rsi = ind.rsi?.toFixed(1) || "?";
-      const macd = ind.macd?.toFixed(2) || "?";
-      const bbPos = ind.bbPos?.toFixed(2) || "?";
-      const volR = ind.volRatio?.toFixed(2) || "?";
-      const atrPct = ind.atrPct?.toFixed(2) || "?";
-      const ema9vs21 = currentPrice > (ind.ema9||0) && (ind.ema9||0) > (ind.ema21||0) ? "BULL_STACK" : currentPrice < (ind.ema9||0) && (ind.ema9||0) < (ind.ema21||0) ? "BEAR_STACK" : "MIXED";
-      const candlePattern = aiResult?.analysis?.candlePattern || "none";
-      const signal = aiResult?.action || "WAIT";
-      const conf = aiResult?.confidence?.toFixed(0) || 0;
-      const reasons = (aiResult?.reasons||[]).slice(0,4).join(" | ");
-
-      // Situational flags for LLM reasoning
-      const rsiNum = parseFloat(rsi);
-      const volRNum = parseFloat(volR);
-      const fgNum = parseInt(fg.value) || 50;
+      const rsi = parseFloat(ind.rsi?.toFixed(1)) || 50;
+      const volR = parseFloat(ind.volRatio?.toFixed(2)) || 1;
+      const fgVal = parseInt(fg.value) || 50;
       const fundRate = fundSig.live ? fundSig.rate * 100 : 0;
       const obImb = obData?.live ? obData.imbalance * 100 : 0;
-      const mtfBull = mtf?.trend === "bullish";
-      const mtfBear = mtf?.trend === "bearish";
-      const mtfAligned = mtf?.aligned;
-      const situations = [];
-      if (rsiNum > 72) situations.push("RSI OVERBOUGHT — LONG risky, short setup forming");
-      if (rsiNum < 28) situations.push("RSI OVERSOLD — SHORT risky, long setup forming");
-      if (rsiNum >= 45 && rsiNum <= 60 && mtfBull) situations.push("RSI in ideal LONG zone with bullish MTF");
-      if (rsiNum >= 40 && rsiNum <= 55 && mtfBear) situations.push("RSI in ideal SHORT zone with bearish MTF");
-      if (volRNum > 2.0) situations.push("VOLUME SURGE — breakout/breakdown likely imminent");
-      if (volRNum < 0.7) situations.push("LOW VOLUME — avoid entries, false moves likely");
-      if (fgNum < 25) situations.push("EXTREME FEAR — historically good dip-buy zone");
-      if (fgNum > 80) situations.push("EXTREME GREED — longs dangerous, fade rallies");
-      if (fundRate > 0.05) situations.push("HIGH FUNDING (crowded longs) — squeeze risk, SHORT has edge");
-      if (fundRate < -0.03) situations.push("NEGATIVE FUNDING (crowded shorts) — squeeze risk, LONG has edge");
-      if (Math.abs(obImb) > 25) situations.push(`ORDER BOOK ${obImb>0?"BUY":"SELL"} PRESSURE ${Math.abs(obImb).toFixed(0)}% — trade ${obImb>0?"WITH":"AGAINST"} if confirmed`);
-      if (mtfAligned && mtfBull && signal === "LONG") situations.push("MTF ALIGNED BULL + signal LONG — highest confidence setup");
-      if (mtfAligned && mtfBear && signal === "SHORT") situations.push("MTF ALIGNED BEAR + signal SHORT — highest confidence setup");
-      if (mtfBull && signal === "SHORT") situations.push("MTF BULLISH vs signal SHORT — conflict, lower confidence");
-      if (mtfBear && signal === "LONG") situations.push("MTF BEARISH vs signal LONG — conflict, lower confidence");
-      if (consLosses >= 3) situations.push(`${consLosses} CONSECUTIVE LOSSES — require stronger evidence before entry`);
-      if (ema9vs21 === "BULL_STACK") situations.push("EMA stack BULLISH — trend momentum up");
-      if (ema9vs21 === "BEAR_STACK") situations.push("EMA stack BEARISH — trend momentum down");
-      if (regime === "trending") situations.push("TRENDING market — trade with momentum, wider stops valid");
-      if (regime === "ranging") situations.push("RANGING market — fade extremes, tight TP, avoid chasing");
-      if (regime === "volatile") situations.push("VOLATILE market — reduce conviction, wait for cleaner setup");
-      const situationStr = situations.length > 0 ? situations.join("\n- ") : "No special conditions detected";
+      const ema = currentPrice > (ind.ema9||0) && (ind.ema9||0) > (ind.ema21||0) ? "BULL" : currentPrice < (ind.ema9||0) && (ind.ema9||0) < (ind.ema21||0) ? "BEAR" : "MIX";
+      const mtfBull = mtf?.trend === "bullish", mtfBear = mtf?.trend === "bearish";
 
-      return `MARKET: ${symbol} @ $${currentPrice.toFixed(0)} | Regime:${regime} | ATR:${atrPct}%
-TECH: RSI=${rsi} MACD=${macd} EMA=${ema9vs21} BB=${bbPos}% Vol=${volR}x Pattern:${candlePattern}
-MULTI-TF: ${mtfStr}
-SENTIMENT: F&G=${fg.value||"?"}(${fg.label||"?"}) Reddit=${redditData?.label||"?"} Macro=${macro.regime||"?"}
-FLOW: ${fundStr} | ${obStr}
-BOT STATE: RuleSignal=${signal}@${conf}% | Recent=${recentWins}W/${recentLosses}L(${consLosses}consec losses) | AllTime=${overallWR}%WR | Bal=$${balance?.toFixed(0)||100}
-RULE REASONS: ${reasons}
+      // Pre-compute situational alerts — LLM gets context, not raw numbers
+      const alerts = [];
+      if (rsi > 72) alerts.push("RSI_OVERBOUGHT→avoid_LONG");
+      if (rsi < 28) alerts.push("RSI_OVERSOLD→avoid_SHORT");
+      if (rsi >= 44 && rsi <= 62 && mtfBull) alerts.push("RSI+MTF_BULL_ALIGNED→LONG_edge");
+      if (rsi >= 38 && rsi <= 56 && mtfBear) alerts.push("RSI+MTF_BEAR_ALIGNED→SHORT_edge");
+      if (volR > 2.0) alerts.push("VOL_SURGE→breakout_likely");
+      if (volR < 0.7) alerts.push("LOW_VOL→skip_entry");
+      if (fgVal < 25) alerts.push("EXTREME_FEAR→LONG_bias");
+      if (fgVal > 80) alerts.push("EXTREME_GREED→SHORT_bias");
+      if (fundRate > 0.05) alerts.push("HIGH_FUNDING→longs_squeezed→SHORT_edge");
+      if (fundRate < -0.03) alerts.push("NEG_FUNDING→shorts_squeezed→LONG_edge");
+      if (Math.abs(obImb) > 25) alerts.push(`BOOK_${obImb>0?"BUY":"SELL"}_PRESSURE_${Math.abs(obImb).toFixed(0)}pct`);
+      if (mtf?.aligned && mtfBull && aiResult?.action==="LONG") alerts.push("MTF_CONFIRMED_LONG→high_prob");
+      if (mtf?.aligned && mtfBear && aiResult?.action==="SHORT") alerts.push("MTF_CONFIRMED_SHORT→high_prob");
+      if (mtfBull && aiResult?.action==="SHORT") alerts.push("MTF_BULL_vs_SHORT→conflict→lower_conf");
+      if (mtfBear && aiResult?.action==="LONG") alerts.push("MTF_BEAR_vs_LONG→conflict→lower_conf");
+      if (consLosses >= 3) alerts.push(`${consLosses}x_CONSEC_LOSS→require_stronger_signal`);
 
-ACTIVE CONDITIONS:
-- ${situationStr}
+      const signal = aiResult?.action || "WAIT";
+      const conf = aiResult?.confidence?.toFixed(0) || 0;
+      const reasons = (aiResult?.reasons||[]).slice(0,3).join("|");
 
-REQUIRED OUTPUT — respond ONLY with this JSON (no other text):
-{"action":"LONG|SHORT|WAIT","confidence":0-100,"reasoning":"specific 1-sentence citing key indicators","risks":"main risk in 4-6 words","conviction":"HIGH|MEDIUM|LOW","override":false,"adjustConfidence":-20_to_20}`;
+      return `BTC $${currentPrice.toFixed(0)} RSI=${rsi} EMA=${ema} MACD=${ind.macd?.toFixed(2)||"?"} BB=${ind.bbPos?.toFixed(1)||"?"}% Vol=${volR}x ATR=${ind.atrPct?.toFixed(2)||"?"}% Pattern=${aiResult?.analysis?.candlePattern||"none"}
+MTF=${mtfStr} F&G=${fgVal}(${fg.label||"?"}) Macro=${macro.regime||"?"} Regime=${aiResult?.analysis?.regime||"?"}
+${fundSig.live?`Fund:${fundSig.crowded} ${fundRate.toFixed(3)}%`:"Fund:?"} ${obData?.live?`Book:${obData.pressure} ${obImb.toFixed(0)}%`:"Book:?"}
+RuleEngine=${signal}@${conf}% | ${recentWins}W/${recentLosses}L(${consLosses}consec) AllTime=${overallWR}%WR Bal=$${balance?.toFixed(0)||100}
+Reasons:${reasons}
+Alerts:${alerts.length?alerts.join(" "):"-"}
+{"action":"LONG|SHORT|WAIT","confidence":0-100,"reasoning":"1 sentence","risks":"3-5 words","conviction":"HIGH|MEDIUM|LOW","override":false,"adjustConfidence":-20_to_20}`;
     } catch { return null; }
   },
 
@@ -1363,56 +1341,7 @@ REQUIRED OUTPUT — respond ONLY with this JSON (no other text):
     const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
-      body: JSON.stringify({ model, messages: [{ role: "system", content: `You are NEXUS, an elite Bitcoin trading AI with 10 years of experience. You analyze market conditions and decide: LONG, SHORT, or WAIT. Respond ONLY with valid JSON.
-
-ENTRY RULES — Only signal LONG/SHORT when multiple conditions align:
-- Trend: EMA BULL_STACK = bullish bias. EMA BEAR_STACK = bearish bias. MIXED = no clear trend, require other strong signals.
-- Momentum: RSI 42-62 ideal for LONG. RSI 38-58 ideal for SHORT. RSI>72 = overbought (avoid LONG). RSI<28 = oversold (avoid SHORT).
-- Volume: >1.5x average confirms move. <0.8x = low conviction, avoid entries.
-- MTF: ALIGNED means all timeframes agree — this is the strongest entry filter. If MTF says BULLISH ALIGNED, only take LONGs. If BEARISH ALIGNED, only take SHORTs. MIXED = proceed cautiously.
-- MACD: Positive and rising = bullish momentum. Negative and falling = bearish. Crossing zero = strong signal.
-
-WHEN TO SIGNAL LONG: EMA bullish + RSI in ideal zone + MTF bullish + volume normal/high + MACD positive or crossing up. Add weight for: extreme fear F&G, negative funding rate, strong buy order book pressure.
-WHEN TO SIGNAL SHORT: EMA bearish + RSI in ideal zone + MTF bearish + volume normal/high + MACD negative or crossing down. Add weight for: extreme greed F&G, high positive funding (crowded longs), strong sell book pressure.
-WHEN TO SIGNAL WAIT: MTF conflicts with signal. Volume too low. RSI at extreme vs signal direction. Regime is volatile with no clear setup. Recent 3+ consecutive losses (require stronger signal). Ranging market without clear extreme.
-
-CONFIDENCE CALIBRATION — Do NOT inflate. Real market signals:
-- 25-34%: Marginal setup, weak signal, many conflicts → signal but low confidence
-- 35-50%: Decent setup, some alignment → standard trade
-- 51-65%: Strong setup, multiple confirming signals → good trade
-- 66-75%: Excellent setup, near-perfect alignment → high priority
-- 76-100%: RARE. Only for perfect storm: MTF ALIGNED + ideal RSI + volume surge + confirming sentiment. Do not use casually.
-
-CONVICTION LEVELS:
-- HIGH: 3+ timeframes aligned, RSI ideal, volume surge, sentiment confirms. Use sparingly.
-- MEDIUM: 2 timeframes agree, decent momentum, minor conflicts.
-- LOW: Conflicting signals, unclear trend, or marginal setup.
-
-MARKET REGIME ADAPTATION:
-- Trending: Trade with momentum. Wider expected moves. Trail profits.
-- Ranging: Fade extremes only (RSI at edges). Tight TP. Don't chase breakouts.
-- Volatile: Reduce conviction. Wait for clear rejection/confirmation candles. Avoid chasing.
-
-SPECIAL CONDITIONS (read from ACTIVE CONDITIONS in user message):
-- High funding rate (crowded longs): Longs at risk of liquidation cascade → SHORT has structural edge
-- Negative funding: Shorts overcrowded → LONG has structural edge
-- Extreme fear F&G <25: Historically strong dip-buy zone → LONG bias
-- Extreme greed F&G >80: Historically strong fade zone → SHORT bias or WAIT
-- Order book imbalance >20%: Institutional pressure — trade WITH it if confirmed by other signals
-- Volume surge >2x: Confirms breakout direction, raise confidence in that direction
-- Consecutive losses 3+: Market conditions may have shifted. Require extra confirmation before entry.
-
-EXIT INTELLIGENCE (for adjustConfidence field):
-- If a setup looks good but you have concerns, use adjustConfidence: -10 to -15 to soften the signal
-- If the setup is cleaner than the rule engine score suggests, use adjustConfidence: +5 to +10
-- If you would normally WAIT but conditions clearly favor one direction, use override:true sparingly
-
-CORE PRINCIPLES:
-1. A missed trade is better than a bad trade.
-2. The trend is your friend until it ends — confirm before fading.
-3. Volume confirms price. No volume = no conviction.
-4. Never fight MTF ALIGNED signal. It represents multi-timeframe institutional consensus.
-5. Fees are 0.4% round trip. The trade must have >0.6% expected move to be worth taking.` }, { role: "user", content: prompt }], temperature: 0.25, max_tokens: 300, response_format: { type: "json_object" } }),
+      body: JSON.stringify({ model, messages: [{ role: "system", content: "You are NEXUS, a BTC trading AI. Rules: LONG when EMA BULL+RSI 44-62+MTF bullish+vol>1x. SHORT when EMA BEAR+RSI 38-56+MTF bearish+vol>1x. WAIT when MTF conflicts, vol<0.8x, RSI extreme vs direction, or no clear setup. Confidence: 35-50=decent, 51-65=strong, 66-75=excellent, 76+=rare perfect storm only. HIGH conviction=3+TFs aligned+ideal RSI+vol surge. Fee=0.4%RT, need >0.6% move. Read Alerts field — they are pre-computed signals, use them. Respond ONLY valid JSON." }, { role: "user", content: prompt }], temperature: 0.25, max_tokens: 150, response_format: { type: "json_object" } }),
     });
     if (!res.ok) {
       const errBody = await res.text().catch(() => "");
@@ -1429,31 +1358,7 @@ CORE PRINCIPLES:
     const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ systemInstruction: { parts: [{ text: `You are NEXUS, an elite Bitcoin trading AI. Respond ONLY with valid JSON, no markdown.
-
-ENTRY RULES — Only signal LONG/SHORT when multiple conditions align:
-- Trend: EMA BULL_STACK = bullish. EMA BEAR_STACK = bearish. MIXED = no clear trend.
-- Momentum: RSI 42-62 ideal for LONG. RSI 38-58 ideal for SHORT. RSI>72 = overbought (avoid LONG). RSI<28 = oversold (avoid SHORT).
-- Volume: >1.5x confirms move. <0.8x = avoid entries.
-- MTF ALIGNED: strongest filter — only trade in that direction. MIXED = proceed cautiously.
-- MACD: positive+rising = bullish. negative+falling = bearish.
-
-WHEN TO LONG: EMA bullish + RSI ideal + MTF bullish + volume normal/high + MACD positive. Bonus: extreme fear, negative funding, buy book pressure.
-WHEN TO SHORT: EMA bearish + RSI ideal + MTF bearish + volume normal/high + MACD negative. Bonus: extreme greed, high positive funding, sell book pressure.
-WHEN TO WAIT: MTF conflicts with signal. Volume too low. RSI extreme vs signal direction. Volatile regime. 3+ consecutive losses requiring stronger signal. Ranging market at midpoint.
-
-CONFIDENCE: 25-34%=marginal, 35-50%=decent, 51-65%=strong, 66-75%=excellent, 76-100%=rare/perfect storm only. Do NOT inflate.
-CONVICTION: HIGH=3+ TFs aligned+ideal RSI+volume surge. MEDIUM=2 TFs+decent momentum. LOW=conflicting/unclear.
-
-SPECIAL CONDITIONS (from ACTIVE CONDITIONS in message):
-- High funding = crowded longs, squeeze risk, SHORT edge
-- Negative funding = crowded shorts, LONG edge
-- F&G <25 = extreme fear, LONG bias. F&G >80 = extreme greed, SHORT bias
-- Book imbalance >20% = trade with institutional pressure
-- Volume >2x = confirms breakout direction
-- 3+ consecutive losses = require extra confirmation
-
-PRINCIPLES: Missed trade > bad trade. Volume confirms price. Never fight MTF ALIGNED. Fees=0.4%RT, need >0.6% move.` }] }, contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.25, maxOutputTokens: 300 } }),
+      body: JSON.stringify({ systemInstruction: { parts: [{ text: "You are NEXUS, a BTC trading AI. Rules: LONG when EMA BULL+RSI 44-62+MTF bullish+vol>1x. SHORT when EMA BEAR+RSI 38-56+MTF bearish+vol>1x. WAIT when MTF conflicts, vol<0.8x, RSI extreme vs direction, or no clear setup. Confidence: 35-50=decent, 51-65=strong, 66-75=excellent, 76+=rare only. HIGH conviction=3+TFs aligned+ideal RSI+vol surge. Fee=0.4%RT need >0.6% move. Read Alerts field — pre-computed signals. Respond ONLY valid JSON." }] }, contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.25, maxOutputTokens: 150 } }),
     });
     if (!res.ok) throw { code: res.status, provider: "gemini" };
     const data = await res.json();
@@ -1491,15 +1396,15 @@ PRINCIPLES: Missed trade > bad trade. Volume confirms price. Never fight MTF ALI
       this._lastCall = now;
       let result = null;
 
-      // Try Groq first (30 RPM, 14,400/day — 6x more generous)
-      if (hasGroq && this._quotaHits.groq < 3 && !this._keyInvalid.groq) {
-        try { result = await this._callGroq(prompt, groqKey); this._provider = "groq"; this._quotaHits.groq = 0; }
-        catch (e) { if (e.code === 401 || e.code === 403) { this._keyInvalid.groq = true; this._lastError = "Groq key invalid - update in Settings"; console.error("Groq key invalid (" + e.code + ") - stopped retrying"); } else if (e.code === 429) this._quotaHits.groq++; }
-      }
-      // Fallback to Gemini (15 RPM, 1,500/day)
-      if (!result && hasGemini && this._quotaHits.gemini < 3 && !this._keyInvalid.gemini) {
+      // Try Gemini first (token-free quota, no TPD limit on free tier)
+      if (hasGemini && this._quotaHits.gemini < 3 && !this._keyInvalid.gemini) {
         try { result = await this._callGemini(prompt, geminiKey); this._provider = "gemini"; this._quotaHits.gemini = 0; }
-        catch (e) { if (e.code === 401 || e.code === 403) { this._keyInvalid.gemini = true; this._lastError = "Gemini key invalid - update in Settings"; console.error("Gemini key invalid (" + e.code + ") - stopped retrying"); } else if (e.code === 429) this._quotaHits.gemini++; }
+        catch (e) { if (e.code === 401 || e.code === 403) { this._keyInvalid.gemini = true; this._lastError = "Gemini key invalid - update in Settings"; console.error("Gemini key invalid (" + e.code + ") - stopped retrying"); } else if (e.code === 429) { this._quotaHits.gemini++; console.warn("[NEXUS] Gemini 429 — trying Groq fallback"); } }
+      }
+      // Fallback to Groq (100k TPD — use sparingly)
+      if (!result && hasGroq && this._quotaHits.groq < 3 && !this._keyInvalid.groq) {
+        try { result = await this._callGroq(prompt, groqKey); this._provider = "groq"; this._quotaHits.groq = 0; }
+        catch (e) { if (e.code === 401 || e.code === 403) { this._keyInvalid.groq = true; this._lastError = "Groq key invalid - update in Settings"; console.error("Groq key invalid (" + e.code + ") - stopped retrying"); } else if (e.code === 429) { this._quotaHits.groq++; console.warn("[NEXUS] Groq 429 — both providers rate-limited"); } }
       }
 
       if (!result) {
@@ -5545,27 +5450,17 @@ export default function NexusV7() {
           );
           const mtfAlignedAgainst = mtfAgainst && mtfCombined.aligned;
 
-          // === STALE RECOVERY EXIT v13.5: held 6h+, price returned near entry — close instead of risking another SL ===
-          // Pattern: trade drifts for hours, recovers to within ±0.3% of entry → close near-BE, free capital
-          if (holdMins > 360 && pnlPct >= -0.3 && pnlPct < 0.5 && !p._partialTaken) {
-            addLog("AI", `STALE RECOVERY: ${p.side} ${p.pairName} ${pnlPct.toFixed(2)}% after ${Math.round(holdMins)}min — recovered to entry, closing near-BE`);
-            console.log(`[NEXUS] 🔁 STALE RECOVERY EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(2)}% held ${Math.round(holdMins)}min`);
-            closeTrade(p, price, "Stale Recovery (near BE)");
-            changed = true;
-            return false;
-          }
-
-          // === TRAIL TO BREAKEVEN === v13.5: stale positions (4h+) get BE trail at 0.5% instead of waiting for 2-3%
-          const beThreshold = holdMins > 240 ? 0.5 : mtfAgainst ? 2.0 : 3.0;
+          // === TRAIL TO BREAKEVEN === v11: widened thresholds to prevent premature BE stops
+          const beThreshold = mtfAgainst ? 2.0 : 3.0; // v11: was 1.2/2.0 — too tight, noise hit BE instantly
           if (pnlPct > beThreshold && p.sl) {
             // v11: Add 0.3% buffer above breakeven so normal noise doesn't trigger it
             const beFee = p.cost * FEE_RATE * 2 / p.qty;
-            const beBuffer = holdMins > 240 ? p.entry * 0.001 : p.entry * 0.003; // tighter buffer for stale
+            const beBuffer = p.entry * 0.003; // 0.3% breathing room above BE
             const be = p.side === "LONG" 
               ? p.entry + beFee + beBuffer
               : p.entry - beFee - beBuffer;
-            if (p.side === "LONG" && p.sl < be) { p.sl = be; addLog("AI", `Trail SL to breakeven${holdMins > 240 ? " (stale, locking BE early)" : mtfAgainst ? " (MTF opposing)" : ""} ${p.pairName}`); console.log(`[NEXUS] 🔄 TRAIL BE: ${p.pairName} SL→$${be.toFixed(2)}`); }
-            if (p.side === "SHORT" && p.sl > be) { p.sl = be; addLog("AI", `Trail SL to breakeven${holdMins > 240 ? " (stale, locking BE early)" : mtfAgainst ? " (MTF opposing)" : ""} ${p.pairName}`); console.log(`[NEXUS] 🔄 TRAIL BE: ${p.pairName} SL→$${be.toFixed(2)}`); }
+            if (p.side === "LONG" && p.sl < be) { p.sl = be; addLog("AI", `Trail SL to breakeven+buffer ${p.pairName}${mtfAgainst ? " (MTF opposing)" : ""}`); console.log(`[NEXUS] 🔄 TRAIL BE: ${p.pairName} SL→$${be.toFixed(2)} (with 0.3% buffer)`); }
+            if (p.side === "SHORT" && p.sl > be) { p.sl = be; addLog("AI", `Trail SL to breakeven+buffer ${p.pairName}${mtfAgainst ? " (MTF opposing)" : ""}`); console.log(`[NEXUS] 🔄 TRAIL BE: ${p.pairName} SL→$${be.toFixed(2)} (with 0.3% buffer)`); }
           }
 
           // === PROFIT TRAILING === v13: tighter trail on confirmed moves, let winners breathe
