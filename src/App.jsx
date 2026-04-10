@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v13.4 — SL floor raised + rapid direction-ban learning (Apr 9 2026)
+// NEXUS v13.5 — SL floor + LLM doctrine upgrade — AI knows when to enter, hold & exit (Apr 10 2026)
 // ✦ v13.4 FIX 1: SL floor raised 1.0% → 1.5% — 1% was still inside BTC noise band
 // ✦ v13.4 FIX 2: Rapid direction-ban — 3 SL hits in 30min bans that direction for 20min
 // ✦ v13.4 FIX 3: Brain records directionBan timestamp per action on rapid-SL streak
@@ -1282,13 +1282,14 @@ const LLMEngine = {
       const recent = (history || []).slice(0, 10);
       const recentWins = recent.filter(h => h.net > 0).length;
       const recentLosses = recent.filter(h => h.net <= 0).length;
+      const consLosses = (() => { let c=0; for(const h of recent){ if(h.net<=0) c++; else break; } return c; })();
       const ind = aiResult?.indicators || {};
       const fg = fgData || {};
       const macro = macroData || {};
       const mtf = mtfData && mtfData.combined && mtfData.combined.valid ? mtfData.combined : null;
-      const mtfStr = mtf ? `MTF:${mtf.trend} ${mtf.strength}% ${mtf.aligned?"ALIGNED":""} (${(mtfData.combined.details||[]).map(d=>`${d.tf}:${d.dir}`).join(" ")})` : "MTF:loading";
+      const mtfStr = mtf ? `MTF:${mtf.trend} ${mtf.strength}% ${mtf.aligned?"ALIGNED":"MIXED"} (${(mtfData.combined.details||[]).map(d=>`${d.tf}:${d.dir}`).join(" ")})` : "MTF:loading";
       const fundSig = FundingRateEngine.getSignal(symbol);
-      const fundStr = fundSig.live ? `Fund:${fundSig.crowded} rate=${( fundSig.rate*100).toFixed(3)}%` : "Fund:unavailable";
+      const fundStr = fundSig.live ? `Fund:${fundSig.crowded} rate=${(fundSig.rate*100).toFixed(3)}%` : "Fund:unavailable";
       const obData = OrderBookEngine._cache[symbol];
       const obStr = obData?.live ? `OrderBook:${obData.pressure} imbalance=${(obData.imbalance*100).toFixed(0)}%` : "OrderBook:unavailable";
       const allWins = (history||[]).filter(h=>h.net>0).length;
@@ -1306,19 +1307,52 @@ const LLMEngine = {
       const conf = aiResult?.confidence?.toFixed(0) || 0;
       const reasons = (aiResult?.reasons||[]).slice(0,4).join(" | ");
 
-      return `You are an elite BTC futures trader with 10 years experience. Analyze this setup and respond ONLY with valid JSON.
+      // Situational flags for LLM reasoning
+      const rsiNum = parseFloat(rsi);
+      const volRNum = parseFloat(volR);
+      const fgNum = parseInt(fg.value) || 50;
+      const fundRate = fundSig.live ? fundSig.rate * 100 : 0;
+      const obImb = obData?.live ? obData.imbalance * 100 : 0;
+      const mtfBull = mtf?.trend === "bullish";
+      const mtfBear = mtf?.trend === "bearish";
+      const mtfAligned = mtf?.aligned;
+      const situations = [];
+      if (rsiNum > 72) situations.push("RSI OVERBOUGHT — LONG risky, short setup forming");
+      if (rsiNum < 28) situations.push("RSI OVERSOLD — SHORT risky, long setup forming");
+      if (rsiNum >= 45 && rsiNum <= 60 && mtfBull) situations.push("RSI in ideal LONG zone with bullish MTF");
+      if (rsiNum >= 40 && rsiNum <= 55 && mtfBear) situations.push("RSI in ideal SHORT zone with bearish MTF");
+      if (volRNum > 2.0) situations.push("VOLUME SURGE — breakout/breakdown likely imminent");
+      if (volRNum < 0.7) situations.push("LOW VOLUME — avoid entries, false moves likely");
+      if (fgNum < 25) situations.push("EXTREME FEAR — historically good dip-buy zone");
+      if (fgNum > 80) situations.push("EXTREME GREED — longs dangerous, fade rallies");
+      if (fundRate > 0.05) situations.push("HIGH FUNDING (crowded longs) — squeeze risk, SHORT has edge");
+      if (fundRate < -0.03) situations.push("NEGATIVE FUNDING (crowded shorts) — squeeze risk, LONG has edge");
+      if (Math.abs(obImb) > 25) situations.push(`ORDER BOOK ${obImb>0?"BUY":"SELL"} PRESSURE ${Math.abs(obImb).toFixed(0)}% — trade ${obImb>0?"WITH":"AGAINST"} if confirmed`);
+      if (mtfAligned && mtfBull && signal === "LONG") situations.push("MTF ALIGNED BULL + signal LONG — highest confidence setup");
+      if (mtfAligned && mtfBear && signal === "SHORT") situations.push("MTF ALIGNED BEAR + signal SHORT — highest confidence setup");
+      if (mtfBull && signal === "SHORT") situations.push("MTF BULLISH vs signal SHORT — conflict, lower confidence");
+      if (mtfBear && signal === "LONG") situations.push("MTF BEARISH vs signal LONG — conflict, lower confidence");
+      if (consLosses >= 3) situations.push(`${consLosses} CONSECUTIVE LOSSES — require stronger evidence before entry`);
+      if (ema9vs21 === "BULL_STACK") situations.push("EMA stack BULLISH — trend momentum up");
+      if (ema9vs21 === "BEAR_STACK") situations.push("EMA stack BEARISH — trend momentum down");
+      if (regime === "trending") situations.push("TRENDING market — trade with momentum, wider stops valid");
+      if (regime === "ranging") situations.push("RANGING market — fade extremes, tight TP, avoid chasing");
+      if (regime === "volatile") situations.push("VOLATILE market — reduce conviction, wait for cleaner setup");
+      const situationStr = situations.length > 0 ? situations.join("\n- ") : "No special conditions detected";
 
-MARKET: ${symbol} @ $${currentPrice.toFixed(0)} | Regime: ${regime} | ATR: ${atrPct}%
-TECHNICALS: RSI=${rsi} MACD=${macd} EMA=${ema9vs21} BB=${bbPos} Vol=${volR}x
-CANDLE: ${candlePattern} | ${mtfStr}
-SENTIMENT: F&G=${fg.value||"?"}(${fg.label||"?"}) | Reddit=${redditData?.label||"?"} | Macro=${macro.regime||"?"}
-ORDERFLOW: ${fundStr} | ${obStr}
-BOT: Signal=${signal}@${conf}% | Recent=${recentWins}W/${recentLosses}L | AllTime=${overallWR}%WR | Bal=$${balance?.toFixed(0)||100}
-REASONS: ${reasons}
+      return `MARKET: ${symbol} @ $${currentPrice.toFixed(0)} | Regime:${regime} | ATR:${atrPct}%
+TECH: RSI=${rsi} MACD=${macd} EMA=${ema9vs21} BB=${bbPos}% Vol=${volR}x Pattern:${candlePattern}
+MULTI-TF: ${mtfStr}
+SENTIMENT: F&G=${fg.value||"?"}(${fg.label||"?"}) Reddit=${redditData?.label||"?"} Macro=${macro.regime||"?"}
+FLOW: ${fundStr} | ${obStr}
+BOT STATE: RuleSignal=${signal}@${conf}% | Recent=${recentWins}W/${recentLosses}L(${consLosses}consec losses) | AllTime=${overallWR}%WR | Bal=$${balance?.toFixed(0)||100}
+RULE REASONS: ${reasons}
 
-Rules: Fee=0.4%RT. Min move 0.6% to profit. Extreme funding=contrarian(longs get liquidated). Book imbal>20%=directional. MTF ALIGNED=trade with trend. RSI>75 in ranging=short opportunity. RSI<25=long opportunity. MACD cross=strong signal. Volume spike(>2x) confirms breakout.
+ACTIVE CONDITIONS:
+- ${situationStr}
 
-{"action":"LONG|SHORT|WAIT","confidence":0-100,"reasoning":"specific 1-sentence analysis citing key indicators","risks":"main risk","conviction":"HIGH|MEDIUM|LOW","override":false,"adjustConfidence":-20_to_20}`;
+REQUIRED OUTPUT — respond ONLY with this JSON (no other text):
+{"action":"LONG|SHORT|WAIT","confidence":0-100,"reasoning":"specific 1-sentence citing key indicators","risks":"main risk in 4-6 words","conviction":"HIGH|MEDIUM|LOW","override":false,"adjustConfidence":-20_to_20}`;
     } catch { return null; }
   },
 
@@ -1329,7 +1363,56 @@ Rules: Fee=0.4%RT. Min move 0.6% to profit. Extreme funding=contrarian(longs get
     const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
-      body: JSON.stringify({ model, messages: [{ role: "system", content: "You are an elite Bitcoin futures trader. Analyze setups with precision. Respond ONLY with valid JSON, no markdown, no explanation outside JSON." }, { role: "user", content: prompt }], temperature: 0.25, max_tokens: 250, response_format: { type: "json_object" } }),
+      body: JSON.stringify({ model, messages: [{ role: "system", content: `You are NEXUS, an elite Bitcoin trading AI with 10 years of experience. You analyze market conditions and decide: LONG, SHORT, or WAIT. Respond ONLY with valid JSON.
+
+ENTRY RULES — Only signal LONG/SHORT when multiple conditions align:
+- Trend: EMA BULL_STACK = bullish bias. EMA BEAR_STACK = bearish bias. MIXED = no clear trend, require other strong signals.
+- Momentum: RSI 42-62 ideal for LONG. RSI 38-58 ideal for SHORT. RSI>72 = overbought (avoid LONG). RSI<28 = oversold (avoid SHORT).
+- Volume: >1.5x average confirms move. <0.8x = low conviction, avoid entries.
+- MTF: ALIGNED means all timeframes agree — this is the strongest entry filter. If MTF says BULLISH ALIGNED, only take LONGs. If BEARISH ALIGNED, only take SHORTs. MIXED = proceed cautiously.
+- MACD: Positive and rising = bullish momentum. Negative and falling = bearish. Crossing zero = strong signal.
+
+WHEN TO SIGNAL LONG: EMA bullish + RSI in ideal zone + MTF bullish + volume normal/high + MACD positive or crossing up. Add weight for: extreme fear F&G, negative funding rate, strong buy order book pressure.
+WHEN TO SIGNAL SHORT: EMA bearish + RSI in ideal zone + MTF bearish + volume normal/high + MACD negative or crossing down. Add weight for: extreme greed F&G, high positive funding (crowded longs), strong sell book pressure.
+WHEN TO SIGNAL WAIT: MTF conflicts with signal. Volume too low. RSI at extreme vs signal direction. Regime is volatile with no clear setup. Recent 3+ consecutive losses (require stronger signal). Ranging market without clear extreme.
+
+CONFIDENCE CALIBRATION — Do NOT inflate. Real market signals:
+- 25-34%: Marginal setup, weak signal, many conflicts → signal but low confidence
+- 35-50%: Decent setup, some alignment → standard trade
+- 51-65%: Strong setup, multiple confirming signals → good trade
+- 66-75%: Excellent setup, near-perfect alignment → high priority
+- 76-100%: RARE. Only for perfect storm: MTF ALIGNED + ideal RSI + volume surge + confirming sentiment. Do not use casually.
+
+CONVICTION LEVELS:
+- HIGH: 3+ timeframes aligned, RSI ideal, volume surge, sentiment confirms. Use sparingly.
+- MEDIUM: 2 timeframes agree, decent momentum, minor conflicts.
+- LOW: Conflicting signals, unclear trend, or marginal setup.
+
+MARKET REGIME ADAPTATION:
+- Trending: Trade with momentum. Wider expected moves. Trail profits.
+- Ranging: Fade extremes only (RSI at edges). Tight TP. Don't chase breakouts.
+- Volatile: Reduce conviction. Wait for clear rejection/confirmation candles. Avoid chasing.
+
+SPECIAL CONDITIONS (read from ACTIVE CONDITIONS in user message):
+- High funding rate (crowded longs): Longs at risk of liquidation cascade → SHORT has structural edge
+- Negative funding: Shorts overcrowded → LONG has structural edge
+- Extreme fear F&G <25: Historically strong dip-buy zone → LONG bias
+- Extreme greed F&G >80: Historically strong fade zone → SHORT bias or WAIT
+- Order book imbalance >20%: Institutional pressure — trade WITH it if confirmed by other signals
+- Volume surge >2x: Confirms breakout direction, raise confidence in that direction
+- Consecutive losses 3+: Market conditions may have shifted. Require extra confirmation before entry.
+
+EXIT INTELLIGENCE (for adjustConfidence field):
+- If a setup looks good but you have concerns, use adjustConfidence: -10 to -15 to soften the signal
+- If the setup is cleaner than the rule engine score suggests, use adjustConfidence: +5 to +10
+- If you would normally WAIT but conditions clearly favor one direction, use override:true sparingly
+
+CORE PRINCIPLES:
+1. A missed trade is better than a bad trade.
+2. The trend is your friend until it ends — confirm before fading.
+3. Volume confirms price. No volume = no conviction.
+4. Never fight MTF ALIGNED signal. It represents multi-timeframe institutional consensus.
+5. Fees are 0.4% round trip. The trade must have >0.6% expected move to be worth taking.` }, { role: "user", content: prompt }], temperature: 0.25, max_tokens: 300, response_format: { type: "json_object" } }),
     });
     if (!res.ok) {
       const errBody = await res.text().catch(() => "");
@@ -1346,7 +1429,31 @@ Rules: Fee=0.4%RT. Min move 0.6% to profit. Extreme funding=contrarian(longs get
     const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.25, maxOutputTokens: 250 } }),
+      body: JSON.stringify({ systemInstruction: { parts: [{ text: `You are NEXUS, an elite Bitcoin trading AI. Respond ONLY with valid JSON, no markdown.
+
+ENTRY RULES — Only signal LONG/SHORT when multiple conditions align:
+- Trend: EMA BULL_STACK = bullish. EMA BEAR_STACK = bearish. MIXED = no clear trend.
+- Momentum: RSI 42-62 ideal for LONG. RSI 38-58 ideal for SHORT. RSI>72 = overbought (avoid LONG). RSI<28 = oversold (avoid SHORT).
+- Volume: >1.5x confirms move. <0.8x = avoid entries.
+- MTF ALIGNED: strongest filter — only trade in that direction. MIXED = proceed cautiously.
+- MACD: positive+rising = bullish. negative+falling = bearish.
+
+WHEN TO LONG: EMA bullish + RSI ideal + MTF bullish + volume normal/high + MACD positive. Bonus: extreme fear, negative funding, buy book pressure.
+WHEN TO SHORT: EMA bearish + RSI ideal + MTF bearish + volume normal/high + MACD negative. Bonus: extreme greed, high positive funding, sell book pressure.
+WHEN TO WAIT: MTF conflicts with signal. Volume too low. RSI extreme vs signal direction. Volatile regime. 3+ consecutive losses requiring stronger signal. Ranging market at midpoint.
+
+CONFIDENCE: 25-34%=marginal, 35-50%=decent, 51-65%=strong, 66-75%=excellent, 76-100%=rare/perfect storm only. Do NOT inflate.
+CONVICTION: HIGH=3+ TFs aligned+ideal RSI+volume surge. MEDIUM=2 TFs+decent momentum. LOW=conflicting/unclear.
+
+SPECIAL CONDITIONS (from ACTIVE CONDITIONS in message):
+- High funding = crowded longs, squeeze risk, SHORT edge
+- Negative funding = crowded shorts, LONG edge
+- F&G <25 = extreme fear, LONG bias. F&G >80 = extreme greed, SHORT bias
+- Book imbalance >20% = trade with institutional pressure
+- Volume >2x = confirms breakout direction
+- 3+ consecutive losses = require extra confirmation
+
+PRINCIPLES: Missed trade > bad trade. Volume confirms price. Never fight MTF ALIGNED. Fees=0.4%RT, need >0.6% move.` }] }, contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.25, maxOutputTokens: 300 } }),
     });
     if (!res.ok) throw { code: res.status, provider: "gemini" };
     const data = await res.json();
@@ -4636,7 +4743,7 @@ export default function NexusV7() {
 
   // ═══ CHAT WITH AI STATE ═══
   const [chatMessages, setChatMessages] = useState([
-    { role: "ai", text: "Hey! I'm NEXUS v13.4. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
+    { role: "ai", text: "Hey! I'm NEXUS v13.5. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
   ]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
@@ -4794,7 +4901,7 @@ export default function NexusV7() {
       console.warn(`[NEXUS] ⚠️ FALLBACK PRICE SET: $${demo.base} — SL/TP BLOCKED until live Binance price confirms (hasLivePrice=false)`);
       setChange24h((Math.random() - 0.4) * 5);
       setReady(true);
-      addLog("AI", "NEXUS v13.4 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
+      addLog("AI", "NEXUS v13.5 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
       addLog("AI", `Config: ${MAX_POSITIONS} max positions | ${MIN_STACK_DISTANCE_PCT}% min stack dist | ${MAX_TRADES_PER_SESSION} trades/session | MTF gate +3 | Dedup 15s | Gap 3s`);
       console.log("[NEXUS] 🚀 STARTUP: Balance=$" + fx(saved.balance || INITIAL_BALANCE) + " | Positions:" + (saved.positions?.length || 0) + " | History:" + (saved.history?.length || 0) + " | hasLivePrice=false (waiting for Binance)");
       if (saved.positions?.length > 0) {
@@ -5438,17 +5545,27 @@ export default function NexusV7() {
           );
           const mtfAlignedAgainst = mtfAgainst && mtfCombined.aligned;
 
-          // === TRAIL TO BREAKEVEN === v11: widened thresholds to prevent premature BE stops
-          const beThreshold = mtfAgainst ? 2.0 : 3.0; // v11: was 1.2/2.0 — too tight, noise hit BE instantly
+          // === STALE RECOVERY EXIT v13.5: held 6h+, price returned near entry — close instead of risking another SL ===
+          // Pattern: trade drifts for hours, recovers to within ±0.3% of entry → close near-BE, free capital
+          if (holdMins > 360 && pnlPct >= -0.3 && pnlPct < 0.5 && !p._partialTaken) {
+            addLog("AI", `STALE RECOVERY: ${p.side} ${p.pairName} ${pnlPct.toFixed(2)}% after ${Math.round(holdMins)}min — recovered to entry, closing near-BE`);
+            console.log(`[NEXUS] 🔁 STALE RECOVERY EXIT: ${p.side} ${p.pairName} ${pnlPct.toFixed(2)}% held ${Math.round(holdMins)}min`);
+            closeTrade(p, price, "Stale Recovery (near BE)");
+            changed = true;
+            return false;
+          }
+
+          // === TRAIL TO BREAKEVEN === v13.5: stale positions (4h+) get BE trail at 0.5% instead of waiting for 2-3%
+          const beThreshold = holdMins > 240 ? 0.5 : mtfAgainst ? 2.0 : 3.0;
           if (pnlPct > beThreshold && p.sl) {
             // v11: Add 0.3% buffer above breakeven so normal noise doesn't trigger it
             const beFee = p.cost * FEE_RATE * 2 / p.qty;
-            const beBuffer = p.entry * 0.003; // 0.3% breathing room above BE
+            const beBuffer = holdMins > 240 ? p.entry * 0.001 : p.entry * 0.003; // tighter buffer for stale
             const be = p.side === "LONG" 
               ? p.entry + beFee + beBuffer
               : p.entry - beFee - beBuffer;
-            if (p.side === "LONG" && p.sl < be) { p.sl = be; addLog("AI", `Trail SL to breakeven+buffer ${p.pairName}${mtfAgainst ? " (MTF opposing)" : ""}`); console.log(`[NEXUS] 🔄 TRAIL BE: ${p.pairName} SL→$${be.toFixed(2)} (with 0.3% buffer)`); }
-            if (p.side === "SHORT" && p.sl > be) { p.sl = be; addLog("AI", `Trail SL to breakeven+buffer ${p.pairName}${mtfAgainst ? " (MTF opposing)" : ""}`); console.log(`[NEXUS] 🔄 TRAIL BE: ${p.pairName} SL→$${be.toFixed(2)} (with 0.3% buffer)`); }
+            if (p.side === "LONG" && p.sl < be) { p.sl = be; addLog("AI", `Trail SL to breakeven${holdMins > 240 ? " (stale, locking BE early)" : mtfAgainst ? " (MTF opposing)" : ""} ${p.pairName}`); console.log(`[NEXUS] 🔄 TRAIL BE: ${p.pairName} SL→$${be.toFixed(2)}`); }
+            if (p.side === "SHORT" && p.sl > be) { p.sl = be; addLog("AI", `Trail SL to breakeven${holdMins > 240 ? " (stale, locking BE early)" : mtfAgainst ? " (MTF opposing)" : ""} ${p.pairName}`); console.log(`[NEXUS] 🔄 TRAIL BE: ${p.pairName} SL→$${be.toFixed(2)}`); }
           }
 
           // === PROFIT TRAILING === v13: tighter trail on confirmed moves, let winners breathe
@@ -6058,7 +6175,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
       <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }}/>
-      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13.4 | 140 IQ ENGINE | LOADING</div>
+      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13.5 | 140 IQ ENGINE | LOADING</div>
     </div>
   );
 
@@ -6072,7 +6189,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13.4 IQ</div>
+            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13.5 IQ</div>
             <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>140 IQ | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
@@ -7091,7 +7208,7 @@ CREATE POLICY "Allow all operations" ON nexus_data
 
         {/* CHAT WITH AI */}
         {tab === "chat" && <div style={S.card}>
-          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13.4</div>
+          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13.5</div>
           <div style={{ fontSize: 9, color: K.txD, marginBottom: 14 }}>Ask why it stopped, give commands, or ask anything about the market.</div>
 
           {/* Quick command buttons */}
