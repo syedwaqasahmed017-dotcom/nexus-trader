@@ -1237,7 +1237,7 @@ const LLMEngine = {
   _modelIdx: 0,
 
   _providers: {
-    groq: { name: "Groq", model: "llama-3.3-70b-versatile", fallback: "llama-3.1-8b-instant", minInterval: 30000 },
+    groq: { name: "Groq", model: "llama-3.3-70b-versatile", fallback: "llama-3.1-8b-instant", minInterval: 45000 },
     gemini: { name: "Gemini", model: "gemini-2.0-flash-lite", fallback: "gemini-2.0-flash", minInterval: 60000 },
   },
 
