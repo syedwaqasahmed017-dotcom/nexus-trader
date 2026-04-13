@@ -1,7 +1,12 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v13.5 — Token-efficient LLM + Gemini primary + situational alerts (Apr 10 2026)
+// NEXUS v13.6 — LLM given real veto power (Apr 13 2026)
+// ✦ v13.6 FIX 1: LLM prompt now explicitly instructs when to set override:true and use WAIT veto
+// ✦ v13.6 FIX 2: applyToDecision — LLM WAIT veto no longer requires override:true; MEDIUM+ conviction enough
+// ✦ v13.6 FIX 3: LLM WAIT veto in trade engine lowered from HIGH+70% to MEDIUM+55% (was too restrictive)
+// ✦ v13.6 FIX 4: LLM confidence adjustment range widened from ±20 to ±35 — strong disagreement actually flips trades
+// ✦ v13.6 FIX 5: MTF conflict alert now also sets adjustConfidence hint in prompt so LLM kills conflicting trades
 // ✦ v13.4 FIX 1: SL floor raised 1.0% → 1.5% — 1% was still inside BTC noise band
 // ✦ v13.4 FIX 2: Rapid direction-ban — 3 SL hits in 30min bans that direction for 20min
 // ✦ v13.4 FIX 3: Brain records directionBan timestamp per action on rapid-SL streak
@@ -1330,7 +1335,11 @@ ${fundSig.live?`Fund:${fundSig.crowded} ${fundRate.toFixed(3)}%`:"Fund:?"} ${obD
 RuleEngine=${signal}@${conf}% | ${recentWins}W/${recentLosses}L(${consLosses}consec) AllTime=${overallWR}%WR Bal=$${balance?.toFixed(0)||100}
 Reasons:${reasons}
 Alerts:${alerts.length?alerts.join(" "):"-"}
-{"action":"LONG|SHORT|WAIT","confidence":0-100,"reasoning":"1 sentence","risks":"3-5 words","conviction":"HIGH|MEDIUM|LOW","override":false,"adjustConfidence":-20_to_20}`;
+YOU HAVE REAL VETO POWER. If RuleEngine says LONG/SHORT but you disagree, say action:WAIT. Your WAIT overrides the rule engine if conviction is MEDIUM or HIGH.
+Set action:WAIT when: trend is clearly against the trade | MTF conflict present | consec losses≥3 in same direction | RSI overbought on LONG or oversold on SHORT | macro bearish on LONG.
+Set override:true when you strongly disagree with RuleEngine direction or want to force a trade the rules missed.
+Use adjustConfidence: negative (-10 to -35) to weaken bad signals, positive to strengthen good ones. -35 will cancel a trade below MIN_CONF threshold.
+{"action":"LONG|SHORT|WAIT","confidence":0-100,"reasoning":"1 sentence","risks":"3-5 words","conviction":"HIGH|MEDIUM|LOW","override":false,"adjustConfidence":-35_to_35}`;
     } catch { return null; }
   },
 
@@ -1457,7 +1466,7 @@ Alerts:${alerts.length?alerts.join(" "):"-"}
         risks: String(json.risks || "").slice(0, 300),
         conviction: ["HIGH", "MEDIUM", "LOW"].includes(json.conviction) ? json.conviction : "LOW",
         override: Boolean(json.override),
-        adjustConfidence: clamp(Number(json.adjustConfidence) || 0, -20, 20),
+        adjustConfidence: clamp(Number(json.adjustConfidence) || 0, -35, 35),
       };
     } catch { return null; }
   },
@@ -1467,11 +1476,17 @@ Alerts:${alerts.length?alerts.join(" "):"-"}
       if (!llmResult || !aiResult) return aiResult;
       const modified = { ...aiResult };
       if (llmResult.adjustConfidence) modified.confidence = clamp(modified.confidence + llmResult.adjustConfidence, 0, 95);
-      if (llmResult.override) {
-        if (llmResult.action === "WAIT" && modified.action !== "WAIT") {
-          modified.action = "WAIT";
-          modified.reasons = ["LLM VETO: " + llmResult.reasoning, ...modified.reasons];
-        } else if (modified.action === "WAIT" && llmResult.action !== "WAIT" && llmResult.confidence >= 75 && llmResult.conviction === "HIGH") {
+      // v13.6: LLM WAIT veto — no longer requires override:true; MEDIUM+ conviction at 55%+ is enough
+      // LLM sees trend context rules miss — if it says WAIT/disagrees strongly, trust it
+      const llmWantsWait = llmResult.action === "WAIT";
+      const llmConvictionOk = llmResult.conviction === "HIGH" || llmResult.conviction === "MEDIUM";
+      const llmConfOk = (llmResult.confidence || 0) >= 55;
+      if (llmWantsWait && llmConvictionOk && llmConfOk && modified.action !== "WAIT") {
+        modified.action = "WAIT";
+        modified.reasons = ["LLM VETO: " + llmResult.reasoning, ...modified.reasons];
+      } else if (llmResult.override) {
+        // LLM forcing a trade direction (HIGH conv + 75%+ conf still required for this)
+        if (modified.action === "WAIT" && llmResult.action !== "WAIT" && llmResult.confidence >= 75 && llmResult.conviction === "HIGH") {
           modified.action = llmResult.action;
           modified.confidence = Math.min(llmResult.confidence, 70);
           modified.reasons = ["LLM SIGNAL: " + llmResult.reasoning, ...modified.reasons];
@@ -4648,7 +4663,7 @@ export default function NexusV7() {
 
   // ═══ CHAT WITH AI STATE ═══
   const [chatMessages, setChatMessages] = useState([
-    { role: "ai", text: "Hey! I'm NEXUS v13.5. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
+    { role: "ai", text: "Hey! I'm NEXUS v13.6. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
   ]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
@@ -4806,7 +4821,7 @@ export default function NexusV7() {
       console.warn(`[NEXUS] ⚠️ FALLBACK PRICE SET: $${demo.base} — SL/TP BLOCKED until live Binance price confirms (hasLivePrice=false)`);
       setChange24h((Math.random() - 0.4) * 5);
       setReady(true);
-      addLog("AI", "NEXUS v13.5 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
+      addLog("AI", "NEXUS v13.6 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
       addLog("AI", `Config: ${MAX_POSITIONS} max positions | ${MIN_STACK_DISTANCE_PCT}% min stack dist | ${MAX_TRADES_PER_SESSION} trades/session | MTF gate +3 | Dedup 15s | Gap 3s`);
       console.log("[NEXUS] 🚀 STARTUP: Balance=$" + fx(saved.balance || INITIAL_BALANCE) + " | Positions:" + (saved.positions?.length || 0) + " | History:" + (saved.history?.length || 0) + " | hasLivePrice=false (waiting for Binance)");
       if (saved.positions?.length > 0) {
@@ -5139,8 +5154,8 @@ export default function NexusV7() {
         aiResult = { ...aiResult, action: llmResult.action, confidence: Math.max(aiResult.confidence, llmResult.confidence * 0.7) };
       }
       if (!llmHighConvOverride && (aiResult.action === "WAIT" || aiResult.action === "PAUSE")) { console.log(`[NEXUS] ⏸ AI says ${aiResult.action} (conf: ${Number(aiResult.confidence).toFixed(1)}%) | Reasons: ${(aiResult.reasons||[]).slice(0,3).join('; ')}`); return; }
-      if ((geminiKey || groqKey) && llmResult?.live && llmResult.override && llmResult.action === "WAIT" && llmResult.conviction === "HIGH" && llmResult.confidence >= 70) { console.log("[NEXUS] ⏸ LLM override: WAIT (HIGH conviction " + llmResult.confidence + "%)"); return; }
-      // v10: LLM WAIT veto now requires HIGH conviction AND 70%+ confidence — was blocking too many valid trades
+      if ((geminiKey || groqKey) && llmResult?.live && llmResult.action === "WAIT" && (llmResult.conviction === "HIGH" || llmResult.conviction === "MEDIUM") && llmResult.confidence >= 55) { console.log("[NEXUS] ⏸ LLM veto: WAIT (" + llmResult.conviction + " " + llmResult.confidence + "%)"); return; }
+      // v13.6: LLM WAIT veto lowered from HIGH+70% to MEDIUM+55% — was too restrictive, LLM rarely qualified
       // ═══ POSITION STACKING GUARDS ═══
       const samePairPositions = positions.filter(p => p.pair === pair.sym);
       // Enforce minimum price distance between stacked entries
@@ -6070,7 +6085,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
       <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }}/>
-      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13.5 | 140 IQ ENGINE | LOADING</div>
+      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13.6 | 140 IQ ENGINE | LOADING</div>
     </div>
   );
 
@@ -6084,7 +6099,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13.5 IQ</div>
+            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13.6 IQ</div>
             <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>140 IQ | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
@@ -7103,7 +7118,7 @@ CREATE POLICY "Allow all operations" ON nexus_data
 
         {/* CHAT WITH AI */}
         {tab === "chat" && <div style={S.card}>
-          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13.5</div>
+          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13.6</div>
           <div style={{ fontSize: 9, color: K.txD, marginBottom: 14 }}>Ask why it stopped, give commands, or ask anything about the market.</div>
 
           {/* Quick command buttons */}
