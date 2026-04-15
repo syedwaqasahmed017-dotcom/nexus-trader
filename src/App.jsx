@@ -1,7 +1,10 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v13.6 — LLM given real veto power (Apr 13 2026)
+// NEXUS v13.7 — Direction ban now persisted across reloads/restarts (Apr 15 2026)
+// ✦ v13.7 FIX: Brain.save() now persists _directionBan + _recentSLHits to localStorage
+// ✦ v13.7 FIX: Brain.load() restores ban state on startup — ban survives Render restart
+// ✦ v13.7 FIX: brain_dir_ban + brain_sl_hits added to cloud sync keys
 // ✦ v13.6 FIX 1: LLM prompt now explicitly instructs when to set override:true and use WAIT veto
 // ✦ v13.6 FIX 2: applyToDecision — LLM WAIT veto no longer requires override:true; MEDIUM+ conviction enough
 // ✦ v13.6 FIX 3: LLM WAIT veto in trade engine lowered from HIGH+70% to MEDIUM+55% (was too restrictive)
@@ -2647,7 +2650,7 @@ const CloudSync = {
   _table: "nexus_data",
 
   // All keys that should be synced to cloud
-  _syncKeys: ["state7", "brain_losses", "brain_wins", "brain_cool", "brain_sessions", "api_settings", "ml_engine", "currentSession"],
+  _syncKeys: ["state7", "brain_losses", "brain_wins", "brain_cool", "brain_sessions", "brain_dir_ban", "brain_sl_hits", "api_settings", "ml_engine", "currentSession"],
 
   isConnected() { return !!(this._url && this._key && this._userId); },
 
@@ -3041,8 +3044,14 @@ const Brain = {
       this.wins = DB.get("brain_wins", []);
       this.coolUntil = DB.get("brain_cool", 0);
       this.sessionTrades = DB.get("brain_sessions", {});
+      // v13.7: restore direction ban state so bans survive page reload / Render restart
+      this._directionBan = DB.get("brain_dir_ban", {});
+      this._recentSLHits = DB.get("brain_sl_hits", []);
+      // Prune stale SL hits on load (outside 30min window)
+      const now = Date.now();
+      this._recentSLHits = this._recentSLHits.filter(h => now - h.ts < this.BAN_WINDOW_MS);
       this._pruneOldSessions();
-    } catch { this.losses = []; this.wins = []; this.coolUntil = 0; this.sessionTrades = {}; }
+    } catch { this.losses = []; this.wins = []; this.coolUntil = 0; this.sessionTrades = {}; this._directionBan = {}; this._recentSLHits = []; }
   },
   save() {
     try {
@@ -3051,6 +3060,9 @@ const Brain = {
       DB.set("brain_cool", this.coolUntil);
       this._pruneOldSessions();
       DB.set("brain_sessions", this.sessionTrades);
+      // v13.7: persist direction ban so it survives page reload / Render restart
+      DB.set("brain_dir_ban", this._directionBan || {});
+      DB.set("brain_sl_hits", (this._recentSLHits || []).slice(-50));
     } catch {}
   },
   _pruneOldSessions() {
@@ -4663,7 +4675,7 @@ export default function NexusV7() {
 
   // ═══ CHAT WITH AI STATE ═══
   const [chatMessages, setChatMessages] = useState([
-    { role: "ai", text: "Hey! I'm NEXUS v13.6. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
+    { role: "ai", text: "Hey! I'm NEXUS v13.7. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
   ]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
@@ -4821,7 +4833,7 @@ export default function NexusV7() {
       console.warn(`[NEXUS] ⚠️ FALLBACK PRICE SET: $${demo.base} — SL/TP BLOCKED until live Binance price confirms (hasLivePrice=false)`);
       setChange24h((Math.random() - 0.4) * 5);
       setReady(true);
-      addLog("AI", "NEXUS v13.6 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
+      addLog("AI", "NEXUS v13.7 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
       addLog("AI", `Config: ${MAX_POSITIONS} max positions | ${MIN_STACK_DISTANCE_PCT}% min stack dist | ${MAX_TRADES_PER_SESSION} trades/session | MTF gate +3 | Dedup 15s | Gap 3s`);
       console.log("[NEXUS] 🚀 STARTUP: Balance=$" + fx(saved.balance || INITIAL_BALANCE) + " | Positions:" + (saved.positions?.length || 0) + " | History:" + (saved.history?.length || 0) + " | hasLivePrice=false (waiting for Binance)");
       if (saved.positions?.length > 0) {
@@ -6085,7 +6097,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
       <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }}/>
-      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13.6 | 140 IQ ENGINE | LOADING</div>
+      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13.7 | 140 IQ ENGINE | LOADING</div>
     </div>
   );
 
@@ -6099,7 +6111,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13.6 IQ</div>
+            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13.7 IQ</div>
             <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>140 IQ | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
@@ -7118,7 +7130,7 @@ CREATE POLICY "Allow all operations" ON nexus_data
 
         {/* CHAT WITH AI */}
         {tab === "chat" && <div style={S.card}>
-          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13.6</div>
+          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13.7</div>
           <div style={{ fontSize: 9, color: K.txD, marginBottom: 14 }}>Ask why it stopped, give commands, or ask anything about the market.</div>
 
           {/* Quick command buttons */}
