@@ -1,7 +1,10 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v13.8 — Deep "Why Losses?" chat diagnostic (Apr 16 2026)
+// NEXUS v13.9 — Fix "Sorry, something went wrong" in chat loss diagnostic (Apr 16 2026)
+// ✦ v13.9 FIX: MIN_SL_PCT was local-only inside AdaptiveTPSL — caused ReferenceError
+//              in sendChat's "why losses?" handler → catch block showed generic error
+//              Fix: promoted MIN_SL_PCT to module-level constant (line 87)
 // ✦ New "📉 Why losses?" quick button in chat
 // ✦ Replaces shallow loss summary with full root-cause analysis:
 //   - Exit reason breakdown (SL hunt %, TP miss, etc.)
@@ -84,6 +87,7 @@ const COOL_AFTER_LOSS_BASE = 30000;    // v10: 30s base cooldown (was 60s — to
 const COOL_AFTER_LOSS_MAX = 180000;    // v10: 3min max cooldown (was 5min — killed momentum)
 const MAX_TRADES_PER_SESSION = 20;
 const MIN_CONF_TO_TRADE = 25; // v13.2 FIX: Was 30 — lowered to allow 25-29% conf signals through; LLM override also added
+const MIN_SL_PCT = 1.5; // v13.9 FIX: Promoted to module-level — was local-only in AdaptiveTPSL, caused ReferenceError in sendChat loss diagnostic
 // ═══ PRICE SANITY — Prevent fake PnL from stale/fallback prices ═══
 const MAX_SANE_MOVE_PCT = 8;       // Max 8% price move considered real
 const MAX_SANE_PNL_PCT = 10;       // Max 10% PnL considered real
@@ -1214,7 +1218,7 @@ const AdaptiveTPSL = {
       // v13.4: raised from 1.0% → 1.5%. Screenshot showed 6 consecutive LONGs all
       // hitting SL at 1.25-1.53%, meaning 1.0% floor was STILL inside BTC noise.
       // At $71k BTC, 1.5% = ~$1,065 wiggle room — the real noise band on 15m.
-      const MIN_SL_PCT = 1.5;
+      // MIN_SL_PCT = 1.5 (module-level constant — v13.9)
       const minSlDist = price * (MIN_SL_PCT / 100);
       if (action === "LONG" && price - sl < minSlDist) { sl = price - minSlDist; }
       if (action === "SHORT" && sl - price < minSlDist) { sl = price + minSlDist; }
