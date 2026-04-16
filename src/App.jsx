@@ -1,7 +1,15 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v13.7 — Direction ban now persisted across reloads/restarts (Apr 15 2026)
+// NEXUS v13.8 — Deep "Why Losses?" chat diagnostic (Apr 16 2026)
+// ✦ New "📉 Why losses?" quick button in chat
+// ✦ Replaces shallow loss summary with full root-cause analysis:
+//   - Exit reason breakdown (SL hunt %, TP miss, etc.)
+//   - Direction bias (LONG vs SHORT loss split)
+//   - Avg SL % hit, profit factor, streak detection
+//   - Regime mismatch analysis
+//   - Brain block status wired in
+//   - Actionable "What to do" section
 // ✦ v13.7 FIX: Brain.save() now persists _directionBan + _recentSLHits to localStorage
 // ✦ v13.7 FIX: Brain.load() restores ban state on startup — ban survives Render restart
 // ✦ v13.7 FIX: brain_dir_ban + brain_sl_hits added to cloud sync keys
@@ -4675,7 +4683,7 @@ export default function NexusV7() {
 
   // ═══ CHAT WITH AI STATE ═══
   const [chatMessages, setChatMessages] = useState([
-    { role: "ai", text: "Hey! I'm NEXUS v13.7. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
+    { role: "ai", text: "Hey! I'm NEXUS v13.8. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
   ]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
@@ -4833,7 +4841,7 @@ export default function NexusV7() {
       console.warn(`[NEXUS] ⚠️ FALLBACK PRICE SET: $${demo.base} — SL/TP BLOCKED until live Binance price confirms (hasLivePrice=false)`);
       setChange24h((Math.random() - 0.4) * 5);
       setReady(true);
-      addLog("AI", "NEXUS v13.7 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
+      addLog("AI", "NEXUS v13.8 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
       addLog("AI", `Config: ${MAX_POSITIONS} max positions | ${MIN_STACK_DISTANCE_PCT}% min stack dist | ${MAX_TRADES_PER_SESSION} trades/session | MTF gate +3 | Dedup 15s | Gap 3s`);
       console.log("[NEXUS] 🚀 STARTUP: Balance=$" + fx(saved.balance || INITIAL_BALANCE) + " | Positions:" + (saved.positions?.length || 0) + " | History:" + (saved.history?.length || 0) + " | hasLivePrice=false (waiting for Binance)");
       if (saved.positions?.length > 0) {
@@ -5955,45 +5963,119 @@ export default function NexusV7() {
 
       // HELP
       if (lower.includes("help") || lower.includes("what can") || lower.includes("commands")) {
-        const reply = `🤖 Things you can ask me:\n• "start trading" / "stop trading"\n• "why did you stop?" / "why aren't you trading?"\n• "what's your current signal?"\n• "show my P&L" / "how much have I made?"\n• "brain status" / "reset brain"\n• "show open positions"\n• "status" — full health check\n• Or just ask anything — I'll use the AI to answer!`;
+        const reply = `🤖 Things you can ask me:\n• "start trading" / "stop trading"\n• "why did you stop?" / "why aren't you trading?"\n• "why did I take so many losses?" — full diagnostic\n• "what's your current signal?"\n• "show my P&L" / "how much have I made?"\n• "brain status" / "reset brain"\n• "show open positions"\n• "status" — full health check\n• Or just ask anything — I'll use the AI to answer!`;
         setChatMessages(prev => [...prev, { role: "ai", text: reply, time: new Date().toLocaleTimeString() }]);
         setChatLoading(false); return;
       }
 
-      // LOSSES / WINS / WHY LOSING
-      if (lower.includes("loss") || lower.includes("losing") || lower.includes("why losing") || lower.includes("so many loss") || (lower.includes("why") && lower.includes("loss")) || lower.includes("win rate") || lower.includes("how am i doing")) {
-        const wins = history.filter(h => (h.net ?? h.pnl ?? 0) > 0);
-        const losses = history.filter(h => (h.net ?? h.pnl ?? 0) <= 0);
+      // LOSSES / WINS / WHY LOSING — deep diagnostic
+      if (lower.includes("loss") || lower.includes("losing") || lower.includes("why losing") || lower.includes("so many loss") || (lower.includes("why") && lower.includes("loss")) || lower.includes("win rate") || lower.includes("how am i doing") || lower.includes("why did i take") || lower.includes("why did i lose") || lower.includes("why so many") || lower.includes("too many loss")) {
+        const _lh = DB.get("state7", {}).history || history || [];
+        const wins = _lh.filter(h => (h.net ?? h.pnl ?? 0) > 0);
+        const losses = _lh.filter(h => (h.net ?? h.pnl ?? 0) <= 0);
         const wr = wins.length + losses.length > 0 ? (wins.length / (wins.length + losses.length) * 100).toFixed(1) : "0";
         const avgWin = wins.length > 0 ? (wins.reduce((s,h) => s + (h.net ?? h.pnl ?? 0), 0) / wins.length).toFixed(2) : "0";
         const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((s,h) => s + (h.net ?? h.pnl ?? 0), 0) / losses.length).toFixed(2) : "0";
         const totalPnl = balance - INITIAL_BALANCE;
-        const recentTrades = history.slice(-10);
-        const recentLosses = recentTrades.filter(h => (h.net ?? h.pnl ?? 0) <= 0).length;
-        const sessionWins = history.filter(h => (h.net ?? h.pnl ?? 0) > 0 && h.exitTime && Date.now() - new Date(h.exitTime).getTime() < 86400000).length;
-        const sessionLosses = history.filter(h => (h.net ?? h.pnl ?? 0) <= 0 && h.exitTime && Date.now() - new Date(h.exitTime).getTime() < 86400000).length;
+        const now = Date.now();
+        const HOUR = 36e5; const DAY = 864e5;
+        const recentTrades = _lh.slice(-10);
+        const recentLosses = recentTrades.filter(h => (h.net ?? h.pnl ?? 0) <= 0);
+        const todayLosses = losses.filter(h => h.exitTime && now - new Date(h.exitTime).getTime() < DAY);
+        const todayWins = wins.filter(h => h.exitTime && now - new Date(h.exitTime).getTime() < DAY);
         const profitFactor = losses.reduce((s,h) => s + Math.abs(h.net ?? h.pnl ?? 0), 0) > 0
-          ? (wins.reduce((s,h) => s + (h.net ?? h.pnl ?? 0), 0) / Math.abs(losses.reduce((s,h) => s + (h.net ?? h.pnl ?? 0), 0))).toFixed(2)
-          : "∞";
+          ? (wins.reduce((s,h) => s + (h.net ?? h.pnl ?? 0), 0) / Math.abs(losses.reduce((s,h) => s + (h.net ?? h.pnl ?? 0), 0))).toFixed(2) : "∞";
 
-        let reply = `📊 Performance Analysis:\n`;
-        reply += `Win rate: ${wr}% (${wins.length}W / ${losses.length}L)\n`;
-        reply += `Avg win: +$${avgWin} | Avg loss: -$${avgLoss}\n`;
-        reply += `Profit factor: ${profitFactor} | Total P&L: ${totalPnl >= 0 ? "+" : ""}$${fx(totalPnl)}\n`;
-        reply += `Last 10 trades: ${recentTrades.length - recentLosses}W / ${recentLosses}L\n`;
-        reply += `Today: ${sessionWins}W / ${sessionLosses}L\n\n`;
+        // ── EXIT REASON BREAKDOWN ──
+        const exitCounts = {};
+        losses.forEach(h => {
+          const reason = h.exitReason || h.exit || "Unknown";
+          exitCounts[reason] = (exitCounts[reason] || 0) + 1;
+        });
+        const topExitReasons = Object.entries(exitCounts).sort((a,b) => b[1]-a[1]).slice(0,4);
 
-        if (wins.length + losses.length === 0) {
-          reply += `No trades recorded yet — I haven't had a chance to build a track record.`;
-        } else if (parseFloat(wr) < 40) {
-          reply += `Win rate is low. Likely causes: choppy/sideways market, spread eating into tight setups, or the signal threshold needs raising. Current min confidence: ${MIN_CONF_TO_TRADE}%.`;
-        } else if (parseFloat(avgLoss) > parseFloat(avgWin) * 1.5) {
-          reply += `Win rate is ok but losses are too large vs wins. Check if stop losses are being hit too early or TP targets are too aggressive.`;
-        } else if (recentLosses >= 7) {
-          reply += `Recent streak of losses — market may have shifted regime. Brain may be in cooldown to protect capital.`;
-        } else {
-          reply += `Performance looks within normal range. Crypto markets have noisy periods — the brain learns and adapts over time.`;
+        // ── DIRECTION BREAKDOWN ──
+        const longLosses = losses.filter(h => h.side === "LONG").length;
+        const shortLosses = losses.filter(h => h.side === "SHORT").length;
+
+        // ── CONSECUTIVE LOSS STREAK ──
+        let maxStreak = 0, curStreak = 0;
+        for (const h of [..._lh].reverse()) {
+          if ((h.net ?? h.pnl ?? 0) <= 0) { curStreak++; maxStreak = Math.max(maxStreak, curStreak); }
+          else break;
         }
+
+        // ── RECENT LOSS SL ANALYSIS ──
+        const slLosses = losses.filter(h => (h.exitReason || h.exit || "").toLowerCase().includes("stop")).slice(-5);
+        const avgSlPct = slLosses.length > 0
+          ? (slLosses.reduce((s,h) => s + Math.abs((h.net ?? h.pnl ?? 0) / (h.cost || 1) * 100), 0) / slLosses.length).toFixed(2)
+          : null;
+
+        // ── BRAIN BLOCK CHECK ──
+        const _ind = aiResult?.indicators || {};
+        const brainBlock = Brain.shouldBlock(_ind, aiResult?.action || "WAIT", pair?.sym || "BTCUSDT");
+
+        // ── REGIME / MARKET CONDITION AT LOSSES ──
+        const regimeCounts = {};
+        losses.forEach(h => { const r = h.regime || "unknown"; regimeCounts[r] = (regimeCounts[r] || 0) + 1; });
+        const topRegime = Object.entries(regimeCounts).sort((a,b)=>b[1]-a[1])[0];
+
+        // ── BUILD REPLY ──
+        let reply = `📉 Loss Diagnostic Report\n`;
+        reply += `${"─".repeat(30)}\n`;
+        reply += `📊 Overall: ${wr}% win rate | ${wins.length}W / ${losses.length}L | PF: ${profitFactor}\n`;
+        reply += `💰 Avg win: +$${avgWin} | Avg loss: -$${avgLoss} | Total P&L: ${totalPnl >= 0 ? "+" : ""}$${fx(totalPnl)}\n`;
+        reply += `📅 Today: ${todayWins.length}W / ${todayLosses.length}L\n`;
+        reply += `🔴 Last 10 trades: ${recentTrades.length - recentLosses.length}W / ${recentLosses.length}L`;
+        if (curStreak > 0) reply += ` | Current losing streak: ${curStreak}`;
+        reply += `\n\n`;
+
+        reply += `🔍 ROOT CAUSES:\n`;
+        const causes = [];
+
+        // Cause 1: Low win rate
+        if (parseFloat(wr) < 40) causes.push(`⚠️ Low win rate (${wr}%) — signals are triggering on noise. Market may be choppy/ranging. Min confidence needed: ${MIN_CONF_TO_TRADE}%.`);
+
+        // Cause 2: Avg loss >> avg win (bad R:R)
+        if (parseFloat(avgLoss) > parseFloat(avgWin) * 1.5) causes.push(`⚠️ Bad R:R — avg loss ($${avgLoss}) is ${(parseFloat(avgLoss)/parseFloat(avgWin)).toFixed(1)}x bigger than avg win ($${avgWin}). Stop losses may be too tight or TP targets too far.`);
+
+        // Cause 3: SL exits dominating
+        const slCount = exitCounts["Stop Loss"] || exitCounts["stop loss"] || 0;
+        if (slCount > 0 && losses.length > 0 && slCount / losses.length > 0.5) causes.push(`⚠️ ${slCount}/${losses.length} losses exited via Stop Loss — stops are getting hunted. BTC 15m noise band is ~0.3–0.5%; SL floor is ${(MIN_SL_PCT * 100).toFixed(1)}%.`);
+
+        // Cause 4: Direction bias
+        if (longLosses > shortLosses * 2) causes.push(`⚠️ LONG-biased losses (${longLosses}L vs ${shortLosses}S losses) — bear market conditions may be punishing longs. Check MTF trend.`);
+        else if (shortLosses > longLosses * 2) causes.push(`⚠️ SHORT-biased losses (${shortLosses}S vs ${longLosses}L losses) — strong uptrend may be squeezing shorts.`);
+
+        // Cause 5: Regime mismatch
+        if (topRegime && topRegime[1] >= 2) causes.push(`⚠️ Most losses happened in "${topRegime[0]}" regime (${topRegime[1]} trades) — this regime may be hostile to current signal logic.`);
+
+        // Cause 6: Brain block
+        if (brainBlock.blocked) causes.push(`⚠️ Brain is currently BLOCKING trades: "${brainBlock.reason}" — actively protecting capital from further losses in this pattern.`);
+
+        // Cause 7: Avg SL hit %
+        if (avgSlPct) causes.push(`📏 Recent SL exits averaged -${avgSlPct}% per trade. If this is near your SL floor, stops are being set at noise level.`);
+
+        // Cause 8: streak
+        if (maxStreak >= 4) causes.push(`🔴 Active losing streak of ${maxStreak} — brain direction-ban may have activated. Waiting for regime shift.`);
+
+        if (causes.length === 0) causes.push(`✅ No single dominant cause found. Loss rate (${wr}%) and R:R are within acceptable range for volatile crypto markets.`);
+
+        causes.forEach(c => { reply += `${c}\n`; });
+
+        // Top exit reasons
+        if (topExitReasons.length > 0) {
+          reply += `\n📋 Top exit reasons in losses:\n`;
+          topExitReasons.forEach(([r, n]) => { reply += `  • ${r}: ${n}x\n`; });
+        }
+
+        reply += `\n💡 WHAT TO DO:\n`;
+        if (parseFloat(wr) < 40) reply += `→ Market is noisy. Consider raising MIN_CONF_TO_TRADE or waiting for clear trending regime.\n`;
+        if (parseFloat(avgLoss) > parseFloat(avgWin) * 1.5) reply += `→ Widen TP targets or tighten SL — current exits are asymmetric.\n`;
+        if (slCount / Math.max(losses.length, 1) > 0.5) reply += `→ SL being hunted. Widen MIN_SL_PCT above 1.5% or let AdaptiveTPSL handle regime-based widening.\n`;
+        if (brainBlock.blocked) reply += `→ Brain is protecting you. Let the cooldown expire — it learned from these patterns.\n`;
+        if (causes.length === 1 && causes[0].startsWith("✅")) reply += `→ Stay the course. Crypto markets have natural variance. Brain is learning.\n`;
+
         setChatMessages(prev => [...prev, { role: "ai", text: reply.trim(), time: new Date().toLocaleTimeString() }]);
         setChatLoading(false); return;
       }
@@ -6097,7 +6179,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
       <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }}/>
-      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13.7 | 140 IQ ENGINE | LOADING</div>
+      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13.8 | 140 IQ ENGINE | LOADING</div>
     </div>
   );
 
@@ -6111,7 +6193,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13.7 IQ</div>
+            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13.8 IQ</div>
             <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>140 IQ | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
@@ -7130,7 +7212,7 @@ CREATE POLICY "Allow all operations" ON nexus_data
 
         {/* CHAT WITH AI */}
         {tab === "chat" && <div style={S.card}>
-          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13.7</div>
+          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13.8</div>
           <div style={{ fontSize: 9, color: K.txD, marginBottom: 14 }}>Ask why it stopped, give commands, or ask anything about the market.</div>
 
           {/* Quick command buttons */}
@@ -7139,6 +7221,7 @@ CREATE POLICY "Allow all operations" ON nexus_data
               ["▶ Start Trading", "start trading"],
               ["⏸ Stop Trading", "stop trading"],
               ["❓ Why stopped?", "why aren't you trading?"],
+              ["📉 Why losses?", "why did I take so many losses?"],
               ["📡 Signal", "what's your current signal?"],
               ["💰 P&L", "show my P&L"],
               ["🧠 Brain", "brain status"],
