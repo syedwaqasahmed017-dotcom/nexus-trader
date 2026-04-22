@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v13.9 — Fix "Sorry, something went wrong" in chat loss diagnostic (Apr 16 2026)
+// NEXUS v14.0 — Fix LLM high-conviction bypass: aiResult const reassignment error (Apr 22 2026)
 // ✦ v13.9 FIX: MIN_SL_PCT was local-only inside AdaptiveTPSL — caused ReferenceError
 //              in sendChat's "why losses?" handler → catch block showed generic error
 //              Fix: promoted MIN_SL_PCT to module-level constant (line 87)
@@ -4687,7 +4687,7 @@ export default function NexusV7() {
 
   // ═══ CHAT WITH AI STATE ═══
   const [chatMessages, setChatMessages] = useState([
-    { role: "ai", text: "Hey! I'm NEXUS v13.8. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
+    { role: "ai", text: "Hey! I'm NEXUS v14.0. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
   ]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
@@ -4845,7 +4845,7 @@ export default function NexusV7() {
       console.warn(`[NEXUS] ⚠️ FALLBACK PRICE SET: $${demo.base} — SL/TP BLOCKED until live Binance price confirms (hasLivePrice=false)`);
       setChange24h((Math.random() - 0.4) * 5);
       setReady(true);
-      addLog("AI", "NEXUS v13.8 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
+      addLog("AI", "NEXUS v14.0 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
       addLog("AI", `Config: ${MAX_POSITIONS} max positions | ${MIN_STACK_DISTANCE_PCT}% min stack dist | ${MAX_TRADES_PER_SESSION} trades/session | MTF gate +3 | Dedup 15s | Gap 3s`);
       console.log("[NEXUS] 🚀 STARTUP: Balance=$" + fx(saved.balance || INITIAL_BALANCE) + " | Positions:" + (saved.positions?.length || 0) + " | History:" + (saved.history?.length || 0) + " | hasLivePrice=false (waiting for Binance)");
       if (saved.positions?.length > 0) {
@@ -5171,13 +5171,14 @@ export default function NexusV7() {
       const llmHighConvOverride = (geminiKey || groqKey) && llmResult?.live && llmResult.override &&
         (llmResult.action === "LONG" || llmResult.action === "SHORT") &&
         llmResult.conviction === "HIGH" && llmResult.confidence >= 75;
+      let effectiveAiResult = aiResult;
       if (llmHighConvOverride) {
         console.log(`[NEXUS] 🤖 LLM HIGH CONV BYPASS: ${llmResult.action} ${llmResult.confidence}% (rule engine said ${aiResult.action})`);
         addLog("LLM", `HIGH CONV BYPASS: ${llmResult.action} ${llmResult.confidence}% — overriding rule engine WAIT`);
-        // Patch aiResult direction so downstream trade logic uses LLM's direction
-        aiResult = { ...aiResult, action: llmResult.action, confidence: Math.max(aiResult.confidence, llmResult.confidence * 0.7) };
+        // Patch effectiveAiResult direction so downstream trade logic uses LLM's direction
+        effectiveAiResult = { ...aiResult, action: llmResult.action, confidence: Math.max(aiResult.confidence, llmResult.confidence * 0.7) };
       }
-      if (!llmHighConvOverride && (aiResult.action === "WAIT" || aiResult.action === "PAUSE")) { console.log(`[NEXUS] ⏸ AI says ${aiResult.action} (conf: ${Number(aiResult.confidence).toFixed(1)}%) | Reasons: ${(aiResult.reasons||[]).slice(0,3).join('; ')}`); return; }
+      if (!llmHighConvOverride && (effectiveAiResult.action === "WAIT" || effectiveAiResult.action === "PAUSE")) { console.log(`[NEXUS] ⏸ AI says ${aiResult.action} (conf: ${Number(aiResult.confidence).toFixed(1)}%) | Reasons: ${(aiResult.reasons||[]).slice(0,3).join('; ')}`); return; }
       if ((geminiKey || groqKey) && llmResult?.live && llmResult.action === "WAIT" && (llmResult.conviction === "HIGH" || llmResult.conviction === "MEDIUM") && llmResult.confidence >= 55) { console.log("[NEXUS] ⏸ LLM veto: WAIT (" + llmResult.conviction + " " + llmResult.confidence + "%)"); return; }
       // v13.6: LLM WAIT veto lowered from HIGH+70% to MEDIUM+55% — was too restrictive, LLM rarely qualified
       // ═══ POSITION STACKING GUARDS ═══
@@ -5203,7 +5204,7 @@ export default function NexusV7() {
       if (!StabilityEngine.canTradeNow()) { console.log("[NEXUS] ⏸ Trade throttle active"); return; }
 
       // ═══ STABILITY: Signal dedup — same signal won't fire twice in 30s ═══
-      if (StabilityEngine.isDuplicate(aiResult.action, pair.sym, aiResult.confidence)) { console.log("[NEXUS] ⏸ Duplicate signal filtered"); return; }
+      if (StabilityEngine.isDuplicate(effectiveAiResult.action, pair.sym, effectiveAiResult.confidence)) { console.log("[NEXUS] ⏸ Duplicate signal filtered"); return; }
 
       // ═══ CONSECUTIVE LOSS COOLDOWN ═══
       if (cooldownUntil > Date.now()) {
@@ -5213,9 +5214,9 @@ export default function NexusV7() {
       }
 
       // ═══ v13.4 RAPID DIRECTION BAN — stop re-entering banned direction ═══
-      if (Brain.isDirectionBanned(aiResult.action)) {
-        const remaining = Brain.getDirectionBanRemaining(aiResult.action);
-        console.log(`[NEXUS] 🚫 Direction ban: ${aiResult.action} banned ${remaining}min (rapid SL streak)`);
+      if (Brain.isDirectionBanned(effectiveAiResult.action)) {
+        const remaining = Brain.getDirectionBanRemaining(effectiveAiResult.action);
+        console.log(`[NEXUS] 🚫 Direction ban: ${effectiveAiResult.action} banned ${remaining}min (rapid SL streak)`);
         return;
       }
 
@@ -5239,10 +5240,10 @@ export default function NexusV7() {
 
       // ═══ MTF ALIGNMENT GATE v11 — Penalize against-trend trades, don't hard-block ═══
       const mtfCombined = mtfData?.combined;
-      console.log(`[NEXUS] 🧠 AI Signal: ${aiResult.action} ${pair.name} conf=${aiResult.confidence}% | MTF: ${mtfCombined?.valid ? mtfCombined.trend + " " + mtfCombined.strength + "%" + (mtfCombined.aligned ? " ALIGNED" : "") : "no data"} | Positions: ${positions.length}/${MAX_POSITIONS} (${samePairPositions.length} same pair)`);
+      console.log(`[NEXUS] 🧠 AI Signal: ${effectiveAiResult.action} ${pair.name} conf=${effectiveAiResult.confidence}% | MTF: ${mtfCombined?.valid ? mtfCombined.trend + " " + mtfCombined.strength + "%" + (mtfCombined.aligned ? " ALIGNED" : "") : "no data"} | Positions: ${positions.length}/${MAX_POSITIONS} (${samePairPositions.length} same pair)`);
       if (mtfCombined && mtfCombined.valid) {
         // HARD BLOCK: Never open a LONG when MTF is aligned bearish (genuine counter-trend)
-        if (aiResult.action === "LONG" && mtfCombined.trend === "bearish" && mtfCombined.aligned) {
+        if (effectiveAiResult.action === "LONG" && mtfCombined.trend === "bearish" && mtfCombined.aligned) {
           addLog("MTF", "BLOCKED LONG: 3+ timeframes aligned bearish — not fighting the trend");
           console.log("[NEXUS] 🚫 MTF HARD BLOCK: LONG vs aligned bearish");
           return;
@@ -5251,7 +5252,7 @@ export default function NexusV7() {
         // In crypto, bull trends dominate 70%+ of the time. Hard-blocking shorts during
         // bullish MTF means the bot can NEVER short — missing all pullbacks & reversals.
         // Instead: penalize confidence by strength of MTF, let strong signals through.
-        if (aiResult.action === "SHORT" && mtfCombined.trend === "bullish" && mtfCombined.aligned) {
+        if (effectiveAiResult.action === "SHORT" && mtfCombined.trend === "bullish" && mtfCombined.aligned) {
           const mtfPenalty = Math.round(mtfCombined.strength * 0.15); // 63% MTF → -9 conf
           console.log(`[NEXUS] ⚠️ MTF PENALTY: SHORT vs aligned bullish — conf penalty -${mtfPenalty} (was hard block)`);
           addLog("MTF", `SHORT penalized -${mtfPenalty} conf (bullish ${mtfCombined.strength}% aligned — not blocked)`);
@@ -5261,29 +5262,29 @@ export default function NexusV7() {
           console.log(`[NEXUS] ℹ MTF neutral/weak (${mtfCombined.strength}%) — no extra gate applied`);
         }
         // BONUS: When MTF confirms trade direction, boost confidence
-        if (aiResult.action === "LONG" && mtfCombined.trend === "bullish") {
+        if (effectiveAiResult.action === "LONG" && mtfCombined.trend === "bullish") {
           // Trade is WITH the MTF trend — no extra gate needed
         }
-        if (aiResult.action === "SHORT" && mtfCombined.trend === "bearish") {
+        if (effectiveAiResult.action === "SHORT" && mtfCombined.trend === "bearish") {
           // Trade is WITH the MTF trend — no extra gate needed
         }
       }
 
-      let tradeConf = aiResult.confidence;
+      let tradeConf = effectiveAiResult.confidence;
       if ((geminiKey || groqKey) && llmResult?.live && llmResult.adjustConfidence) {
         tradeConf = Math.max(0, Math.min(95, tradeConf + llmResult.adjustConfidence));
       }
 
       // ═══ v7.5 BRAIN MTF-LEARNING GATE — Loosened: old premature exits poisoned data ═══
-      const mtfReq = Brain.getMtfRequirement(aiResult.action);
+      const mtfReq = Brain.getMtfRequirement(effectiveAiResult.action);
       if (mtfReq.requireMtf) {
         // Only block if MTF is ACTIVELY against the trade direction (not neutral/missing)
         const mtfBlocksEntry = mtfCombined?.valid && (
-          (aiResult.action === "LONG" && mtfCombined.trend === "bearish" && mtfCombined.aligned) ||
-          (aiResult.action === "SHORT" && mtfCombined.trend === "bullish" && mtfCombined.aligned)
+          (effectiveAiResult.action === "LONG" && mtfCombined.trend === "bearish" && mtfCombined.aligned) ||
+          (effectiveAiResult.action === "SHORT" && mtfCombined.trend === "bullish" && mtfCombined.aligned)
         );
         if (mtfBlocksEntry) {
-          addLog("BRAIN", `BLOCKED: MTF aligned against ${aiResult.action}`);
+          addLog("BRAIN", `BLOCKED: MTF aligned against ${effectiveAiResult.action}`);
           console.log(`[NEXUS] 🧠 BRAIN MTF GATE: ${aiResult.action} blocked — MTF strongly opposing`);
           return;
         }
@@ -5300,9 +5301,9 @@ export default function NexusV7() {
       // ═══ DYNAMIC SHORT CONFIDENCE v11 — Less aggressive, let shorts through ═══
       // v11: In bull market, shorts get a SMALL penalty (not a death sentence)
       // The MTF hard block was already removed above; this is the soft penalty layer
-      if (aiResult.action === "SHORT") {
-        const bias = aiResult?.indicators?.marketBias || "neutral";
-        const biasStr = aiResult?.indicators?.marketBiasStrength || 0;
+      if (effectiveAiResult.action === "SHORT") {
+        const bias = effectiveAiResult?.indicators?.marketBias || "neutral";
+        const biasStr = effectiveAiResult?.indicators?.marketBiasStrength || 0;
         if (bias === "bear" && biasStr > 40) {
           tradeConf += 5; // Bear market: shorts are trend-aligned, boost
         } else if (bias === "bear") {
@@ -5327,7 +5328,7 @@ export default function NexusV7() {
       }
 
       // MTF alignment bonus for longs
-      if (aiResult.action === "LONG" && mtfCombined?.valid && mtfCombined.trend === "bullish" && mtfCombined.aligned) {
+      if (effectiveAiResult.action === "LONG" && mtfCombined?.valid && mtfCombined.trend === "bullish" && mtfCombined.aligned) {
         tradeConf += 6;
         addLog("MTF", `Long +6 conf: MTF aligned bullish ${mtfCombined.strength}%`);
       }
@@ -5391,7 +5392,7 @@ export default function NexusV7() {
         stackedAmount = Math.max(5, stackedAmount * (1 - streakPenalty));
       }
       // Regime-based sizing
-      const currentRegime = aiResult?.analysis?.regime || "unknown";
+      const currentRegime = effectiveAiResult?.analysis?.regime || "unknown";
       const regimeConfig = REGIME_TRADE_MAP[currentRegime] || REGIME_TRADE_MAP.unknown;
       if (regimeConfig.sizeBonus !== 0) {
         stackedAmount = Math.max(5, stackedAmount * (1 + regimeConfig.sizeBonus));
@@ -5426,14 +5427,14 @@ export default function NexusV7() {
 
       if (stackedAmount < 5) return;
 
-      console.log(`[NEXUS] ✅ ALL GATES PASSED — EXECUTING: ${aiResult.action} ${pair.name} | Conf:${tradeConf.toFixed(0)}% | Amount:$${stackedAmount.toFixed(2)} | Stack:${stackLevel+1}/${MAX_POSITIONS} | SL:${aiResult.sl||'none'} TP:${aiResult.tp||'none'}`);
+      console.log(`[NEXUS] ✅ ALL GATES PASSED — EXECUTING: ${effectiveAiResult.action} ${pair.name} | Conf:${tradeConf.toFixed(0)}% | Amount:$${stackedAmount.toFixed(2)} | Stack:${stackLevel+1}/${MAX_POSITIONS} | SL:${effectiveAiResult.sl||'none'} TP:${effectiveAiResult.tp||'none'}`);
 
       // ═══ STABILITY: Lock execution, record signal, execute ═══
       executionLockRef.current = true;
       try {
-        StabilityEngine.recordSignal(aiResult.action, pair.sym, aiResult.confidence);
+        StabilityEngine.recordSignal(effectiveAiResult.action, pair.sym, effectiveAiResult.confidence);
         StabilityEngine.recordTrade();
-        executeTrade(aiResult.action, stackedAmount, aiResult.sl, aiResult.tp, true);
+        executeTrade(effectiveAiResult.action, stackedAmount, effectiveAiResult.sl, effectiveAiResult.tp, true);
       } finally {
         executionLockRef.current = false;
       }
@@ -6183,7 +6184,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
       <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }}/>
-      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v13.8 | 140 IQ ENGINE | LOADING</div>
+      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v14.0 | 140 IQ ENGINE | LOADING</div>
     </div>
   );
 
@@ -6197,7 +6198,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v13.8 IQ</div>
+            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v14.0 IQ</div>
             <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>140 IQ | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
@@ -7216,7 +7217,7 @@ CREATE POLICY "Allow all operations" ON nexus_data
 
         {/* CHAT WITH AI */}
         {tab === "chat" && <div style={S.card}>
-          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v13.8</div>
+          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v14.0</div>
           <div style={{ fontSize: 9, color: K.txD, marginBottom: 14 }}>Ask why it stopped, give commands, or ask anything about the market.</div>
 
           {/* Quick command buttons */}
