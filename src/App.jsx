@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v14.0 — Fix LLM high-conviction bypass: aiResult const reassignment error (Apr 22 2026)
+// NEXUS v14.1 — Fix: LLM WAIT veto tightened (HIGH+65% only); Squeeze regime threshold bonus (Apr 28 2026)
 // ✦ v13.9 FIX: MIN_SL_PCT was local-only inside AdaptiveTPSL — caused ReferenceError
 //              in sendChat's "why losses?" handler → catch block showed generic error
 //              Fix: promoted MIN_SL_PCT to module-level constant (line 87)
@@ -4455,9 +4455,12 @@ function aiDecision(candles, currentPrice, symbol, sessionPnl, sessionStart, pos
     // biasBonus: when market has clear direction (>50%), reduce thresholds proportionally
     const biasStr = marketBias.strength || 0;
     const biasBonus = biasStr > 50 ? Math.round((biasStr - 50) * 0.2) : 0; // up to 10pt reduction at 100% bias
-    const confThreshold = Math.max(18, baseCT - biasBonus);
-    const pctThreshold = Math.max(48, basePT - biasBonus);
-    if (biasBonus > 0) console.log(`[NEXUS] 📊 Bias-adaptive: bias=${marketBias.bias} ${biasStr}% → confThreshold=${confThreshold} pctThreshold=${pctThreshold} (bonus=${biasBonus})`);
+    // v14.1: squeezeBonus — squeeze regime has very low volatility so normal thresholds are too strict
+    // A squeeze by definition is compressed price — breakout direction is the trade, lower the bar
+    const squeezeBonus = regime === "squeeze" ? 6 : 0;
+    const confThreshold = Math.max(18, baseCT - biasBonus - squeezeBonus);
+    const pctThreshold = Math.max(45, basePT - biasBonus - squeezeBonus);
+    if (biasBonus > 0 || squeezeBonus > 0) console.log(`[NEXUS] 📊 Bias-adaptive: bias=${marketBias.bias} ${biasStr}% squeeze=${squeezeBonus > 0} → confThreshold=${confThreshold} pctThreshold=${pctThreshold} (biasBonus=${biasBonus} squeezeBonus=${squeezeBonus})`);
 
     // ═══ TREND CONTINUATION ENGINE v10 — Strong bias adds directional points ═══
     if (biasStr > 45) {
@@ -5179,8 +5182,9 @@ export default function NexusV7() {
         effectiveAiResult = { ...aiResult, action: llmResult.action, confidence: Math.max(aiResult.confidence, llmResult.confidence * 0.7) };
       }
       if (!llmHighConvOverride && (effectiveAiResult.action === "WAIT" || effectiveAiResult.action === "PAUSE")) { console.log(`[NEXUS] ⏸ AI says ${aiResult.action} (conf: ${Number(aiResult.confidence).toFixed(1)}%) | Reasons: ${(aiResult.reasons||[]).slice(0,3).join('; ')}`); return; }
-      if ((geminiKey || groqKey) && llmResult?.live && llmResult.action === "WAIT" && (llmResult.conviction === "HIGH" || llmResult.conviction === "MEDIUM") && llmResult.confidence >= 55) { console.log("[NEXUS] ⏸ LLM veto: WAIT (" + llmResult.conviction + " " + llmResult.confidence + "%)"); return; }
-      // v13.6: LLM WAIT veto lowered from HIGH+70% to MEDIUM+55% — was too restrictive, LLM rarely qualified
+      if ((geminiKey || groqKey) && llmResult?.live && llmResult.action === "WAIT" && llmResult.conviction === "HIGH" && llmResult.confidence >= 65) { console.log("[NEXUS] ⏸ LLM veto: WAIT (" + llmResult.conviction + " " + llmResult.confidence + "%)"); return; }
+      // v14.1: LLM WAIT veto tightened — MEDIUM conviction no longer enough to block trades (was MEDIUM+55%, now HIGH+65%)
+      // Reason: LLM was vetoing every squeeze-regime signal with MEDIUM 30% confidence — caused days of no trading
       // ═══ POSITION STACKING GUARDS ═══
       const samePairPositions = positions.filter(p => p.pair === pair.sym);
       // Enforce minimum price distance between stacked entries
