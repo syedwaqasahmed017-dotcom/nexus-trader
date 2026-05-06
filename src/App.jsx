@@ -5178,6 +5178,7 @@ export default function NexusV7() {
   }, [geminiKey, groqKey, llmResult?.live]);
 
   useEffect(() => {
+    (async () => {
     try {
       if (!aiActive || !aiResult) return;
       // ═══ DEMO GUARD: Never auto-trade on fake/offline data ═══
@@ -5458,6 +5459,7 @@ export default function NexusV7() {
         executionLockRef.current = false;
       }
     } catch {}
+    })();
   }, [aiResult, aiActive, llmResult, drawdownState, cooldownUntil, lastDataUpdate, candles, isLive, mtfData, hasLivePrice]);
 
   // ═══ SL/TP MONITOR + MTF-AWARE SMART EXITS (v7.3 — Price Sanity + Stale Winner) ═══
