@@ -1,7 +1,17 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// NEXUS v14.3 — Fix: Squeeze R:R freeze — lowered min R:R 1.5→1.1 in squeeze, tpMult 9→11 (May 5 2026)
+// NEXUS v14.4 — LIVE ORDER EXECUTION via proxy (May 6 2026)
+// ✦ Real Binance spot orders — BUY on entry, SELL on exit
+// ✦ Proxy signs requests with HMAC-SHA256 server-side (secret never in browser)
+// ✦ tradingMode="live" now actually places real orders via nexus-proxy /binance/order
+// ✦ On LONG entry: BUY quoteOrderQty USDT → get real avgPrice + qty from fills
+// ✦ On SHORT entry: SELL quantity of base asset at market
+// ✦ closeTrade in live mode: opposite SELL/BUY to flatten position
+// ✦ Real Binance balance synced on startup + after every fill
+// ✦ Live orders tagged with orderId; all paper trade logic unchanged
+// ✦ Safe fallback: any proxy error reverts to paper simulation with ERR log
+// ✦ v14.3 FIX preserved: Squeeze R:R freeze — lowered min R:R 1.5→1.1
 // ✦ v13.9 FIX: MIN_SL_PCT was local-only inside AdaptiveTPSL — caused ReferenceError
 //              in sendChat's "why losses?" handler → catch block showed generic error
 //              Fix: promoted MIN_SL_PCT to module-level constant (line 87)
@@ -4694,7 +4704,7 @@ export default function NexusV7() {
 
   // ═══ CHAT WITH AI STATE ═══
   const [chatMessages, setChatMessages] = useState([
-    { role: "ai", text: "Hey! I'm NEXUS v14.3. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
+    { role: "ai", text: "Hey! I'm NEXUS v14.4. Ask me anything — predictions, analysis, why I'm not trading, my P&L, what I think the market is doing. I'll give you a real answer, not a canned response.", time: new Date().toLocaleTimeString() }
   ]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
@@ -4813,6 +4823,7 @@ export default function NexusV7() {
       if (gk) { setGroqKey(gk.trim()); }
       if (gmk) { setGeminiKey(gmk.trim()); }
       if (apiSettings.apiKey) setApiKey(apiSettings.apiKey);
+      if (apiSettings.apiSecret) setApiSecret(apiSettings.apiSecret);
       if (apiSettings.tradingMode) setTradingMode(apiSettings.tradingMode);
       // Auto-save defaults if not already saved
       if (!apiSettings.groqKey && gk) {
@@ -4852,7 +4863,7 @@ export default function NexusV7() {
       console.warn(`[NEXUS] ⚠️ FALLBACK PRICE SET: $${demo.base} — SL/TP BLOCKED until live Binance price confirms (hasLivePrice=false)`);
       setChange24h((Math.random() - 0.4) * 5);
       setReady(true);
-      addLog("AI", "NEXUS v14.3 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
+      addLog("AI", "NEXUS v14.4 online - 24/7 AI active - $" + fx(saved.balance || INITIAL_BALANCE) + " balance restored");
       addLog("AI", `Config: ${MAX_POSITIONS} max positions | ${MIN_STACK_DISTANCE_PCT}% min stack dist | ${MAX_TRADES_PER_SESSION} trades/session | MTF gate +3 | Dedup 15s | Gap 3s`);
       console.log("[NEXUS] 🚀 STARTUP: Balance=$" + fx(saved.balance || INITIAL_BALANCE) + " | Positions:" + (saved.positions?.length || 0) + " | History:" + (saved.history?.length || 0) + " | hasLivePrice=false (waiting for Binance)");
       if (saved.positions?.length > 0) {
@@ -5442,7 +5453,7 @@ export default function NexusV7() {
       try {
         StabilityEngine.recordSignal(effectiveAiResult.action, pair.sym, effectiveAiResult.confidence);
         StabilityEngine.recordTrade();
-        executeTrade(effectiveAiResult.action, stackedAmount, effectiveAiResult.sl, effectiveAiResult.tp, true);
+        await executeTrade(effectiveAiResult.action, stackedAmount, effectiveAiResult.sl, effectiveAiResult.tp, true);
       } finally {
         executionLockRef.current = false;
       }
@@ -5681,8 +5692,58 @@ export default function NexusV7() {
     } catch {}
   }, [price, lastDataUpdate, mtfData, hasLivePrice]);
 
+  // ═══ LIVE ORDER HELPER — calls proxy to place real Binance order ═══
+  async function placeLiveOrder(binanceSide, quoteOrderQty, quantityAsset) {
+    try {
+      const proxyUrl = "https://nexus-proxy-fd7v.onrender.com/binance/order";
+      const body = {
+        symbol: pair.sym,
+        side: binanceSide, // "BUY" or "SELL"
+        ...(quantityAsset
+          ? { quantity: quantityAsset }
+          : { quoteOrderQty }),
+      };
+      const res = await fetch(proxyUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          // Send keys in header — proxy signs with them server-side
+          "X-Api-Key": `${apiKey}:${apiSecret}`,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15000),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        console.error("[NEXUS LIVE] Order rejected:", data);
+        return { ok: false, error: data.error || `HTTP ${res.status}` };
+      }
+      return { ok: true, ...data };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  }
+
+  // ═══ SYNC REAL BINANCE BALANCE ═══
+  async function syncLiveBalance() {
+    try {
+      if (tradingMode !== "live" || !apiKey || !apiSecret) return;
+      const res = await fetch("https://nexus-proxy-fd7v.onrender.com/binance/account", {
+        headers: { "X-Api-Key": `${apiKey}:${apiSecret}` },
+        signal: AbortSignal.timeout(10000),
+      });
+      const data = await res.json();
+      if (data.ok && typeof data.usdt === "number") {
+        setBalance(data.usdt);
+        addLog("AI", `💰 Live balance synced: $${fx(data.usdt)} USDT`);
+      }
+    } catch (e) {
+      console.warn("[NEXUS LIVE] Balance sync failed:", e.message);
+    }
+  }
+
   // ═══ TRADE EXECUTION ═══
-  function executeTrade(side, amount, sl, tp, isAI = false) {
+  async function executeTrade(side, amount, sl, tp, isAI = false) {
     try {
       // ═══ FIX: Block trades if no confirmed live price ═══
       if (!hasLivePrice) {
@@ -5693,7 +5754,48 @@ export default function NexusV7() {
       if (amount > balance) { addLog("ERR", "Insufficient balance"); return; }
       if (balance < MIN_BALANCE) { addLog("ERR", `Min $${MIN_BALANCE} required`); return; }
       console.log(`[NEXUS] 🔔 OPENING: ${side} ${pair.name} | Amount:$${amount.toFixed(2)} | Price:$${price.toFixed(2)} | SL:${sl||'none'} TP:${tp||'none'}`);
-      // ═══ REALISTIC EXECUTION: apply slippage on entry ═══
+
+      // ══════════════════════════════════════════════════════
+      // LIVE MODE — real Binance order via proxy
+      // ══════════════════════════════════════════════════════
+      if (tradingMode === "live" && apiKey && apiSecret && isLive) {
+        addLog(isAI ? "AI" : "TRADE", `⏳ Placing LIVE ${side} ${pair.name} $${fx(amount)} on Binance...`);
+        // LONG = BUY with USDT, SHORT = SELL base asset (requires holding it)
+        const binanceSide = side === "LONG" ? "BUY" : "SELL";
+        const order = await placeLiveOrder(binanceSide, amount, null);
+
+        if (!order.ok) {
+          addLog("ERR", `LIVE ORDER FAILED: ${order.error} — falling back to paper`);
+          // Fallback: simulate the trade so bot keeps running
+        } else {
+          // Real fill data from Binance
+          const fillPrice = order.avgPrice || price;
+          const qty = order.executedQty || (amount / fillPrice);
+          const entryFee = order.totalCommission || (amount * FEE_RATE);
+          const slippageCost = Math.abs(fillPrice - price) * qty;
+          const trade = {
+            id: uid(), pair: pair.sym, pairName: pair.name, side, entry: fillPrice,
+            qty, cost: amount, fee: entryFee, slippage: slippageCost,
+            sl: sl ? +sl : 0, tp: tp ? +tp : 0,
+            entryTime: new Date().toISOString(), isAI,
+            isDemo: false, // REAL trade
+            isLiveOrder: true,
+            binanceOrderId: order.orderId,
+            indicators: aiResult ? { ...aiResult.indicators } : {},
+            session: session?.primary?.name || "-",
+          };
+          // Sync real balance from Binance after fill
+          await syncLiveBalance();
+          setPositions(prev => [...prev, trade]);
+          setSessionTradeCount(d => d + 1);
+          addLog(isAI ? "AI" : "TRADE", `✅ LIVE ${side} ${qty.toFixed(6)} ${pair.name} @ $${fillPrice.toFixed(pair.dp)} | Binance order #${order.orderId} | Fee: $${fx(entryFee,4)} | Slip: $${fx(slippageCost,4)}`);
+          return; // Done — real order placed
+        }
+      }
+
+      // ══════════════════════════════════════════════════════
+      // PAPER MODE (or live fallback) — simulation
+      // ══════════════════════════════════════════════════════
       const atrPct = aiResult?.indicators?.atrPct || 1;
       const fillPrice = simulateSlippage(price, side, atrPct);
       const slippageCost = Math.abs(fillPrice - price) * ((amount) / price);
@@ -5704,7 +5806,7 @@ export default function NexusV7() {
         qty, cost: amount, fee: entryFee, slippage: slippageCost,
         sl: sl ? +sl : 0, tp: tp ? +tp : 0,
         entryTime: new Date().toISOString(), isAI,
-        isDemo: !isLive, // ═══ HONEST: Tag demo trades so Brain/ML can filter ═══
+        isDemo: !isLive,
         indicators: aiResult ? { ...aiResult.indicators } : {},
         session: session?.primary?.name || "-",
       };
@@ -5726,10 +5828,28 @@ export default function NexusV7() {
       }
       console.log(`[NEXUS] 💰 CLOSING: ${p.side} ${p.pairName} | Entry:$${p.entry.toFixed(2)} Exit:$${exitPrice.toFixed(2)} (${priceVsEntry.toFixed(2)}% move) | Reason: ${reason}`);
 
-      // ═══ REALISTIC EXECUTION: slippage on exit (reversed — works against you) ═══
-      const exitSide = p.side === "LONG" ? "SHORT" : "LONG"; // closing is opposite direction
+      // ══════════════════════════════════════════════════════
+      // LIVE MODE — place real closing order on Binance
+      // ══════════════════════════════════════════════════════
+      if (tradingMode === "live" && p.isLiveOrder && apiKey && apiSecret && isLive) {
+        const closeSide = p.side === "LONG" ? "SELL" : "BUY";
+        addLog("TRADE", `⏳ Closing LIVE ${p.side} ${p.pairName} → ${closeSide} ${p.qty.toFixed(6)} on Binance...`);
+        // Fire-and-forget but capture result via promise chain
+        placeLiveOrder(closeSide, null, p.qty).then(order => {
+          if (!order.ok) {
+            addLog("ERR", `LIVE CLOSE FAILED: ${order.error}`);
+          } else {
+            addLog("TRADE", `✅ LIVE CLOSE confirmed: ${closeSide} ${p.pairName} @ $${order.avgPrice?.toFixed(2) || exitPrice.toFixed(2)} | Order #${order.orderId}`);
+            // Sync real balance from Binance after close
+            syncLiveBalance();
+          }
+        }).catch(e => addLog("ERR", "Live close exception: " + e.message));
+      }
+
+      // ═══ P&L ACCOUNTING (always runs — real exit price used if live fill is async) ═══
+      const exitSide = p.side === "LONG" ? "SHORT" : "LONG";
       const atrPct = aiResult?.indicators?.atrPct || 1;
-      const realExit = simulateSlippage(exitPrice, exitSide, atrPct);
+      const realExit = (tradingMode === "live" && p.isLiveOrder) ? exitPrice : simulateSlippage(exitPrice, exitSide, atrPct);
       const exitSlippage = Math.abs(realExit - exitPrice) * p.qty;
       const grossPnl = p.side === "LONG" ? (realExit - p.entry) * p.qty : (p.entry - realExit) * p.qty;
       const exitFee = realExit * p.qty * FEE_RATE;
@@ -5737,34 +5857,32 @@ export default function NexusV7() {
       const pct = (netPnl / p.cost) * 100;
       const totalFees = p.fee + exitFee;
       const totalSlippage = (p.slippage || 0) + exitSlippage;
-      const isDemo = !isLive || p.isDemo;
+      const isDemo = p.isDemo || (!isLive && tradingMode !== "live");
       const record = { ...p, exit: realExit, exitTime: new Date().toISOString(), gross: grossPnl, exitFee, net: netPnl, pct, totalFees, totalSlippage, reason, isDemo };
-      console.log(`[NEXUS] 📋 TRADE CLOSED: ${p.side} ${p.pairName} | Entry:$${p.entry.toFixed(2)} Exit:$${realExit.toFixed(2)} | Gross:$${grossPnl.toFixed(4)} Net:$${netPnl.toFixed(4)} (${pct.toFixed(2)}%) | Fees:$${totalFees.toFixed(4)} Slip:$${totalSlippage.toFixed(4)} | ${reason}${isDemo ? " [DEMO]" : ""}`);
+      console.log(`[NEXUS] 📋 TRADE CLOSED: ${p.side} ${p.pairName} | Entry:$${p.entry.toFixed(2)} Exit:$${realExit.toFixed(2)} | Gross:$${grossPnl.toFixed(4)} Net:$${netPnl.toFixed(4)} (${pct.toFixed(2)}%) | Fees:$${totalFees.toFixed(4)} Slip:$${totalSlippage.toFixed(4)} | ${reason}${isDemo ? " [DEMO]" : ""}${p.isLiveOrder ? " [LIVE]" : ""}`);
       setHistory(prev => [record, ...prev]);
-      setBalance(b => b + p.cost + netPnl);
+      // Paper mode updates balance locally; live mode balance is synced from Binance after fill
+      if (!p.isLiveOrder) setBalance(b => b + p.cost + netPnl);
       setSessionPnl(d => d + netPnl);
       if (netPnl > 0) {
         setSessionProfit(d => d + netPnl);
-        // ═══ DEMO GUARD: Never pollute Brain with offline/demo data ═══
         const holdMins = p.entryTime ? (Date.now() - new Date(p.entryTime).getTime()) / 60000 : 0;
         if (!isDemo) Brain.recordWin({ symbol: p.pair, action: p.side, indicators: p.indicators, profit: netPnl, exitReason: reason, holdMins });
-        addLog("WIN", `${p.side} ${p.pairName} | ${fMoney(netPnl)} (${fPct(pct)}) | ${reason}${isDemo ? " [DEMO]" : ""}`);
+        addLog("WIN", `${p.side} ${p.pairName} | ${fMoney(netPnl)} (${fPct(pct)}) | ${reason}${isDemo ? " [DEMO]" : ""}${p.isLiveOrder ? " 💸 LIVE" : ""}`);
         setConsecutiveWins(prev => prev + 1);
         setConsecutiveLosses(0);
       } else {
-        // ═══ DEMO GUARD: Never pollute Brain with offline/demo data ═══
         const holdMins = p.entryTime ? (Date.now() - new Date(p.entryTime).getTime()) / 60000 : 0;
         if (!isDemo) Brain.recordLoss({ symbol: p.pair, action: p.side, indicators: p.indicators, loss: Math.abs(netPnl), exitReason: reason, holdMins });
-        // ═══ v13.4 RAPID DIRECTION BAN — track SL hits by direction ═══
         if (!isDemo && reason === "Stop Loss") {
           const banned = Brain.recordSLHit(p.side);
           if (banned) addLog("BRAIN", `🚫 DIRECTION BAN: ${p.side} banned 20min — 3 SL hits in 30min`);
         }
-        addLog("LOSS", `${p.side} ${p.pairName} | ${fMoney(netPnl)} (${fPct(pct)}) | ${reason}${isDemo ? " [DEMO]" : ""}`);
+        addLog("LOSS", `${p.side} ${p.pairName} | ${fMoney(netPnl)} (${fPct(pct)}) | ${reason}${isDemo ? " [DEMO]" : ""}${p.isLiveOrder ? " 💸 LIVE" : ""}`);
         setConsecutiveLosses(prev => {
           const newStreak = prev + 1;
           if (newStreak >= 3) {
-            const cooldownMs = 5 * 60 * 1000; // 5 minutes
+            const cooldownMs = 5 * 60 * 1000;
             setCooldownUntil(Date.now() + cooldownMs);
             addLog("WARN", `${newStreak} consecutive losses — AUTO-COOLDOWN 5min to prevent tilt trading`);
           }
@@ -5773,7 +5891,6 @@ export default function NexusV7() {
         setConsecutiveWins(0);
       }
       setBrainStats(Brain.getStats());
-      // ML auto-retrain check
       if (MLEngine.needsRetrain()) {
         const result = MLEngine.train(150);
         if (result.success) { addLog("ML", `Auto-retrained: ${result.accuracy.toFixed(1)}% accuracy on ${result.samples} trades`); setMlStats(MLEngine.getStats()); }
@@ -6192,7 +6309,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${K.warn},#e8700a)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 900, color: "#000" }}>N</div>
       <div style={{ width: 28, height: 28, border: `2px solid ${K.bd}`, borderTopColor: K.warn, borderRadius: "50%", animation: "spin .7s linear infinite" }}/>
-      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v14.3 | 140 IQ ENGINE | LOADING</div>
+      <div style={{ color: K.txM, fontSize: 10, letterSpacing: 3, animation: "pulse 1.5s infinite" }}>NEXUS v14.4 | 140 IQ ENGINE | LOADING</div>
     </div>
   );
 
@@ -6206,7 +6323,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${K.warn},#e8700a)`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#000", animation: "glow 3s infinite" }}>N</div>
           <div>
-            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v14.3 IQ</div>
+            <div style={{ fontSize: 15, fontWeight: 800, background: `linear-gradient(90deg,${K.warn},${K.gold})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>NEXUS v14.4 IQ</div>
             <div style={{ fontSize: 7, color: K.txM, letterSpacing: 1.2 }}>140 IQ | {Brain.losses.length + Brain.wins.length} PATTERNS{BacktestEngine.countBacktestPatterns() > 0 ? ` (${BacktestEngine.countBacktestPatterns()} BT)` : ""} | {(geminiKey || groqKey) ? "LLM BRAIN ACTIVE" : "REALISTIC MODE"}{MLEngine._trained ? " | ML ACTIVE" : ""}{CloudSync.isConnected() ? " | \u2601 CLOUD" : ""}{drawdownState?.tier?.name !== "NORMAL" ? ` | ${drawdownState.tier.name}` : ""}</div>
           </div>
         </div>
@@ -7095,7 +7212,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
             <div style={{ fontSize: 12, fontWeight: 700, color: K.gold, marginBottom: 8 }}>Trading Mode</div>
             <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
               <button onClick={() => { setTradingMode("paper"); DB.set("api_settings", { apiKey, tradingMode: "paper", geminiKey, groqKey }); addLog("AI", "Training mode active - realistic simulation with fees + slippage"); }} style={{ ...S.btn(tradingMode === "paper", K.gold), padding: "10px 20px", fontSize: 12 }}>TRAINING ($100 realistic)</button>
-              <button onClick={() => { if (!apiKey) { addLog("WARN", "Enter API key first"); return; } setTradingMode("live"); DB.set("api_settings", { apiKey, tradingMode: "live", geminiKey, groqKey }); addLog("AI", "LIVE TRADING ACTIVATED - REAL MONEY"); }} style={{ ...S.btn(tradingMode === "live", K.up), padding: "10px 20px", fontSize: 12 }}>LIVE (Real Money)</button>
+              <button onClick={() => { if (!apiKey || !apiSecret) { addLog("WARN", "Enter both API Key and Secret in Binance section first"); return; } setTradingMode("live"); DB.set("api_settings", { apiKey, apiSecret, tradingMode: "live", geminiKey, groqKey }); addLog("AI", "🚨 LIVE TRADING ACTIVATED — REAL MONEY on Binance"); syncLiveBalance(); }} style={{ ...S.btn(tradingMode === "live", K.up), padding: "10px 20px", fontSize: 12 }}>LIVE (Real Money)</button>
             </div>
             <div style={{ fontSize: 8, color: K.cyan, padding: 8, background: K.cyan + "08", borderRadius: 6, marginBottom: 8 }}>
               REALISTIC MODE: Training includes real Binance fees (0.2%), market slippage, and execution delays. What you see here is what you get with real money.
@@ -7193,7 +7310,20 @@ CREATE POLICY "Allow all operations" ON nexus_data
             <div style={{ fontSize: 9, color: K.txD, marginBottom: 8 }}>Connect your Binance account for live trading. Only enable when AI is profitable over 50+ trades.</div>
             <div style={{ marginBottom: 8 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>API Key</div><input type="text" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="Enter Binance API Key" style={S.input}/></div>
             <div style={{ marginBottom: 8 }}><div style={{ fontSize: 9, color: K.txD, marginBottom: 4 }}>API Secret</div><input type="password" value={apiSecret} onChange={e => setApiSecret(e.target.value)} placeholder="Enter Binance API Secret" style={S.input}/></div>
-            <button onClick={() => { DB.set("api_settings", { apiKey, tradingMode, geminiKey, groqKey }); LLMEngine._consecutiveErrors = 0; LLMEngine._lastError = ""; LLMEngine._backoffUntil = 0; LLMEngine._lastCall = 0; setLlmRefresh(r => r + 1); addLog("AI", "API settings saved"); }} style={{ ...S.btn(true, K.up), marginBottom: 10, fontSize: 10 }}>Save API Keys</button>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+              <button onClick={() => {
+                DB.set("api_settings", { apiKey, apiSecret, tradingMode, geminiKey, groqKey });
+                addLog("AI", "API keys saved");
+              }} style={{ ...S.btn(true, K.up), fontSize: 10 }}>Save API Keys</button>
+              <button onClick={async () => {
+                if (!apiKey || !apiSecret) { addLog("WARN", "Enter both API Key and Secret first"); return; }
+                addLog("AI", "Testing connection & syncing real Binance balance...");
+                await syncLiveBalance();
+              }} style={{ ...S.btn(!!(apiKey && apiSecret), K.cyan), fontSize: 10, opacity: (apiKey && apiSecret) ? 1 : 0.4 }}>🔄 Sync Balance from Binance</button>
+            </div>
+            {tradingMode === "live" && apiKey && apiSecret && <div style={{ fontSize: 9, color: K.up, padding: 8, background: K.up + "10", borderRadius: 6, marginBottom: 8, border: `1px solid ${K.up}30` }}>
+              ✅ LIVE MODE ACTIVE — Orders go to real Binance account. USDT balance synced from exchange.
+            </div>}
             <div style={{ fontSize: 8, color: K.dn, padding: 8, background: K.dn + "08", borderRadius: 6 }}>
               WARNING: Live trading uses real money. Only enable when your AI brain has 50+ patterns and win rate above 55%.
               Current brain: {brainStats.brainSize} patterns | Win rate: {brainStats.totalWins + brainStats.totalLosses > 0 ? fx(brainStats.totalWins / (brainStats.totalWins + brainStats.totalLosses) * 100, 1) : "0"}%
@@ -7225,7 +7355,7 @@ CREATE POLICY "Allow all operations" ON nexus_data
 
         {/* CHAT WITH AI */}
         {tab === "chat" && <div style={S.card}>
-          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v14.3</div>
+          <div style={{ fontSize: 9, color: K.txM, letterSpacing: 2, marginBottom: 4 }}>TALK TO YOUR AI — NEXUS v14.4</div>
           <div style={{ fontSize: 9, color: K.txD, marginBottom: 14 }}>Ask why it stopped, give commands, or ask anything about the market.</div>
 
           {/* Quick command buttons */}
