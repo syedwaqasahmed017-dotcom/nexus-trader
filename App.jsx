@@ -605,7 +605,7 @@ const OnChainEngine = {
           const target = "https://mempool.space/api/mempool";
           const url = proxy ? proxy + encodeURIComponent(target) : target;
           const r = await fetch(url, { signal: AbortSignal.timeout(6000) });
-          if (r.ok) { const mp = await r.json(); unconfirmed = mp.count || mp.vsize ? Math.round((mp.vsize || 0) / 250) : null; if (mp.count) unconfirmed = mp.count; break; }
+          if (r.ok) { const mp = await r.json(); unconfirmed = mp.count || (mp.vsize ? Math.round(mp.vsize / 250) : null); break; }
         } catch { continue; }
       }
 

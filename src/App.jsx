@@ -615,7 +615,7 @@ const OnChainEngine = {
           const target = "https://mempool.space/api/mempool";
           const url = proxy ? proxy + encodeURIComponent(target) : target;
           const r = await fetch(url, { signal: AbortSignal.timeout(6000) });
-          if (r.ok) { const mp = await r.json(); unconfirmed = mp.count || mp.vsize ? Math.round((mp.vsize || 0) / 250) : null; if (mp.count) unconfirmed = mp.count; break; }
+          if (r.ok) { const mp = await r.json(); unconfirmed = mp.count || (mp.vsize ? Math.round(mp.vsize / 250) : null); break; }
         } catch { continue; }
       }
 
@@ -5839,13 +5839,18 @@ export default function NexusV7() {
         // Fire-and-forget but capture result via promise chain
         placeLiveOrder(closeSide, null, p.qty).then(order => {
           if (!order.ok) {
-            addLog("ERR", `LIVE CLOSE FAILED: ${order.error}`);
+            addLog("ERR", `LIVE CLOSE FAILED: ${order.error} — position restored, still open on Binance`);
+            // Restore the position so the UI matches the real exchange state
+            setPositions(prev => [...prev, p]);
           } else {
             addLog("TRADE", `✅ LIVE CLOSE confirmed: ${closeSide} ${p.pairName} @ $${order.avgPrice?.toFixed(2) || exitPrice.toFixed(2)} | Order #${order.orderId}`);
             // Sync real balance from Binance after close
             syncLiveBalance();
           }
-        }).catch(e => addLog("ERR", "Live close exception: " + e.message));
+        }).catch(e => {
+          addLog("ERR", "Live close exception: " + e.message + " — position restored");
+          setPositions(prev => [...prev, p]);
+        });
       }
 
       // ═══ P&L ACCOUNTING (always runs — real exit price used if live fill is async) ═══
