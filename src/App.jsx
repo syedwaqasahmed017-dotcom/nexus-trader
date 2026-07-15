@@ -5737,11 +5737,13 @@ export default function NexusV7() {
       });
       const data = await res.json();
       if (data.ok && typeof data.usdt === "number") {
+      console.log("[LEDGER-DEBUG] syncLiveBalance ok usdt=" + data.usdt + " priorBalance=" + balance.toFixed(2));
         setBalance(data.usdt);
         addLog("AI", `💰 Live balance synced: $${fx(data.usdt)} USDT`);
       }
     } catch (e) {
       console.warn("[NEXUS LIVE] Balance sync failed:", e.message);
+      console.log("[LEDGER-DEBUG] syncLiveBalance FAILED: " + e.message + " priorBalance=" + balance.toFixed(2));
     }
   }
 
@@ -5925,6 +5927,7 @@ export default function NexusV7() {
   }, 0);
 
   const uptimeStr = `${Math.floor(uptime/3600)}h ${Math.floor((uptime%3600)/60)}m ${uptime%60}s`;
+  console.log("[LEDGER-DEBUG] t=" + Date.now() + " equity=" + equity.toFixed(2) + " balance=" + balance.toFixed(2) + " unrealizedDelta=" + (equity - balance).toFixed(2));
 
   // ═══ DRAWDOWN ESCALATION ═══
   useEffect(() => {
@@ -5933,6 +5936,7 @@ export default function NexusV7() {
       if (newPeak > peakBalance) setPeakBalance(newPeak);
       const dd = DrawdownManager.calculate(balance, newPeak);
       setDrawdownState(dd);
+      console.log("[LEDGER-DEBUG] t=" + Date.now() + " balance=" + balance.toFixed(2) + " peakBalance=" + newPeak.toFixed(2) + " drawdownPct=" + dd.drawdownPct.toFixed(2) + " tier=" + dd.tier.name + " openPositions=" + positions.length);
       if (dd.tier.name === "EMERGENCY" && drawdownState?.tier?.name !== "EMERGENCY") addLog("WARN", `EMERGENCY DRAWDOWN: ${dd.drawdownPct.toFixed(1)}% — trading PAUSED`);
       else if (dd.tier.name === "RECOVERY" && drawdownState?.tier?.name !== "RECOVERY") addLog("WARN", `RECOVERY MODE: ${dd.drawdownPct.toFixed(1)}% drawdown — risk reduced 75%`);
       else if (dd.tier.name === "CAUTIOUS" && drawdownState?.tier?.name !== "CAUTIOUS") addLog("WARN", `CAUTIOUS MODE: ${dd.drawdownPct.toFixed(1)}% drawdown — risk reduced 50%`);
@@ -6727,6 +6731,7 @@ Respond like a sharp pro trader — direct, specific, cite exact numbers. For ea
                 points.push({ bal: running, time: h.exitTime, net: h.net, side: h.side, reason: h.reason, pairName: h.pairName });
               });
 
+              console.log("[LEDGER-DEBUG] t=" + Date.now() + " statsCurveRunning=" + running.toFixed(2) + " tradeCount=" + sorted.length);
               // Chart dimensions
               const W = 340, H = 160, PAD = { t: 20, r: 16, b: 28, l: 42 };
               const cW = W - PAD.l - PAD.r, cH = H - PAD.t - PAD.b;
