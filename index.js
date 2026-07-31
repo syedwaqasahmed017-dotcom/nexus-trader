@@ -82,9 +82,11 @@ function binanceFetch(path, method, params, apiKey, apiSecret) {
 // Falls back to environment variables BINANCE_API_KEY / BINANCE_API_SECRET
 function getKeys(req) {
   const header = req.headers["x-api-key"] || "";
-  if (header.includes(":")) {
-    const [key, secret] = header.split(":");
-    if (key && secret) return { apiKey: key.trim(), apiSecret: secret.trim() };
+  const colonIdx = header.indexOf(":");
+  if (colonIdx !== -1) {
+    const key = header.slice(0, colonIdx).trim();
+    const secret = header.slice(colonIdx + 1).trim();
+    if (key && secret) return { apiKey: key, apiSecret: secret };
   }
   const envKey = process.env.BINANCE_API_KEY;
   const envSecret = process.env.BINANCE_API_SECRET;
